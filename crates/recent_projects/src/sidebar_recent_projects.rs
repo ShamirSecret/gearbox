@@ -23,6 +23,14 @@ use zed_actions::OpenRemote;
 
 use crate::{highlights_for_path, icon_for_remote_connection, open_remote_project};
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 pub struct SidebarRecentProjects {
     pub picker: Entity<Picker<SidebarRecentProjectsDelegate>>,
     _subscription: Subscription,
@@ -141,7 +149,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search projects…".into()
+        gearbox_label("Search projects…", "搜索项目...").into()
     }
 
     fn render_editor(
@@ -285,7 +293,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                             .await
                     })
                     .detach_and_prompt_err(
-                        "Failed to open project",
+                        gearbox_label("Failed to open project", "打开项目失败"),
                         window,
                         cx,
                         |_, _, _| None,
@@ -300,9 +308,12 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         let text = if self.workspaces.is_empty() {
-            "Recently opened projects will show up here"
+            gearbox_label(
+                "Recently opened projects will show up here",
+                "最近打开的项目会显示在这里",
+            )
         } else {
-            "No matches"
+            gearbox_label("No matches", "没有匹配项")
         };
         Some(text.into())
     }
@@ -385,7 +396,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                 )
                 .tooltip(move |_, cx| {
                     Tooltip::with_meta(
-                        "Open Project in This Window",
+                        gearbox_label("Open Project in This Window", "在当前窗口打开项目"),
                         None,
                         tooltip_path.clone(),
                         cx,

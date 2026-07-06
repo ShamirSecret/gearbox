@@ -28,6 +28,14 @@ use util::ResultExt;
 use workspace::{ModalView, Workspace, WorkspaceSettings};
 use zed_actions::{OpenZedUrl, command_palette::Toggle};
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 pub fn init(cx: &mut App) {
     command_palette_hooks::init(cx);
     cx.observe_new(CommandPalette::register).detach();
@@ -383,7 +391,7 @@ impl PickerDelegate for CommandPaletteDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Execute a command...".into()
+        gearbox_label("Execute a command...", "输入并执行命令...").into()
     }
 
     fn select_history(

@@ -22,7 +22,7 @@ use ui::{
 use vim_mode_setting::VimModeSetting;
 
 use crate::{
-    ImportCursorSettings, ImportVsCodeSettings, SettingsImportState,
+    ImportCursorSettings, ImportVsCodeSettings, SettingsImportState, gearbox_text,
     theme_preview::{ThemePreviewStyle, ThemePreviewTile},
 };
 
@@ -57,7 +57,10 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
     return v_flex()
         .gap_2()
         .child(
-            h_flex().justify_between().child(Label::new("Theme")).child(
+            h_flex()
+                .justify_between()
+                .child(Label::new(gearbox_text("Theme", "主题")))
+                .child(
                 ToggleButtonGroup::single_row(
                     "theme-selector-onboarding-dark-light",
                     [
@@ -71,8 +74,17 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
                             SharedString::new_static("Dark"),
                             SharedString::new_static("System"),
                         ];
+                        const GEARBOX_MODE_NAMES: [SharedString; 3] = [
+                            SharedString::new_static("浅色"),
+                            SharedString::new_static("深色"),
+                            SharedString::new_static("跟随系统"),
+                        ];
                         ToggleButtonSimple::new(
-                            MODE_NAMES[mode as usize].clone(),
+                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                GEARBOX_MODE_NAMES[mode as usize].clone()
+                            } else {
+                                MODE_NAMES[mode as usize].clone()
+                            },
                             move |_, _, cx| {
                                 write_mode_change(mode, cx);
 
@@ -250,7 +262,10 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
             SwitchField::new(
                 "onboarding-telemetry-metrics",
                 None::<&str>,
-                Some("Help improve Zed by sending anonymous usage data".into()),
+                Some(gearbox_text(
+                    "Help improve Zed by sending anonymous usage data",
+                    "发送匿名使用数据，帮助改进 Gearbox",
+                )),
                 if TelemetrySettings::get_global(cx).metrics {
                     ui::ToggleState::Selected
                 } else {
@@ -290,8 +305,10 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
                 "onboarding-telemetry-crash-reports",
                 None::<&str>,
                 Some(
-                    "Help fix Zed by sending crash reports so we can fix critical issues fast"
-                        .into(),
+                    gearbox_text(
+                        "Help fix Zed by sending crash reports so we can fix critical issues fast",
+                        "发送崩溃报告，帮助我们更快修复严重问题",
+                    ),
                 ),
                 if TelemetrySettings::get_global(cx).diagnostics {
                     ui::ToggleState::Selected
@@ -340,7 +357,10 @@ fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoE
         BaseKeymap::TextMate | BaseKeymap::None => None,
     };
 
-    return v_flex().gap_2().child(Label::new("Base Keymap")).child(
+    return v_flex()
+        .gap_2()
+        .child(Label::new(gearbox_text("Base Keymap", "基础快捷键方案")))
+        .child(
         ToggleButtonGroup::two_rows(
             "base_keymap_selection",
             [
@@ -394,8 +414,11 @@ fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoEleme
     };
     SwitchField::new(
         "onboarding-vim-mode",
-        Some("Vim Mode"),
-        Some("Coming from Neovim? Use our first-class implementation of Vim Mode".into()),
+        Some(gearbox_text("Vim Mode", "Vim 模式")),
+        Some(gearbox_text(
+            "Coming from Neovim? Use our first-class implementation of Vim Mode",
+            "如果你习惯 Neovim，可以启用 Gearbox 内置的 Vim 模式",
+        )),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -431,12 +454,19 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
         ui::ToggleState::Unselected
     };
 
-    let tooltip_description = "Zed can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted.";
+    let tooltip_description = if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        "只有在你将新项目标记为受信任后，Gearbox 才会允许语言服务器、项目设置和 MCP 服务器等服务运行。"
+    } else {
+        "Zed can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted."
+    };
 
     SwitchField::new(
         "onboarding-auto-trust-worktrees",
-        Some("Trust All Projects By Default"),
-        Some("Automatically mark all new projects as trusted to unlock all Zed's features".into()),
+        Some(gearbox_text("Trust All Projects By Default", "默认信任所有项目")),
+        Some(gearbox_text(
+            "Automatically mark all new projects as trusted to unlock all Zed's features",
+            "自动将所有新项目标记为受信任，以启用 Gearbox 的完整功能",
+        )),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -519,9 +549,12 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
             v_flex()
                 .gap_0p5()
                 .max_w_5_6()
-                .child(Label::new("Import Settings"))
+                .child(Label::new(gearbox_text("Import Settings", "导入设置")))
                 .child(
-                    Label::new("Automatically pull your settings from other editors")
+                    Label::new(gearbox_text(
+                        "Automatically pull your settings from other editors",
+                        "自动从其他编辑器导入你的设置",
+                    ))
                         .color(Color::Muted),
                 ),
         )
@@ -554,7 +587,7 @@ fn render_registry_agent_button(
             .color(Color::Success)
             .into_any_element()
     } else {
-        Label::new("Install")
+        Label::new(gearbox_text("Install", "安装"))
             .size(LabelSize::XSmall)
             .color(Color::Muted)
             .into_any_element()
@@ -608,12 +641,12 @@ fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl
     let is_signed_in = !is_signed_out;
 
     let state_element = if is_signed_out {
-        Label::new("Sign In")
+        Label::new(gearbox_text("Sign In", "登录"))
             .size(LabelSize::XSmall)
             .color(Color::Muted)
             .into_any_element()
     } else if is_signing_in {
-        Label::new("Signing In…")
+        Label::new(gearbox_text("Signing In…", "正在登录..."))
             .size(LabelSize::XSmall)
             .color(Color::Muted)
             .with_animation(
@@ -625,7 +658,7 @@ fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl
             )
             .into_any_element()
     } else if is_signed_in && is_free {
-        Label::new("Start Free Trial")
+        Label::new(gearbox_text("Start Free Trial", "开始免费试用"))
             .size(LabelSize::XSmall)
             .color(Color::Muted)
             .into_any_element()
@@ -642,7 +675,7 @@ fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
         )
-        .name("Zed Agent")
+        .name(gearbox_text("Zed Agent", "Gearbox Agent"))
         .state(state_element)
         .disabled(is_trial || is_pro)
         .map(|this| {
@@ -696,9 +729,12 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
 
     v_flex()
         .gap_0p5()
-        .child(Label::new("Agent Setup"))
+        .child(Label::new(gearbox_text("Agent Setup", "Agent 设置")))
         .child(
-            Label::new("Install your favorite agents and start your first thread.")
+            Label::new(gearbox_text(
+                "Install your favorite agents and start your first thread.",
+                "安装你常用的 Agent，然后开始第一个对话。",
+            ))
                 .color(Color::Muted),
         )
         .child(grid)

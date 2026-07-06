@@ -27,6 +27,7 @@ use gpui::{App, Global};
 
 use rust_embed::RustEmbed;
 use std::env;
+use std::sync::OnceLock;
 use std::{borrow::Cow, fmt, str};
 use util::asset_str;
 
@@ -122,6 +123,20 @@ impl fmt::Display for WorktreeId {
 #[exclude = "*.DS_Store"]
 pub struct SettingsAssets;
 
+static SETTINGS_ASSET_LOADER: OnceLock<fn(&str) -> Cow<'static, str>> = OnceLock::new();
+
+pub fn set_settings_asset_loader(loader: fn(&str) -> Cow<'static, str>) {
+    let _ = SETTINGS_ASSET_LOADER.set(loader);
+}
+
+pub(crate) fn settings_asset_str(path: &str) -> Cow<'static, str> {
+    if let Some(loader) = SETTINGS_ASSET_LOADER.get() {
+        loader(path)
+    } else {
+        asset_str::<SettingsAssets>(path)
+    }
+}
+
 pub fn init(cx: &mut App) {
     let settings = SettingsStore::new(cx, &default_settings());
     cx.set_global(settings);
@@ -129,11 +144,11 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn default_settings() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default.json")
+    settings_asset_str("settings/default.json")
 }
 
 pub fn default_semantic_token_rules() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default_semantic_token_rules.json")
+    settings_asset_str("settings/default_semantic_token_rules.json")
 }
 
 #[cfg(target_os = "macos")]
@@ -146,13 +161,13 @@ pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-windows.json";
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-linux.json";
 
 pub fn default_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(DEFAULT_KEYMAP_PATH)
+    settings_asset_str(DEFAULT_KEYMAP_PATH)
 }
 
 pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.json";
 
 pub fn vim_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(VIM_KEYMAP_PATH)
+    settings_asset_str(VIM_KEYMAP_PATH)
 }
 
 /// Specific keybinding overrides. Loaded after the base keymap so they win over
@@ -167,29 +182,29 @@ pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides-mac
 pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides.json";
 
 pub fn initial_user_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_user_settings.json")
+    settings_asset_str("settings/initial_user_settings.json")
 }
 
 pub fn initial_server_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_server_settings.json")
+    settings_asset_str("settings/initial_server_settings.json")
 }
 
 pub fn initial_project_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_local_settings.json")
+    settings_asset_str("settings/initial_local_settings.json")
 }
 
 pub fn initial_keymap_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("keymaps/initial.json")
+    settings_asset_str("keymaps/initial.json")
 }
 
 pub fn initial_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_tasks.json")
+    settings_asset_str("settings/initial_tasks.json")
 }
 
 pub fn initial_debug_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_debug_tasks.json")
+    settings_asset_str("settings/initial_debug_tasks.json")
 }
 
 pub fn initial_local_debug_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_local_debug_tasks.json")
+    settings_asset_str("settings/initial_local_debug_tasks.json")
 }

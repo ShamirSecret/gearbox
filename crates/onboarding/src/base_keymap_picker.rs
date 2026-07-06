@@ -107,7 +107,11 @@ impl PickerDelegate for BaseKeymapSelectorDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Select a base keymap...".into()
+        if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+            "选择基础快捷键方案...".into()
+        } else {
+            "Select a base keymap...".into()
+        }
     }
 
     fn match_count(&self) -> usize {

@@ -27,6 +27,14 @@ use util::{
 };
 use workspace::Workspace;
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 pub struct OpenPathPrompt;
 
 pub struct OpenPathDelegate {
@@ -662,9 +670,15 @@ impl PickerDelegate for OpenPathDelegate {
                             gpui::PromptLevel::Critical,
                             &format!("{prompted_path:?} already exists. Do you want to replace it?"),
                             Some(
-                                "A file or folder with the same name already exists. Replacing it will overwrite its current contents.",
+                                gearbox_label(
+                                    "A file or folder with the same name already exists. Replacing it will overwrite its current contents.",
+                                    "同名文件或文件夹已存在。替换会覆盖当前内容。",
+                                ),
                             ),
-                            &["Replace", "Cancel"],
+                            &[
+                                gearbox_label("Replace", "替换"),
+                                gearbox_label("Cancel", "取消"),
+                            ],
                             cx
                         );
                         self.replace_prompt = cx.spawn_in(window, async move |picker, cx| {
@@ -865,12 +879,14 @@ impl PickerDelegate for OpenPathDelegate {
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(match &self.directory_state {
-            DirectoryState::Create { .. } => SharedString::from("Type a path…"),
+            DirectoryState::Create { .. } => {
+                SharedString::from(gearbox_label("Type a path…", "输入路径..."))
+            }
             DirectoryState::List {
                 error: Some(error), ..
             } => error.clone(),
             DirectoryState::List { .. } | DirectoryState::None { .. } => {
-                SharedString::from("No such file or directory")
+                SharedString::from(gearbox_label("No such file or directory", "没有这个文件或目录"))
             }
         })
     }

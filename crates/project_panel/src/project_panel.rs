@@ -92,6 +92,14 @@ use crate::{
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
     entries: Vec<GitEntry>,
@@ -1117,14 +1125,23 @@ impl ProjectPanel {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
                         menu.when(is_markdown, |menu| {
-                            menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                            menu.action(
+                                gearbox_label("Open Markdown Preview", "打开 Markdown 预览"),
+                                Box::new(OpenMarkdownPreview),
+                            )
                         })
                         .when(is_dir, |menu| {
-                            menu.action("Search Inside", Box::new(NewSearchInDirectory))
+                            menu.action(
+                                gearbox_label("Search Inside", "在内部搜索"),
+                                Box::new(NewSearchInDirectory),
+                            )
                         })
                     } else {
-                        menu.action("New File", Box::new(NewFile))
-                            .action("New Folder", Box::new(NewDirectory))
+                        menu.action(gearbox_label("New File", "新建文件"), Box::new(NewFile))
+                            .action(
+                                gearbox_label("New Folder", "新建文件夹"),
+                                Box::new(NewDirectory),
+                            )
                             .separator()
                             .when(is_local, |menu| {
                                 menu.action(
@@ -1133,99 +1150,161 @@ impl ProjectPanel {
                                 )
                             })
                             .when(is_local, |menu| {
-                                menu.action("Open in Default App", Box::new(OpenWithSystem))
+                                menu.action(
+                                    gearbox_label("Open in Default App", "用默认应用打开"),
+                                    Box::new(OpenWithSystem),
+                                )
                             })
-                            .action("Open in Terminal", Box::new(OpenInTerminal))
+                            .action(
+                                gearbox_label("Open in Terminal", "在终端中打开"),
+                                Box::new(OpenInTerminal),
+                            )
                             .when(is_markdown, |menu| {
-                                menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                                menu.action(
+                                    gearbox_label("Open Markdown Preview", "打开 Markdown 预览"),
+                                    Box::new(OpenMarkdownPreview),
+                                )
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()
-                                    .action("Find in Folder…", Box::new(NewSearchInDirectory))
+                                    .action(
+                                        gearbox_label("Find in Folder…", "在文件夹中查找..."),
+                                        Box::new(NewSearchInDirectory),
+                                    )
                             })
                             .when(is_unfoldable, |menu| {
-                                menu.action("Unfold Directory", Box::new(UnfoldDirectory))
+                                menu.action(
+                                    gearbox_label("Unfold Directory", "展开目录"),
+                                    Box::new(UnfoldDirectory),
+                                )
                             })
                             .when(is_foldable, |menu| {
-                                menu.action("Fold Directory", Box::new(FoldDirectory))
+                                menu.action(
+                                    gearbox_label("Fold Directory", "折叠目录"),
+                                    Box::new(FoldDirectory),
+                                )
                             })
                             .when(should_show_compare, |menu| {
                                 menu.separator()
-                                    .action("Compare Marked Files", Box::new(CompareMarkedFiles))
+                                    .action(
+                                        gearbox_label("Compare Marked Files", "比较已标记文件"),
+                                        Box::new(CompareMarkedFiles),
+                                    )
                             })
                             .separator()
-                            .action("Cut", Box::new(Cut))
-                            .action("Copy", Box::new(Copy))
-                            .action("Duplicate", Box::new(Duplicate))
-                            .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
+                            .action(gearbox_label("Cut", "剪切"), Box::new(Cut))
+                            .action(gearbox_label("Copy", "复制"), Box::new(Copy))
+                            .action(gearbox_label("Duplicate", "创建副本"), Box::new(Duplicate))
+                            .action_disabled_when(
+                                !has_pasteable_content,
+                                gearbox_label("Paste", "粘贴"),
+                                Box::new(Paste),
+                            )
                             .when(cx.has_flag::<ProjectPanelUndoRedoFeatureFlag>(), |menu| {
                                 menu.action_disabled_when(
                                     !self.undo_manager.can_undo(),
-                                    "Undo",
+                                    gearbox_label("Undo", "撤销"),
                                     Box::new(Undo),
                                 )
                                 .action_disabled_when(
                                     !self.undo_manager.can_redo(),
-                                    "Redo",
+                                    gearbox_label("Redo", "重做"),
                                     Box::new(Redo),
                                 )
                             })
                             .when(is_remote, |menu| {
                                 menu.separator()
-                                    .action("Download...", Box::new(DownloadFromRemote))
+                                    .action(
+                                        gearbox_label("Download...", "下载..."),
+                                        Box::new(DownloadFromRemote),
+                                    )
                             })
                             .separator()
-                            .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
                             .action(
-                                "Copy Relative Path",
+                                gearbox_label("Copy Path", "复制路径"),
+                                Box::new(zed_actions::workspace::CopyPath),
+                            )
+                            .action(
+                                gearbox_label("Copy Relative Path", "复制相对路径"),
                                 Box::new(zed_actions::workspace::CopyRelativePath),
                             )
                             .when(has_git_repo, |menu| {
                                 menu.separator()
                                     .when(!is_dir && self.has_git_changes(entry_id), |menu| {
                                         menu.action(
-                                            "Restore File",
+                                            gearbox_label("Restore File", "还原文件"),
                                             Box::new(git::RestoreFile { skip_prompt: false }),
                                         )
                                     })
-                                    .action("Add to .gitignore", Box::new(git::AddToGitignore))
                                     .action(
-                                        "Add to .git/info/exclude",
+                                        gearbox_label("Add to .gitignore", "添加到 .gitignore"),
+                                        Box::new(git::AddToGitignore),
+                                    )
+                                    .action(
+                                        gearbox_label(
+                                            "Add to .git/info/exclude",
+                                            "添加到 .git/info/exclude",
+                                        ),
                                         Box::new(git::AddToGitInfoExclude),
                                     )
                                     .when(has_history, |menu| {
-                                        menu.action("View History", Box::new(git::FileHistory))
+                                        menu.action(
+                                            gearbox_label("View History", "查看历史"),
+                                            Box::new(git::FileHistory),
+                                        )
                                     })
                             })
                             .when(!should_hide_rename, |menu| {
-                                menu.separator().action("Rename", Box::new(Rename))
+                                menu.separator()
+                                    .action(gearbox_label("Rename", "重命名"), Box::new(Rename))
                             })
                             .when(!is_root && !is_remote, |menu| {
-                                menu.action("Trash", Box::new(Trash { skip_prompt: false }))
+                                menu.action(
+                                    gearbox_label("Trash", "移到废纸篓"),
+                                    Box::new(Trash { skip_prompt: false }),
+                                )
                             })
                             .when(!is_root, |menu| {
-                                menu.action("Delete", Box::new(Delete { skip_prompt: false }))
+                                menu.action(
+                                    gearbox_label("Delete", "删除"),
+                                    Box::new(Delete { skip_prompt: false }),
+                                )
                             })
                             .when(!is_collab && is_root, |menu| {
                                 menu.separator()
                                     .action(
-                                        "Add Folders to Project…",
+                                        gearbox_label(
+                                            "Add Folders to Project…",
+                                            "添加文件夹到项目...",
+                                        ),
                                         Box::new(workspace::AddFolderToProject),
                                     )
-                                    .action("Remove from Project", Box::new(RemoveFromProject))
+                                    .action(
+                                        gearbox_label("Remove from Project", "从项目中移除"),
+                                        Box::new(RemoveFromProject),
+                                    )
                             })
                             .when(is_dir && !is_root, |menu| {
                                 menu.separator()
-                                    .action("Expand All", Box::new(ExpandSelectedEntryAndChildren))
                                     .action(
-                                        "Collapse All",
+                                        gearbox_label("Expand All", "全部展开"),
+                                        Box::new(ExpandSelectedEntryAndChildren),
+                                    )
+                                    .action(
+                                        gearbox_label("Collapse All", "全部折叠"),
                                         Box::new(CollapseSelectedEntryAndChildren),
                                     )
                             })
                             .when(is_dir && is_root, |menu| {
                                 menu.separator()
-                                    .action("Expand All", Box::new(ExpandAllEntries))
-                                    .action("Collapse All", Box::new(CollapseAllEntries))
+                                    .action(
+                                        gearbox_label("Expand All", "全部展开"),
+                                        Box::new(ExpandAllEntries),
+                                    )
+                                    .action(
+                                        gearbox_label("Collapse All", "全部折叠"),
+                                        Box::new(CollapseAllEntries),
+                                    )
                             })
                     }
                 })

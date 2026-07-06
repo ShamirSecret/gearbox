@@ -13,12 +13,11 @@ use std::borrow::Cow;
 use std::{any::TypeId, fmt::Write, rc::Rc, sync::Arc, sync::LazyLock};
 use util::ResultExt as _;
 use util::{
-    asset_str,
     markdown::{MarkdownEscaped, MarkdownInlineCode, MarkdownString},
     schemars::AllowTrailingCommas,
 };
 
-use crate::SettingsAssets;
+use crate::settings_asset_str;
 use settings_content::{ActionName, ActionWithArguments};
 use settings_json::{
     append_top_level_array_value_in_json_text, parse_json_with_comments,
@@ -182,7 +181,7 @@ impl KeymapFile {
         source: Option<KeybindSource>,
         cx: &App,
     ) -> anyhow::Result<Vec<KeyBinding>> {
-        match Self::load(asset_str::<SettingsAssets>(asset_path).as_ref(), cx) {
+        match Self::load(settings_asset_str(asset_path).as_ref(), cx) {
             KeymapFileLoadResult::Success { mut key_bindings } => match source {
                 Some(source) => Ok({
                     for key_binding in &mut key_bindings {
@@ -205,7 +204,7 @@ impl KeymapFile {
         asset_path: &str,
         cx: &App,
     ) -> anyhow::Result<Vec<KeyBinding>> {
-        match Self::load(asset_str::<SettingsAssets>(asset_path).as_ref(), cx) {
+        match Self::load(settings_asset_str(asset_path).as_ref(), cx) {
             KeymapFileLoadResult::SomeFailedToLoad {
                 key_bindings,
                 error_message,
@@ -225,7 +224,7 @@ impl KeymapFile {
     pub fn load_asset_cached(asset_path: &str, cx: &App) -> anyhow::Result<Vec<KeyBinding>> {
         static CACHED: std::sync::OnceLock<KeymapFile> = std::sync::OnceLock::new();
         let keymap = CACHED
-            .get_or_init(|| Self::parse(asset_str::<SettingsAssets>(asset_path).as_ref()).unwrap());
+            .get_or_init(|| Self::parse(settings_asset_str(asset_path).as_ref()).unwrap());
         match keymap.load_keymap(cx) {
             KeymapFileLoadResult::SomeFailedToLoad {
                 key_bindings,

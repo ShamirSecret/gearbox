@@ -37,6 +37,33 @@ actions!(
     ]
 );
 
+fn is_gearbox_gui() -> bool {
+    std::env::var("GEARBOX_GUI").as_deref() == Ok("1")
+}
+
+fn gearbox_text(english: &'static str, chinese: &'static str) -> SharedString {
+    if is_gearbox_gui() {
+        chinese.into()
+    } else {
+        english.into()
+    }
+}
+
+fn welcome_text(text: &'static str) -> SharedString {
+    match text {
+        "Get Started" => gearbox_text(text, "开始使用"),
+        "New File" => gearbox_text(text, "新建文件"),
+        "Open Project" => gearbox_text(text, "打开项目"),
+        "Clone Repository" => gearbox_text(text, "克隆仓库"),
+        "Open Command Palette" => gearbox_text(text, "打开命令面板"),
+        "Configure" => gearbox_text(text, "配置"),
+        "Open Settings" => gearbox_text(text, "打开设置"),
+        "Customize Keymaps" => gearbox_text(text, "自定义快捷键"),
+        "Explore Extensions" => gearbox_text(text, "浏览扩展"),
+        _ => text.into(),
+    }
+}
+
 #[derive(IntoElement)]
 struct SectionHeader {
     title: SharedString,
@@ -150,7 +177,7 @@ impl SectionEntry {
     fn render(&self, button_index: usize, focus: &FocusHandle) -> Option<impl IntoElement> {
         self.visibility_guard.is_visible().then(|| {
             SectionButton::new(
-                self.title,
+                welcome_text(self.title),
                 self.icon,
                 self.action,
                 button_index,
@@ -227,7 +254,7 @@ impl<const COLS: usize> Section<COLS> {
     fn render(self, index_offset: usize, focus: &FocusHandle) -> impl IntoElement {
         v_flex()
             .min_w_full()
-            .child(SectionHeader::new(self.title))
+            .child(SectionHeader::new(welcome_text(self.title)))
             .children(
                 self.entries
                     .iter()
@@ -330,7 +357,10 @@ impl WelcomePage {
         let focus = self.focus_handle.clone();
         let color = cx.theme().colors();
 
-        let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
+        let description = gearbox_text(
+            "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.",
+            "同时运行多个线程，组合任意兼容 ACP 的 Agent，并用 worktree 保持任务互不冲突。",
+        );
 
         v_flex()
             .w_full()
@@ -351,7 +381,10 @@ impl WelcomePage {
                             .color(Color::Muted)
                             .size(IconSize::Small),
                     )
-                    .child(Label::new("Collaborate with Agents")),
+                    .child(Label::new(gearbox_text(
+                        "Collaborate with Agents",
+                        "与 Agent 协作",
+                    ))),
             )
             .child(
                 Label::new(description)
@@ -360,7 +393,7 @@ impl WelcomePage {
                     .mb_2(),
             )
             .child(
-                Button::new("open-agent", "Open Agent Panel")
+                Button::new("open-agent", gearbox_text("Open Agent Panel", "打开 Agent 面板"))
                     .full_width()
                     .tab_index(tab_index as isize)
                     .style(ButtonStyle::Outlined)
@@ -381,7 +414,10 @@ impl WelcomePage {
     ) -> impl IntoElement {
         v_flex()
             .w_full()
-            .child(SectionHeader::new("Recent Projects"))
+            .child(SectionHeader::new(gearbox_text(
+                "Recent Projects",
+                "最近项目",
+            )))
             .children(recent_projects)
     }
 
@@ -448,9 +484,9 @@ impl Render for WelcomePage {
         };
 
         let welcome_label = if self.fallback_to_recent_projects {
-            "Welcome back to Zed"
+            gearbox_text("Welcome back to Zed", "欢迎回到 Gearbox")
         } else {
-            "Welcome to Zed"
+            gearbox_text("Welcome to Zed", "欢迎使用 Gearbox")
         };
 
         h_flex()
@@ -480,7 +516,10 @@ impl Render for WelcomePage {
                             .child(Vector::square(VectorName::ZedLogo, rems_from_px(45.)))
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
+                                    Label::new(gearbox_text(
+                                        "The editor for what's next",
+                                        "面向下一代工作的中文编辑器",
+                                    ))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .italic(),
@@ -497,7 +536,10 @@ impl Render for WelcomePage {
                     .when(!self.fallback_to_recent_projects, |this| {
                         this.child(
                             v_flex().gap_4().child(Divider::horizontal()).child(
-                                Button::new("welcome-exit", "Return to Onboarding")
+                                Button::new(
+                                    "welcome-exit",
+                                    gearbox_text("Return to Onboarding", "返回初始化设置"),
+                                )
                                     .tab_index(next_tab_index as isize)
                                     .full_width()
                                     .label_size(LabelSize::XSmall)
@@ -523,7 +565,7 @@ impl Item for WelcomePage {
     type Event = ItemEvent;
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Welcome".into()
+        gearbox_text("Welcome", "欢迎")
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

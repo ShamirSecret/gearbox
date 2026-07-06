@@ -12,6 +12,14 @@ use workspace::{ModalView, MultiWorkspace};
 
 use crate::open_remote_project;
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WslDistroSelected {
     pub secondary: bool,
@@ -98,7 +106,7 @@ impl picker::PickerDelegate for WslPickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        Arc::from("Enter WSL distro name")
+        Arc::from(gearbox_label("Enter WSL distro name", "输入 WSL 发行版名称"))
     }
 
     fn update_matches(

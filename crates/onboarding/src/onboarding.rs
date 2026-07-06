@@ -33,6 +33,14 @@ use zed_actions::OpenOnboarding;
 mod base_keymap_picker;
 mod basics_page;
 pub mod multibuffer_hint;
+
+fn gearbox_text(english: &'static str, chinese: &'static str) -> SharedString {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese.into()
+    } else {
+        english.into()
+    }
+}
 mod theme_preview;
 
 /// Imports settings from Visual Studio Code.
@@ -351,11 +359,17 @@ impl Render for Onboarding {
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        Headline::new(gearbox_text(
+                                                            "Welcome to Zed",
+                                                            "欢迎使用 Gearbox",
+                                                        ))
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
-                                                        Label::new("The editor for what's next")
+                                                        Label::new(gearbox_text(
+                                                            "The editor for what's next",
+                                                            "面向下一代工作的中文编辑器",
+                                                        ))
                                                             .color(Color::Muted)
                                                             .size(LabelSize::Small)
                                                             .italic(),
@@ -363,7 +377,10 @@ impl Render for Onboarding {
                                             ),
                                     )
                                     .child({
-                                        Button::new("finish_setup", "Finish Setup")
+                                        Button::new(
+                                            "finish_setup",
+                                            gearbox_text("Finish Setup", "完成设置"),
+                                        )
                                             .style(ButtonStyle::Filled)
                                             .size(ButtonSize::Medium)
                                             .width(rems_from_px(200.))

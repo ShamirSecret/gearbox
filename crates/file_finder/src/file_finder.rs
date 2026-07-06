@@ -62,6 +62,14 @@ actions!(
     ]
 );
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 impl ModalView for FileFinder {}
 
 pub struct FileFinder {
@@ -1615,7 +1623,7 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search project files...".into()
+        gearbox_label("Search project files...", "搜索项目文件...").into()
     }
 
     fn searchbar_trailer(
@@ -1628,9 +1636,9 @@ impl PickerDelegate for FileFinderDelegate {
         // Clicking includes ignored files unless they're already included, in
         // which case it excludes them again (see `handle_toggle_ignored`).
         let tooltip_label = if including_ignored {
-            "Exclude Ignored Files"
+            gearbox_label("Exclude Ignored Files", "排除已忽略文件")
         } else {
-            "Include Ignored Files"
+            gearbox_label("Include Ignored Files", "包含已忽略文件")
         };
 
         let filter_button = IconButton::new("filter-ignored", IconName::Sliders)
@@ -1822,7 +1830,7 @@ impl PickerDelegate for FileFinderDelegate {
                     ..Default::default()
                 };
                 let mut message = picker::HighlightedTextBuilder::default();
-                message.push_plain("Create file ");
+                message.push_plain(gearbox_label("Create file ", "创建文件 "));
                 message.push_styled(project_path.path.display(path_style), path_highlight);
                 message.push_plain("?");
                 Some(picker::PreviewUpdate::message(message.build()))
@@ -1907,13 +1915,28 @@ impl PickerDelegate for FileFinderDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Vec<picker::PickerAction> {
         vec![
-            picker::PickerAction::header("Split…"),
-            picker::PickerAction::button("Left", pane::SplitLeft::default().boxed_clone()),
-            picker::PickerAction::button("Right", pane::SplitRight::default().boxed_clone()),
-            picker::PickerAction::button("Up", pane::SplitUp::default().boxed_clone()),
-            picker::PickerAction::button("Down", pane::SplitDown::default().boxed_clone()),
+            picker::PickerAction::header(gearbox_label("Split…", "拆分...")),
+            picker::PickerAction::button(
+                gearbox_label("Left", "左侧"),
+                pane::SplitLeft::default().boxed_clone(),
+            ),
+            picker::PickerAction::button(
+                gearbox_label("Right", "右侧"),
+                pane::SplitRight::default().boxed_clone(),
+            ),
+            picker::PickerAction::button(
+                gearbox_label("Up", "上方"),
+                pane::SplitUp::default().boxed_clone(),
+            ),
+            picker::PickerAction::button(
+                gearbox_label("Down", "下方"),
+                pane::SplitDown::default().boxed_clone(),
+            ),
             picker::PickerAction::separator(),
-            picker::PickerAction::button("Open File", menu::Confirm.boxed_clone()),
+            picker::PickerAction::button(
+                gearbox_label("Open File", "打开文件"),
+                menu::Confirm.boxed_clone(),
+            ),
         ]
     }
 }

@@ -85,7 +85,7 @@ impl PickerDelegate for OllamaModelPickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search models…".into()
+        (if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "搜索模型..." } else { "Search models…" }).into()
     }
 
     fn update_matches(

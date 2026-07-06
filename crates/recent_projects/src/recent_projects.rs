@@ -57,6 +57,14 @@ actions!(
     [ToggleActionsMenu, RemoveSelected, AddToWorkspace,]
 );
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RecentProjectEntry {
     pub name: SharedString,
@@ -935,7 +943,7 @@ impl PickerDelegate for RecentProjectsDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search projects…".into()
+        gearbox_label("Search projects…", "搜索项目...").into()
     }
 
     fn render_editor(
@@ -1074,7 +1082,9 @@ impl PickerDelegate for RecentProjectsDelegate {
             };
 
             if !matched_folders.is_empty() {
-                entries.push(ProjectPickerEntry::Header("Current Folders".into()));
+                entries.push(ProjectPickerEntry::Header(
+                    gearbox_label("Current Folders", "当前文件夹").into(),
+                ));
                 for (index, positions) in matched_folders {
                     entries.push(ProjectPickerEntry::OpenFolder { index, positions });
                 }
@@ -1088,7 +1098,9 @@ impl PickerDelegate for RecentProjectsDelegate {
         };
 
         if has_projects_to_show {
-            entries.push(ProjectPickerEntry::Header("This Window".into()));
+            entries.push(ProjectPickerEntry::Header(
+                gearbox_label("This Window", "当前窗口").into(),
+            ));
 
             if is_empty_query {
                 for id in 0..self.window_project_groups.len() {
@@ -1113,7 +1125,9 @@ impl PickerDelegate for RecentProjectsDelegate {
         };
 
         if has_recent_to_show {
-            entries.push(ProjectPickerEntry::Header("Recent Projects".into()));
+            entries.push(ProjectPickerEntry::Header(
+                gearbox_label("Recent Projects", "最近项目").into(),
+            ));
 
             if is_empty_query {
                 for (id, workspace) in self.workspaces.iter().enumerate() {
@@ -1238,9 +1252,13 @@ impl PickerDelegate for RecentProjectsDelegate {
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         let text = if self.workspaces.is_empty() && self.open_folders.is_empty() {
-            "Recently opened projects will show up here".into()
+            gearbox_label(
+                "Recently opened projects will show up here",
+                "最近打开的项目会显示在这里",
+            )
+            .into()
         } else {
-            "No matches".into()
+            gearbox_label("No matches", "没有匹配项").into()
         };
         Some(text)
     }
