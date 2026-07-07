@@ -348,3 +348,19 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 - Adds Gearbox-only Chinese wording for the discard-changes restore prompt and buttons when `GEARBOX_GUI=1`.
 
+## 2026-07-07 Gearbox Packaging Brand and Icon Sweep
+
+### `crates/gearbox/resources/app-icon.icns`
+
+- Adds the Gearbox macOS app icon resource generated from the Gearbox PNG app icon.
+- Matches the GitHub Release DMG packaging step that copies `app-icon.icns` into `Gearbox.app`.
+
+### `crates/gearbox/resources/flatpak/manifest-template.json`
+
+- Switches the Flatpak command/module/resource path from upstream `zed` resources to Gearbox command and Gearbox resources.
+- Keeps internal `ZED_BUNDLE_TYPE` unchanged because it is still an application runtime environment key.
+
+### `crates/gearbox/resources/snap/snapcraft.yaml.in`
+
+- Switches the Snap app entry and command from `zed` to `gearbox`.
+- Keeps internal `ZED_BUNDLE_TYPE` unchanged because it is still an application runtime environment key.

@@ -52,8 +52,8 @@ parts:
       - -usr/share/man
 
 apps:
-  zed:
-    command: usr/bin/zed
+  gearbox:
+    command: usr/bin/gearbox
     common-id: dev.gearbox.Gearbox
     environment:
       ZED_BUNDLE_TYPE: snap

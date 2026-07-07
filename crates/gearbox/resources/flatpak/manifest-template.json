@@ -6,7 +6,7 @@
   "sdk-extensions": [
     "org.freedesktop.Sdk.Extension.rust-stable"
   ],
-  "command": "zed",
+  "command": "gearbox",
   "finish-args": [
     "--talk-name=org.freedesktop.Flatpak",
     "--device=dri",
@@ -22,7 +22,7 @@
   },
   "modules": [
     {
-      "name": "zed",
+      "name": "gearbox",
       "buildsystem": "simple",
       "build-options": {
         "env": {
@@ -41,8 +41,8 @@
         "envsubst < zed.desktop.in > zed.desktop && install -Dm755 zed.desktop /app/share/applications/$APP_ID.desktop",
         "envsubst < flatpak/zed.metainfo.xml.in > zed.metainfo.xml && install -Dm644 zed.metainfo.xml /app/share/metainfo/$APP_ID.metainfo.xml",
         "sed -i -e '/@release_info@/{r flatpak/release-info/$CHANNEL' -e 'd}' /app/share/metainfo/$APP_ID.metainfo.xml",
-        "install -Dm755 bin/zed /app/bin/zed",
-        "install -Dm755 libexec/zed-editor /app/libexec/zed-editor",
+        "install -Dm755 bin/gearbox /app/bin/gearbox",
+        "install -Dm755 libexec/gearbox-editor /app/libexec/gearbox-editor",
         "install -Dm755 lib/* -t /app/lib"
       ],
       "sources": [
@@ -52,7 +52,7 @@
         },
         {
           "type": "dir",
-          "path": "./crates/zed/resources"
+          "path": "./crates/gearbox/resources"
         }
       ]
     }
