@@ -1,0 +1,401 @@
+name: Gearbox Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional GitHub release tag to upload artifacts to, for example v0.1.1"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+      - "gearbox-v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GEARBOX_GUI: "1"
+  GEARBOX_ARTIFACT_VERSION: ${{ inputs.release_tag || github.ref_name }}
+  RELEASE_CHANNEL: stable
+
+jobs:
+  build_linux_x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gearbox-linux-x86_64
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Build Gearbox
+        run: |
+          export RELEASE_VERSION="${GEARBOX_ARTIFACT_VERSION:-0.0.0}"
+          cargo build --release --locked --package gearbox
+
+      - name: Package Linux artifact
+        run: |
+          version="${GEARBOX_ARTIFACT_VERSION:-manual}"
+          mkdir -p "dist/gearbox-linux-x86_64"
+          cp target/release/gearbox "dist/gearbox-linux-x86_64/gearbox"
+          tar -czf "dist/gearbox-${version}-linux-x86_64.tar.gz" -C dist "gearbox-linux-x86_64"
+
+      - name: Package Linux deb installer
+        run: |
+          version="${GEARBOX_ARTIFACT_VERSION:-0.0.0}"
+          deb_version="${version#gearbox-v}"
+          deb_version="${deb_version#v}"
+          package_root="dist/deb/gearbox_${deb_version}_amd64"
+
+          mkdir -p "$package_root/DEBIAN"
+          mkdir -p "$package_root/usr/bin"
+          mkdir -p "$package_root/usr/share/applications"
+          mkdir -p "$package_root/usr/share/icons/hicolor/512x512/apps"
+
+          install -m 755 target/release/gearbox "$package_root/usr/bin/gearbox"
+          install -m 644 crates/gearbox/resources/app-icon.png "$package_root/usr/share/icons/hicolor/512x512/apps/gearbox.png"
+          cat > "$package_root/usr/share/applications/gearbox.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Gearbox
+          Comment=Gearbox Chinese code editor
+          Exec=gearbox %U
+          Icon=gearbox
+          Terminal=false
+          Categories=Development;IDE;TextEditor;
+          StartupNotify=true
+          DESKTOP
+
+          installed_size="$(du -sk "$package_root/usr" | cut -f1)"
+          cat > "$package_root/DEBIAN/control" <<CONTROL
+          Package: gearbox
+          Version: ${deb_version}
+          Section: devel
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Gearbox <noreply@github.com>
+          Installed-Size: ${installed_size}
+          Depends: libc6, libgcc-s1, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, libasound2 | libasound2t64, libfontconfig1, libssl3 | libssl1.1
+          Description: Gearbox Chinese code editor
+           Gearbox is a Chinese-localized GUI fork of Zed.
+          CONTROL
+
+          dpkg-deb --build "$package_root" "dist/gearbox-${version}-linux-x86_64.deb"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gearbox-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+
+  build_macos_aarch64:
+    name: Build macOS aarch64
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gearbox-macos-aarch64
+
+      - name: Build Gearbox
+        run: |
+          export RELEASE_VERSION="${GEARBOX_ARTIFACT_VERSION:-0.0.0}"
+          cargo build --release --locked --package gearbox --target aarch64-apple-darwin
+
+      - name: Package macOS artifact
+        run: |
+          version="${GEARBOX_ARTIFACT_VERSION:-manual}"
+          mkdir -p "dist/gearbox-macos-aarch64"
+          cp target/aarch64-apple-darwin/release/gearbox "dist/gearbox-macos-aarch64/gearbox"
+          ditto -c -k --sequesterRsrc --keepParent "dist/gearbox-macos-aarch64" "dist/gearbox-${version}-macos-aarch64.zip"
+
+      - name: Package macOS dmg installer
+        run: |
+          version="${GEARBOX_ARTIFACT_VERSION:-manual}"
+          app_dir="dist/dmg-aarch64/Gearbox.app"
+          mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
+          cp target/aarch64-apple-darwin/release/gearbox "$app_dir/Contents/MacOS/Gearbox"
+          cp crates/gearbox/resources/app-icon.icns "$app_dir/Contents/Resources/AppIcon.icns"
+          cat > "$app_dir/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>Gearbox</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.gearbox.Gearbox</string>
+            <key>CFBundleName</key>
+            <string>Gearbox</string>
+            <key>CFBundleDisplayName</key>
+            <string>Gearbox</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          chmod +x "$app_dir/Contents/MacOS/Gearbox"
+          ln -s /Applications "dist/dmg-aarch64/Applications"
+          hdiutil create -volname "Gearbox" -srcfolder "dist/dmg-aarch64" -ov -format UDZO "dist/gearbox-${version}-macos-aarch64.dmg"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gearbox-macos-aarch64
+          path: |
+            dist/*.zip
+            dist/*.dmg
+
+  build_macos_x86_64:
+    name: Build macOS x86_64
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gearbox-macos-x86_64
+
+      - name: Build Gearbox
+        run: |
+          export RELEASE_VERSION="${GEARBOX_ARTIFACT_VERSION:-0.0.0}"
+          cargo build --release --locked --package gearbox --target x86_64-apple-darwin
+
+      - name: Package macOS artifact
+        run: |
+          version="${GEARBOX_ARTIFACT_VERSION:-manual}"
+          mkdir -p "dist/gearbox-macos-x86_64"
+          cp target/x86_64-apple-darwin/release/gearbox "dist/gearbox-macos-x86_64/gearbox"
+          ditto -c -k --sequesterRsrc --keepParent "dist/gearbox-macos-x86_64" "dist/gearbox-${version}-macos-x86_64.zip"
+
+      - name: Package macOS dmg installer
+        run: |
+          version="${GEARBOX_ARTIFACT_VERSION:-manual}"
+          app_dir="dist/dmg-x86_64/Gearbox.app"
+          mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
+          cp target/x86_64-apple-darwin/release/gearbox "$app_dir/Contents/MacOS/Gearbox"
+          cp crates/gearbox/resources/app-icon.icns "$app_dir/Contents/Resources/AppIcon.icns"
+          cat > "$app_dir/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>Gearbox</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.gearbox.Gearbox</string>
+            <key>CFBundleName</key>
+            <string>Gearbox</string>
+            <key>CFBundleDisplayName</key>
+            <string>Gearbox</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          chmod +x "$app_dir/Contents/MacOS/Gearbox"
+          ln -s /Applications "dist/dmg-x86_64/Applications"
+          hdiutil create -volname "Gearbox" -srcfolder "dist/dmg-x86_64" -ov -format UDZO "dist/gearbox-${version}-macos-x86_64.dmg"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gearbox-macos-x86_64
+          path: |
+            dist/*.zip
+            dist/*.dmg
+
+  build_windows_x86_64:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gearbox-windows-x86_64
+
+      - name: Build Gearbox
+        shell: pwsh
+        run: |
+          $env:RELEASE_VERSION = if ($env:GEARBOX_ARTIFACT_VERSION) { $env:GEARBOX_ARTIFACT_VERSION } else { "0.0.0" }
+          cargo build --release --locked --package gearbox --target x86_64-pc-windows-msvc
+
+      - name: Package Windows artifact
+        shell: pwsh
+        run: |
+          $version = if ($env:GEARBOX_ARTIFACT_VERSION) { $env:GEARBOX_ARTIFACT_VERSION } else { "manual" }
+          New-Item -ItemType Directory -Force -Path "dist/gearbox-windows-x86_64" | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/gearbox.exe" "dist/gearbox-windows-x86_64/gearbox.exe"
+          Compress-Archive -Path "dist/gearbox-windows-x86_64" -DestinationPath "dist/gearbox-$version-windows-x86_64.zip" -Force
+
+      - name: Package Windows installer
+        shell: pwsh
+        run: |
+          $artifactVersion = if ($env:GEARBOX_ARTIFACT_VERSION) { $env:GEARBOX_ARTIFACT_VERSION } else { "manual" }
+          $installerVersion = $artifactVersion -replace "^gearbox-v", "" -replace "^v", ""
+          if ($installerVersion -eq "manual") {
+            $installerVersion = "0.1.0"
+          }
+
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+
+          New-Item -ItemType Directory -Force -Path "dist/installer" | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/gearbox.exe" "dist/installer/Gearbox.exe"
+          Copy-Item "crates/gearbox/resources/windows/app-icon.ico" "dist/installer/app-icon.ico"
+          @"
+          [Setup]
+          AppId={9F37E3C5-5403-4E6B-9B19-EBDB67A7D4F2}
+          AppName=Gearbox
+          AppVersion=$installerVersion
+          AppPublisher=Gearbox
+          DefaultDirName={autopf}\Gearbox
+          DefaultGroupName=Gearbox
+          OutputDir=.
+          OutputBaseFilename=gearbox-$artifactVersion-windows-x86_64-setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          SetupIconFile=app-icon.ico
+          UninstallDisplayIcon={app}\Gearbox.exe
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+
+          [Files]
+          Source: "Gearbox.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\Gearbox"; Filename: "{app}\Gearbox.exe"
+          Name: "{autodesktop}\Gearbox"; Filename: "{app}\Gearbox.exe"; Tasks: desktopicon
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+
+          [Run]
+          Filename: "{app}\Gearbox.exe"; Description: "Launch Gearbox"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Encoding UTF8 "dist/installer/gearbox.iss"
+
+          Push-Location "dist/installer"
+          & $iscc "gearbox.iss"
+          Pop-Location
+          Move-Item "dist/installer/gearbox-$artifactVersion-windows-x86_64-setup.exe" "dist/gearbox-$artifactVersion-windows-x86_64-setup.exe" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gearbox-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*setup.exe
+
+  publish_release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build_linux_x86_64
+      - build_macos_aarch64
+      - build_macos_x86_64
+      - build_windows_x86_64
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish artifacts to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          tag="${INPUT_RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          if [ -z "$tag" ]; then
+            echo "No release tag was provided"
+            exit 1
+          fi
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "Gearbox release $tag"
+          fi
+
+          gh release upload "$tag" dist/* --clobber
