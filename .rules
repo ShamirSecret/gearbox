@@ -1,3 +1,16 @@
+# Gearbox fork rules
+
+本仓库是 Gearbox fork：需要在承载 Gearbox 中文界面、独立品牌、设置资源和产品说明的同时，持续跟随上游更新。
+
+* 合并或 rebase 上游前，必须先查看 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md`。
+* 解决上游冲突时，如果冲突涉及 Gearbox 已修改过的共享源码，并且解决方案改变了 Gearbox 的实现策略或触碰文件列表，必须更新 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md`。
+* 为 Gearbox 修改共享源码或核心代码前，必须先查看 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md`，避免重复实现或破坏已有覆盖层决策。
+* Gearbox 专属行为优先放在 `crates/gearbox` 或 `crates/gearbox_settings`。
+* 如果必须修改共享源码，优先使用 `GEARBOX_GUI=1` 条件显示层或资源层，保持上游 Zed 默认行为不变。
+* 共享源码只要因为 Gearbox 汉化、品牌替换或资源路由发生变化，就必须在 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md` 记录文件和原因。
+* 不要只为了去掉 `Zed` 字样就重命名内部上游标识，例如 Rust 类型名、action 名、enum variant、keymap context、协议名或测试 fixture；只有明确功能影响和上游合并成本后才允许修改。
+* 用户可见的 Gearbox UI、README、打包元数据和产品说明，应尽量使用 Gearbox 品牌和中文文本。
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
