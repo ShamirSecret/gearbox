@@ -117,6 +117,7 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 - Keeps the upstream settings data model unchanged; translations happen at render time when `GEARBOX_GUI=1`.
 - Dynamically displays `Zed` as `Gearbox` in settings descriptions only when `GEARBOX_GUI=1`.
 - Localizes deeper settings UI labels such as search placeholder, settings-file buttons, user/project/server scope labels, workspace restoration settings, telemetry settings, and scoped settings only when `GEARBOX_GUI=1`.
+- Adds display mappings for the regular `page_data.rs` setting section headers and setting titles so Gearbox settings pages show Chinese labels while preserving upstream JSON paths and setting metadata.
 
 ### `crates/settings_ui/src/pages/edit_prediction_provider_setup.rs`
 
