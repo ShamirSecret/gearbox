@@ -187,7 +187,7 @@ impl Orchestrator {
         let mut verification_results = Vec::new();
         let mut last_verification_path = None;
         let mut final_evaluation = None;
-        let worker_registry = WorkerRegistry::default();
+        let worker_registry = WorkerRegistry;
 
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
@@ -886,6 +886,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::workers::WorkerKind;
 
     #[test]
     fn run_creates_ledger_artifacts_and_verification() -> Result<()> {
@@ -907,7 +908,8 @@ mod tests {
             workspace: temp_dir.path().to_path_buf(),
             verification_commands: vec!["echo verify-ok".to_string()],
             worker: WorkerConfig {
-                opencode_command: None,
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
                 skip_worker: true,
                 require_worker: false,
             },
@@ -948,7 +950,8 @@ mod tests {
             workspace: temp_dir.path().to_path_buf(),
             verification_commands: vec!["exit 7".to_string()],
             worker: WorkerConfig {
-                opencode_command: None,
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
                 skip_worker: true,
                 require_worker: false,
             },
@@ -988,7 +991,8 @@ mod tests {
             workspace: temp_dir.path().to_path_buf(),
             verification_commands: vec![verify_command],
             worker: WorkerConfig {
-                opencode_command: None,
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
                 skip_worker: true,
                 require_worker: false,
             },
@@ -1028,7 +1032,8 @@ mod tests {
             workspace: temp_dir.path().to_path_buf(),
             verification_commands: vec!["echo unreachable".to_string()],
             worker: WorkerConfig {
-                opencode_command: None,
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
                 skip_worker: true,
                 require_worker: false,
             },

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
 use crate::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
-use crate::workers::WorkerConfig;
+use crate::workers::{WorkerConfig, WorkerKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "gear")]
@@ -31,6 +31,12 @@ struct RunCommand {
 
     #[arg(long)]
     opencode_command: Option<String>,
+
+    #[arg(long, default_value = "opencode")]
+    worker: String,
+
+    #[arg(long)]
+    worker_command: Option<String>,
 
     #[arg(long)]
     skip_worker: bool,
@@ -59,12 +65,15 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::Run(command) => {
+            let worker_kind = WorkerKind::parse(&command.worker)
+                .ok_or_else(|| anyhow!("unknown Gear worker kind `{}`", command.worker))?;
             let outcome = Orchestrator::run(RunOptions {
                 request: command.prompt,
                 workspace: command.workspace,
                 verification_commands: command.verification_commands,
                 worker: WorkerConfig {
-                    opencode_command: command.opencode_command,
+                    worker_kind,
+                    worker_command: command.worker_command.or(command.opencode_command),
                     skip_worker: command.skip_worker,
                     require_worker: command.require_worker,
                 },

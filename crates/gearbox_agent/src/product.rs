@@ -80,7 +80,7 @@ Goal: `{}`
 ## Default Build Path
 
 - Confirm the workspace facts with deterministic tools.
-- Send bounded implementation work to the configured opencode worker.
+- Send bounded implementation work to the configured worker adapter.
 - Inspect diff after the worker returns.
 - Run Gear-owned verification commands.
 - Create a repair task if verification fails.

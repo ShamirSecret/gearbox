@@ -49,7 +49,7 @@ use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
 use gearbox_agent::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
 use gearbox_agent::tools::CancellationToken;
-use gearbox_agent::workers::WorkerConfig;
+use gearbox_agent::workers::{WorkerConfig, WorkerKind};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
     TaskExt, WeakEntity,
@@ -2561,13 +2561,19 @@ fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) 
 }
 
 fn gear_worker_config_from_env() -> WorkerConfig {
-    let opencode_command = std::env::var("GEARBOX_OPENCODE_COMMAND")
+    let worker_kind = std::env::var("GEARBOX_GEAR_WORKER")
         .ok()
+        .and_then(|worker| WorkerKind::parse(&worker))
+        .unwrap_or_default();
+    let worker_command = std::env::var("GEARBOX_GEAR_WORKER_COMMAND")
+        .ok()
+        .or_else(|| std::env::var("GEARBOX_OPENCODE_COMMAND").ok())
         .map(|command| command.trim().to_string())
         .filter(|command| !command.is_empty());
 
     WorkerConfig {
-        opencode_command,
+        worker_kind,
+        worker_command,
         skip_worker: false,
         require_worker: false,
     }

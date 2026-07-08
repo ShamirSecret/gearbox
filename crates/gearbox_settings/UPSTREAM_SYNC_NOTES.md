@@ -380,6 +380,7 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 - Streams Gear runtime events into the native ACP thread so the Gearbox GUI shows Gear-owned progress instead of only the final worker report.
 - Wires GUI cancel to a Gear cancellation token so Gear orchestrator, worker, and verification commands can stop from the native Agent Panel cancel action.
 - Passes the Gear runtime's default iteration limit from the GUI so Gear runs as a bounded goal-pursuit loop instead of a one-shot worker wrapper.
+- Reads `GEARBOX_GEAR_WORKER` and `GEARBOX_GEAR_WORKER_COMMAND` for Gear worker selection, while keeping `GEARBOX_OPENCODE_COMMAND` as a compatibility fallback.
 
 ### `crates/agent_ui/src/agent_ui.rs`
 ### `crates/agent_ui/src/agent_panel.rs`
