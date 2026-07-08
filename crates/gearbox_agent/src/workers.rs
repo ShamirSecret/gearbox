@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -63,22 +63,54 @@ pub struct WorkerResult {
     pub result_path: PathBuf,
 }
 
+pub struct WorkerRunRequest<'a> {
+    pub store: &'a StateStore,
+    pub workspace: &'a Path,
+    pub task: &'a Task,
+    pub goal: &'a str,
+    pub verification_commands: &'a [String],
+    pub config: &'a WorkerConfig,
+    pub cancellation_token: Option<&'a CancellationToken>,
+}
+
+pub trait WorkerAdapter {
+    fn name(&self) -> &'static str;
+    fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult>;
+}
+
+#[derive(Default)]
+pub struct WorkerRegistry {
+    opencode: OpencodeWorker,
+}
+
+impl WorkerRegistry {
+    pub fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
+        self.opencode.run(request)
+    }
+}
+
+#[derive(Default)]
 pub struct OpencodeWorker;
 
-impl OpencodeWorker {
-    pub fn run(
-        store: &StateStore,
-        workspace: &std::path::Path,
-        task: &Task,
-        request: &str,
-        verification_commands: &[String],
-        config: &WorkerConfig,
-        cancellation_token: Option<&CancellationToken>,
-    ) -> Result<WorkerResult> {
+impl WorkerAdapter for OpencodeWorker {
+    fn name(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
+        let WorkerRunRequest {
+            store,
+            workspace,
+            task,
+            goal,
+            verification_commands,
+            config,
+            cancellation_token,
+        } = request;
         let packet = WorkerPacket {
             task_id: task.id.clone(),
-            worker: "opencode".to_string(),
-            goal: request.to_string(),
+            worker: self.name().to_string(),
+            goal: goal.to_string(),
             scope: task.scope.clone(),
             constraints: vec![
                 "Stay inside the allowed paths when they are provided.".to_string(),

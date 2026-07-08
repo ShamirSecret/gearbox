@@ -13,7 +13,7 @@ use crate::tools::{
     CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_snapshot,
     run_shell_command_with_env_and_cancellation,
 };
-use crate::workers::{OpencodeWorker, WorkerConfig, WorkerStatus};
+use crate::workers::{WorkerConfig, WorkerRegistry, WorkerRunRequest, WorkerStatus};
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
 pub const DEFAULT_MAX_ITERATIONS: usize = 2;
@@ -187,6 +187,7 @@ impl Orchestrator {
         let mut verification_results = Vec::new();
         let mut last_verification_path = None;
         let mut final_evaluation = None;
+        let worker_registry = WorkerRegistry::default();
 
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
@@ -258,15 +259,15 @@ impl Orchestrator {
                     last_verification_path.as_deref(),
                 )
             };
-            let iteration_worker_result = OpencodeWorker::run(
-                &store,
-                &workspace,
-                &worker_task,
-                &worker_request,
-                &detection.verification_commands,
-                &options.worker,
-                options.cancellation_token.as_ref(),
-            )?;
+            let iteration_worker_result = worker_registry.run(WorkerRunRequest {
+                store: &store,
+                workspace: &workspace,
+                task: &worker_task,
+                goal: &worker_request,
+                verification_commands: &detection.verification_commands,
+                config: &options.worker,
+                cancellation_token: options.cancellation_token.as_ref(),
+            })?;
 
             update_worker_task(
                 &mut tasks,
