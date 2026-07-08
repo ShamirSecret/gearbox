@@ -2510,11 +2510,27 @@ impl NativeAgentConnection {
                 anyhow::Ok((outcome, final_report))
             });
 
-            while let Ok(message) = event_rx.recv().await {
+            let mut events_open = true;
+            let run_task = run_task.fuse();
+            futures::pin_mut!(run_task);
+            let run_result = loop {
+                if events_open {
+                    futures::select! {
+                        message = event_rx.recv().fuse() => match message {
+                            Ok(message) => push_gear_assistant_markdown(&acp_thread, &thread, message, cx),
+                            Err(_) => events_open = false,
+                        },
+                        result = run_task => break result,
+                    }
+                } else {
+                    break run_task.await;
+                }
+            };
+            while let Ok(message) = event_rx.try_recv() {
                 push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
             }
 
-            let response = match run_task.await {
+            let response = match run_result {
                 Ok((outcome, final_report)) => {
                     let message = gear_response_markdown(&outcome, &final_report);
                     push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
@@ -2542,7 +2558,7 @@ impl NativeAgentConnection {
                 &cancellation_token,
                 cx,
             );
-            review_task.await;
+            drop(review_task);
             response
         })
     }
@@ -4526,6 +4542,7 @@ fn apply_skill_overrides(skills: &[Skill]) -> Vec<Skill> {
 #[cfg(test)]
 mod internal_tests {
     use std::path::Path;
+    use std::time::Duration;
 
     use super::*;
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
@@ -4656,6 +4673,19 @@ mod internal_tests {
             .collect()
     }
 
+    async fn wait_for_fake_completion(model: &FakeLanguageModel, cx: &mut TestAppContext) {
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if model.completion_count() > 0 {
+                return;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        panic!("timed out waiting for fake model completion request");
+    }
+
     #[gpui::test]
     async fn test_compact_command_is_available(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4782,9 +4812,14 @@ mod internal_tests {
             })
         });
         let prompt_task = cx.foreground_executor().spawn(prompt_task);
-        cx.run_until_parked();
+        wait_for_fake_completion(fake_model, cx).await;
         fake_model.send_last_completion_stream_text_chunk(
             "Build a compact notes MVP, verify artifacts, and keep the scope small.",
+        );
+        fake_model.end_last_completion_stream();
+        wait_for_fake_completion(fake_model, cx).await;
+        fake_model.send_last_completion_stream_text_chunk(
+            "GOAL_SATISFIED: yes\nSUMMARY: The generated artifacts satisfy the MVP goal.\nREPAIR_REQUEST: none",
         );
         fake_model.end_last_completion_stream();
         prompt_task.await.unwrap();
