@@ -161,12 +161,11 @@ pub struct WorkerRegistry;
 
 impl WorkerRegistry {
     pub fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
-        CommandWorker.run(request)
+        CommandWorker {}.run(request)
     }
 }
 
-pub struct CommandWorker {
-}
+pub struct CommandWorker {}
 
 impl WorkerAdapter for CommandWorker {
     fn name(&self) -> &'static str {
@@ -338,6 +337,39 @@ mod tests {
         assert_eq!(WorkerKind::parse("claude-code"), Some(WorkerKind::Claude));
         assert_eq!(WorkerKind::parse("zed_agent"), Some(WorkerKind::ZedAgent));
         assert_eq!(WorkerKind::parse("unknown"), None);
+    }
+
+    #[test]
+    fn worker_config_routes_attempts_through_worker_pool() {
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("opencode run".to_string()),
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("opencode run".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Codex,
+                    worker_command: Some("codex exec".to_string()),
+                },
+            ],
+            skip_worker: false,
+            require_worker: false,
+        };
+
+        let first = config.selected_route(1);
+        assert_eq!(first.worker_kind, WorkerKind::Opencode);
+        assert_eq!(first.worker_command, Some("opencode run"));
+        assert!(first.require_worker);
+
+        let second = config.selected_route(2);
+        assert_eq!(second.worker_kind, WorkerKind::Codex);
+        assert_eq!(second.worker_command, Some("codex exec"));
+        assert!(second.require_worker);
+
+        let later = config.selected_route(8);
+        assert_eq!(later.worker_kind, WorkerKind::Codex);
     }
 
     #[test]

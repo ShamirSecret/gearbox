@@ -16,8 +16,9 @@ use crate::tools::{
 use crate::workers::{WorkerConfig, WorkerKind, WorkerRegistry, WorkerRunRequest, WorkerStatus};
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
-pub type CoordinatorReviewHook =
-    Arc<dyn Fn(CoordinatorReviewInput) -> Result<Option<CoordinatorReview>> + Send + Sync + 'static>;
+pub type CoordinatorReviewHook = Arc<
+    dyn Fn(CoordinatorReviewInput) -> Result<Option<CoordinatorReview>> + Send + Sync + 'static,
+>;
 pub const DEFAULT_MAX_ITERATIONS: usize = 2;
 
 #[derive(Clone)]
@@ -216,13 +217,14 @@ impl Orchestrator {
             ),
         )?;
 
-        let before_diff = git_snapshot(&workspace)?;
+        let mut before_diff = git_snapshot(&workspace)?;
         let mut after_diff = before_diff.clone();
         let mut scope_check = check_scope(&after_diff, &scope);
         let mut worker_result = None;
         let mut verification_results = Vec::new();
         let mut last_verification_path = None;
         let mut final_evaluation = None;
+        let mut last_coordinator_review: Option<CoordinatorReview> = None;
         let worker_registry = WorkerRegistry;
 
         for iteration in 1..=max_iterations {
@@ -300,6 +302,7 @@ impl Orchestrator {
                     &options.request,
                     iteration,
                     last_verification_path.as_deref(),
+                    last_coordinator_review.as_ref(),
                 )
             };
             let iteration_worker_result = worker_registry.run(WorkerRunRequest {
@@ -437,6 +440,27 @@ impl Orchestrator {
             )?;
 
             last_verification_path = Some(verification_path.clone());
+            let coordinator_review = run_coordinator_review(
+                &store,
+                &options.event_sink,
+                &options.coordinator_review_hook,
+                &session_id,
+                &goal_id,
+                iteration,
+                max_iterations,
+                &options.request,
+                worker_result
+                    .as_ref()
+                    .context("missing worker result for coordinator review")?,
+                verification_passed,
+                &verification_results,
+                &scope_check,
+                &before_diff,
+                &after_diff,
+            )?;
+            last_coordinator_review = coordinator_review.clone();
+            let coordinator_review = coordinator_review.as_ref();
+
             let evaluation = evaluate_goal(
                 verification_passed,
                 &worker_result
@@ -445,6 +469,7 @@ impl Orchestrator {
                     .status,
                 selected_route.require_worker,
                 &scope_check,
+                coordinator_review.as_ref(),
                 iteration,
                 max_iterations,
             );
@@ -460,6 +485,7 @@ impl Orchestrator {
                         .context("missing worker result for goal review")?,
                     &scope_check,
                     &verification_results,
+                    coordinator_review.as_ref(),
                 ),
             )?;
             add_review_task(
@@ -494,6 +520,8 @@ impl Orchestrator {
             if !should_continue {
                 break;
             }
+
+            before_diff = after_diff.clone();
         }
 
         let final_evaluation = final_evaluation.context("Gear loop did not evaluate the goal")?;
@@ -682,6 +710,157 @@ fn run_verification(
         .collect()
 }
 
+fn run_coordinator_review(
+    store: &StateStore,
+    event_sink: &Option<EventSink>,
+    hook: &Option<CoordinatorReviewHook>,
+    session_id: &str,
+    goal_id: &str,
+    iteration: usize,
+    max_iterations: usize,
+    request: &str,
+    worker_result: &crate::workers::WorkerResult,
+    verification_passed: bool,
+    verification_results: &[ShellCommandResult],
+    scope_check: &crate::tools::ScopeCheck,
+    before_diff: &DiffSnapshot,
+    after_diff: &DiffSnapshot,
+) -> Result<Option<CoordinatorReview>> {
+    let Some(hook) = hook else {
+        return Ok(None);
+    };
+
+    let input = CoordinatorReviewInput {
+        goal_id: goal_id.to_string(),
+        iteration,
+        max_iterations,
+        request: request.to_string(),
+        worker_status: worker_result.status.as_str().to_string(),
+        worker_summary: worker_result.summary.clone(),
+        verification_passed,
+        verification_summary: verification_summary(verification_results),
+        scope_summary: scope_summary(scope_check),
+        diff_summary: diff_summary(before_diff, after_diff),
+    };
+
+    let review = match hook(input) {
+        Ok(review) => review,
+        Err(error) => {
+            append_event(
+                store,
+                event_sink,
+                event(
+                    session_id,
+                    Some(goal_id),
+                    None,
+                    EventKind::TaskStarted,
+                    format!("Coordinator review failed: {error:#}"),
+                    json!({ "iteration": iteration }),
+                ),
+            )?;
+            return Ok(None);
+        }
+    };
+
+    let Some(review) = review else {
+        return Ok(None);
+    };
+
+    let review_path = store.write_artifact(
+        goal_id,
+        &format!("coordinator-review-iteration-{iteration}.md"),
+        &coordinator_review_artifact(iteration, &review),
+    )?;
+    append_event(
+        store,
+        event_sink,
+        event(
+            session_id,
+            Some(goal_id),
+            None,
+            EventKind::TaskStarted,
+            "Coordinator review completed",
+            json!({
+                "iteration": iteration,
+                "goal_satisfied": review.goal_satisfied,
+                "review_path": review_path.to_string_lossy(),
+            }),
+        ),
+    )?;
+
+    Ok(Some(review))
+}
+
+fn verification_summary(results: &[ShellCommandResult]) -> String {
+    if results.is_empty() {
+        return "No verification command ran.".to_string();
+    }
+
+    results
+        .iter()
+        .map(|result| {
+            format!(
+                "- `{}`: {} ({:?})",
+                result.command,
+                if result.success { "passed" } else { "failed" },
+                result.exit_code
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn scope_summary(scope_check: &crate::tools::ScopeCheck) -> String {
+    format!(
+        "forbidden_touches={}, outside_allowed_paths={}, changed_file_count={}, max_files_exceeded={}",
+        scope_check.forbidden_touches.len(),
+        scope_check.outside_allowed_paths.len(),
+        scope_check.changed_file_count,
+        scope_check.max_files_exceeded
+    )
+}
+
+fn diff_summary(before_diff: &DiffSnapshot, after_diff: &DiffSnapshot) -> String {
+    format!(
+        "before_files={}, after_files={}, is_git_repo={}",
+        before_diff.changed_files.len(),
+        after_diff.changed_files.len(),
+        after_diff.is_git_repo
+    )
+}
+
+fn coordinator_review_artifact(iteration: usize, review: &CoordinatorReview) -> String {
+    format!(
+        r#"# Coordinator Review
+
+Iteration: `{iteration}`
+
+## Decision
+
+- goal_satisfied: `{}`
+- summary: {}
+
+## Repair Request
+
+{}
+
+## Raw Provider Review
+
+{}
+"#,
+        review
+            .goal_satisfied
+            .map(|satisfied| if satisfied { "yes" } else { "no" })
+            .unwrap_or("unknown"),
+        review.summary,
+        review
+            .repair_request
+            .as_deref()
+            .unwrap_or("No repair request supplied."),
+        review.raw_response.trim(),
+    )
+}
+
 fn check_run_cancelled(cancellation_token: Option<&CancellationToken>) -> Result<()> {
     if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
         bail!("Gear run cancelled");
@@ -803,6 +982,7 @@ fn evaluate_goal(
     worker_status: &WorkerStatus,
     require_worker: bool,
     scope_check: &crate::tools::ScopeCheck,
+    coordinator_review: Option<&CoordinatorReview>,
     iteration: usize,
     max_iterations: usize,
 ) -> GoalEvaluation {
@@ -827,6 +1007,26 @@ fn evaluate_goal(
         };
     }
     if verification_passed {
+        if coordinator_review.is_some_and(|review| review.goal_satisfied == Some(false)) {
+            if iteration < max_iterations {
+                return GoalEvaluation {
+                    status: GoalStatus::Running,
+                    should_continue: true,
+                    summary: format!(
+                        "Coordinator review found remaining work after iteration {iteration}; Gear will plan a repair iteration."
+                    ),
+                };
+            }
+
+            return GoalEvaluation {
+                status: GoalStatus::Limited,
+                should_continue: false,
+                summary: format!(
+                    "Goal reached the iteration limit ({max_iterations}) after coordinator review found remaining work."
+                ),
+            };
+        }
+
         let summary = if *worker_status == WorkerStatus::Succeeded {
             format!("Goal completed after {iteration} Gear iteration(s).")
         } else {
@@ -864,12 +1064,16 @@ fn repair_request(
     original_request: &str,
     iteration: usize,
     verification_path: Option<&std::path::Path>,
+    coordinator_review: Option<&CoordinatorReview>,
 ) -> String {
     let verification_path = verification_path
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "missing verification artifact".to_string());
+    let coordinator_guidance = coordinator_review
+        .and_then(|review| review.repair_request.as_deref())
+        .unwrap_or("Use the verification artifact and goal review to choose the smallest repair.");
     format!(
-        "Repair iteration {iteration} for Gear goal.\n\nOriginal request:\n{original_request}\n\nReview the failed verification artifact at `{verification_path}` and make the smallest focused repair. Do not expand scope."
+        "Repair iteration {iteration} for Gear goal.\n\nOriginal request:\n{original_request}\n\nReview the failed verification artifact at `{verification_path}` and make the smallest focused repair. Do not expand scope.\n\nCoordinator repair guidance:\n{coordinator_guidance}"
     )
 }
 
@@ -880,6 +1084,7 @@ fn goal_review_artifact(
     worker_result: &crate::workers::WorkerResult,
     scope_check: &crate::tools::ScopeCheck,
     verification_results: &[ShellCommandResult],
+    coordinator_review: Option<&CoordinatorReview>,
 ) -> String {
     let verification_summary = if verification_results.is_empty() {
         "No verification command ran.".to_string()
@@ -888,6 +1093,19 @@ fn goal_review_artifact(
     } else {
         "One or more verification commands failed.".to_string()
     };
+
+    let coordinator_summary = coordinator_review
+        .map(|review| {
+            format!(
+                "- goal_satisfied: `{}`\n- summary: {}",
+                review
+                    .goal_satisfied
+                    .map(|satisfied| if satisfied { "yes" } else { "no" })
+                    .unwrap_or("unknown"),
+                review.summary
+            )
+        })
+        .unwrap_or_else(|| "No provider-backed coordinator review ran.".to_string());
 
     format!(
         r#"# Goal Review
@@ -909,6 +1127,10 @@ Iteration: `{iteration}` / `{max_iterations}`
 
 {}
 
+## Coordinator Review
+
+{}
+
 ## Scope
 
 - forbidden_touches: {}
@@ -922,6 +1144,7 @@ Iteration: `{iteration}` / `{max_iterations}`
         worker_result.status.as_str(),
         worker_result.summary,
         verification_summary,
+        coordinator_summary,
         scope_check.forbidden_touches.len(),
         scope_check.outside_allowed_paths.len(),
         scope_check.changed_file_count,
@@ -984,6 +1207,7 @@ mod tests {
                 name: "GPT-4.1".to_string(),
             }),
             coordinator_brief: Some("Prefer a compact local implementation.".to_string()),
+            coordinator_review_hook: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -1034,6 +1258,7 @@ mod tests {
             &WorkerStatus::Failed,
             false,
             &scope_check,
+            None,
             1,
             DEFAULT_MAX_ITERATIONS,
         );
@@ -1042,6 +1267,74 @@ mod tests {
         assert!(!evaluation.should_continue);
         assert!(evaluation.summary.contains("verification passed"));
         assert!(evaluation.summary.contains("worker status was failed"));
+    }
+
+    #[test]
+    fn coordinator_review_can_request_repair_after_passing_verification() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        fs::write(temp_dir.path().join("package.json"), r#"{"scripts":{}}"#)?;
+        let review_calls = Arc::new(Mutex::new(0usize));
+        let hook: CoordinatorReviewHook = {
+            let review_calls = review_calls.clone();
+            Arc::new(move |input| {
+                let mut calls = review_calls.lock().expect("review mutex poisoned");
+                *calls += 1;
+                if input.iteration == 1 {
+                    Ok(Some(CoordinatorReview {
+                        goal_satisfied: Some(false),
+                        summary: "The provider review wants one more repair pass.".to_string(),
+                        repair_request: Some("Re-check the minimal deliverable.".to_string()),
+                        raw_response: "GOAL_SATISFIED: no\nSUMMARY: The provider review wants one more repair pass.\nREPAIR_REQUEST: Re-check the minimal deliverable.".to_string(),
+                    }))
+                } else {
+                    Ok(Some(CoordinatorReview {
+                        goal_satisfied: Some(true),
+                        summary: "The goal is now satisfied.".to_string(),
+                        repair_request: None,
+                        raw_response: "GOAL_SATISFIED: yes\nSUMMARY: The goal is now satisfied.\nREPAIR_REQUEST: none".to_string(),
+                    }))
+                }
+            })
+        };
+
+        let outcome = Orchestrator::run(RunOptions {
+            request: "Build a tiny task tracker".to_string(),
+            workspace: temp_dir.path().to_path_buf(),
+            verification_commands: vec!["echo verify-ok".to_string()],
+            worker: WorkerConfig {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
+                worker_routes: Vec::new(),
+                skip_worker: true,
+                require_worker: false,
+            },
+            allowed_paths: Vec::new(),
+            forbidden_paths: vec![".git".to_string()],
+            max_files_changed: 10,
+            install_dependencies: false,
+            event_sink: None,
+            cancellation_token: None,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            coordinator_model: None,
+            coordinator_brief: None,
+            coordinator_review_hook: Some(hook),
+        })?;
+
+        assert_eq!(outcome.status, GoalStatus::Complete);
+        assert_eq!(*review_calls.lock().expect("review mutex poisoned"), 2);
+        assert!(
+            outcome
+                .artifacts_root
+                .join("coordinator-review-iteration-1.md")
+                .exists()
+        );
+        assert!(
+            outcome
+                .artifacts_root
+                .join("verification-iteration-2.md")
+                .exists()
+        );
+        Ok(())
     }
 
     #[test]
@@ -1069,6 +1362,7 @@ mod tests {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             coordinator_model: None,
             coordinator_brief: None,
+            coordinator_review_hook: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Limited);
@@ -1113,6 +1407,7 @@ mod tests {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             coordinator_model: None,
             coordinator_brief: None,
+            coordinator_review_hook: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -1157,6 +1452,7 @@ mod tests {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             coordinator_model: None,
             coordinator_brief: None,
+            coordinator_review_hook: None,
         })
         .expect_err("run should be cancelled");
 

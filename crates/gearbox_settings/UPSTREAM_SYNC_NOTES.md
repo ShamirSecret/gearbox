@@ -29,6 +29,15 @@ Two new entrypoints in `crates/ui/src/gearbox_text.rs`, exported via `crates/ui/
 
 ---
 
+## Merge Guide
+
+- `[NEW]` = entire function/struct/file added by Gearbox → **keep during merge**
+- `[MOD]` = upstream function modified → **careful diff needed**; keep Gearbox additions, merge upstream logic
+- `[NO-OP]` = cosmetic/text-only inside `GEARBOX_GUI=1` guard → **accept Gearbox side**, text is intentional
+- Files NOT listed here have no Gearbox changes and can be accepted from upstream.
+
+---
+
 ## Modified Upstream Files
 
 ### Build & workspace
@@ -37,47 +46,47 @@ Two new entrypoints in `crates/ui/src/gearbox_text.rs`, exported via `crates/ui/
 |------|--------|
 | `Cargo.toml` | `+workspace deps: gearbox, gearbox_settings, gearbox_agent` |
 | `Cargo.lock` | Auto-updated |
-| `.github/workflows/gearbox_release.yml` | New workflow. Builds `--package gearbox` on GH runners (Linux/macOS/Windows). Produces `.deb`, `.dmg`, `.exe`. Publishes to GH Release (no Sentry/Slack/notarization/signing). Keep separate from upstream. |
+| `[NEW]` `.github/workflows/gearbox_release.yml` | New workflow. Builds `--package gearbox` on GH runners (Linux/macOS/Windows). Produces `.deb`, `.dmg`, `.exe`. Publishes to GH Release (no Sentry/Slack/notarization/signing). Keep separate from upstream. |
 
 ### Settings infrastructure
 
 | File | Change |
 |------|--------|
-| `crates/settings/src/settings.rs` | `+set_settings_asset_loader`, `+settings_asset_str`. Upstream default still loads `SettingsAssets`. Gearbox calls `gearbox_settings::load` before `settings::init`. |
-| `crates/settings/src/keymap_file.rs` | Keymap loading → `settings_asset_str` (keeps default Zed keymaps unchanged) |
+| `[MOD]` `crates/settings/src/settings.rs` | `+set_settings_asset_loader`, `+settings_asset_str`. Upstream default still loads `SettingsAssets`. Gearbox calls `gearbox_settings::load` before `settings::init`. |
+| `[MOD]` `crates/settings/src/keymap_file.rs` | Keymap loading → `settings_asset_str` (keeps default Zed keymaps unchanged) |
 
 ### UI components — routed through `gearbox_translate_text`
 
 All user-visible text in these components goes through the shared translation layer:
 
-| File | Text type |
-|------|-----------|
-| `crates/ui/src/components/label/label.rs` | Label |
-| `crates/ui/src/components/label/loading_label.rs` | Loading label |
-| `crates/ui/src/components/button/button.rs` | Button |
-| `crates/ui/src/components/button/button_link.rs` | Button link |
-| `crates/ui/src/components/button/toggle_button.rs` | Toggle button |
-| `crates/ui/src/components/button/copy_button.rs` | Copy button messages/tooltips |
-| `crates/ui/src/components/button/icon_button.rs` | Icon button |
-| `crates/ui/src/components/tooltip.rs` | Tooltip |
-| `crates/ui/src/components/context_menu.rs` | Context menu |
-| `crates/ui/src/components/modal.rs` | Modal |
-| `crates/ui/src/components/chip.rs` | Chip |
-| `crates/ui/src/components/tree_view_item.rs` | Tree item |
-| `crates/ui/src/components/project_empty_state.rs` | Empty state labels, action buttons |
-| `crates/ui/src/components/collab/update_button.rs` | Update progress labels; inline GEARBOX_GUI Chinese text |
-| `crates/ui/src/components/ai/agent_setup_button.rs` | `"Gearbox Agent"` under GEARBOX_GUI |
-| `crates/ui/src/components/ai/configured_api_card.rs` | API card labels |
-| `crates/ui/src/components/ai/thread_item.rs` | Thread item labels |
-| `crates/ui/src/components/ai/ai_setting_item.rs` | AI setting labels |
-| `crates/ui/src/components/list/list_header.rs` | List header |
-| `crates/ui/src/components/list/list_sub_header.rs` | List sub-header |
-| `crates/ui/src/components/list/list_bullet_item.rs` | List bullet |
-| `crates/ui/src/styles/typography.rs` | Headline text |
+| File | Text type | Marker |
+|------|-----------|--------|
+| `crates/ui/src/components/label/label.rs` | Label | `[MOD]` |
+| `crates/ui/src/components/label/loading_label.rs` | Loading label | `[MOD]` |
+| `crates/ui/src/components/button/button.rs` | Button | `[MOD]` |
+| `crates/ui/src/components/button/button_link.rs` | Button link | `[MOD]` |
+| `crates/ui/src/components/button/toggle_button.rs` | Toggle button | `[MOD]` |
+| `crates/ui/src/components/button/copy_button.rs` | Copy button messages/tooltips | `[MOD]` |
+| `crates/ui/src/components/button/icon_button.rs` | Icon button | `[MOD]` |
+| `crates/ui/src/components/tooltip.rs` | Tooltip | `[MOD]` |
+| `crates/ui/src/components/context_menu.rs` | Context menu | `[MOD]` |
+| `crates/ui/src/components/modal.rs` | Modal | `[MOD]` |
+| `crates/ui/src/components/chip.rs` | Chip | `[MOD]` |
+| `crates/ui/src/components/tree_view_item.rs` | Tree item | `[MOD]` |
+| `crates/ui/src/components/project_empty_state.rs` | Empty state | `[MOD]` |
+| `crates/ui/src/components/collab/update_button.rs` | Update button | `[MOD]` |
+| `crates/ui/src/components/ai/agent_setup_button.rs` | Agent setup | `[MOD]` |
+| `crates/ui/src/components/ai/configured_api_card.rs` | API card | `[MOD]` |
+| `crates/ui/src/components/ai/thread_item.rs` | Thread item | `[MOD]` |
+| `crates/ui/src/components/ai/ai_setting_item.rs` | AI setting | `[MOD]` |
+| `crates/ui/src/components/list/list_header.rs` | List header | `[MOD]` |
+| `crates/ui/src/components/list/list_sub_header.rs` | List sub-header | `[MOD]` |
+| `crates/ui/src/components/list/list_bullet_item.rs` | List bullet | `[MOD]` |
+| `crates/ui/src/styles/typography.rs` | Headline | `[MOD]` |
 
 ### GUI crates — own `gearbox_label` / `gearbox_text` helpers
 
-Each crate has a local helper that checks `GEARBOX_GUI` and returns Chinese or English.  All changes preserve upstream behavior outside `GEARBOX_GUI=1`.
+Each crate has a local helper that checks `GEARBOX_GUI` and returns Chinese or English.  These are `[MOD]` — upstream functions with Gearbox text added inside `GEARBOX_GUI=1` guards.  Merge tip: accept Gearbox side for the guarded text blocks; the upstream logic around them should be merged normally.
 
 | File | What's localized | Notes |
 |------|-----------------|-------|
@@ -105,45 +114,64 @@ Each crate has a local helper that checks `GEARBOX_GUI` and returns Chinese or E
 | `crates/extensions_ui/src/extensions_ui.rs` | Version compatibility tooltips, doc/install labels | |
 | `crates/extensions_ui/src/extension_version_selector.rs` | Compatibility labels | |
 | `crates/oauth_callback_server/src/oauth_callback_server.rs` | OAuth success/failure browser pages | Zed wording kept when not `GEARBOX_GUI` |
+|------|-----------------|-------|
+| `crates/onboarding/src/onboarding.rs` | Title, subtitle, finish button | |
+| `crates/onboarding/src/basics_page.rs` | Setup labels, descriptions | Theme/font IDs left as upstream values |
+| `crates/onboarding/src/base_keymap_picker.rs` | Placeholder | |
+| `crates/workspace/src/welcome.rs` | Welcome page sections, buttons, subtitle, agent card, recent header, tab title | |
+| `crates/workspace/src/notifications.rs` | Notification titles, secondary content, primary action labels | Catches text not entering via `Label::new` / `Button::new` |
+| `crates/workspace/src/pane_group.rs` | Dynamic collab location/share labels with usernames | Cannot exact-match |
+| `crates/workspace/src/security_modal.rs` | Restricted-mode text and buttons | |
+| `crates/project_panel/src/project_panel.rs` | Context menu (36 labels), discard-changes prompt, restore/cancel buttons | File-manager labels from `ui::utils` intentionally not changed |
+| `crates/recent_projects/src/recent_projects.rs` | Picker placeholder, section headers, no-match text, footer/action labels | |
+| `crates/recent_projects/src/sidebar_recent_projects.rs` | Picker placeholder, no-match, tooltip, error prompt | |
+| `crates/recent_projects/src/wsl_picker.rs` | Distro picker placeholder | |
+| `crates/recent_projects/src/remote_connections.rs` | Connection failure prompt titles, retry/cancel buttons | |
+| `crates/recent_projects/src/remote_servers.rs` | Remote-server and Dev Container action labels | |
+| `crates/command_palette/src/command_palette.rs` | Placeholder, run/add-keybinding buttons | Command names not localized (derived from action metadata; needs separate action-name translation layer) |
+| `crates/file_finder/src/file_finder.rs` | Placeholder, filter tooltip, create-file prompt, split/open labels | |
+| `crates/open_path_prompt/src/open_path_prompt.rs` | Create/replace confirmation body, buttons, empty-state text | Prompt title keeps target path, mostly upstream-formatted |
+| `crates/collab_ui/src/collab_panel.rs` | CLA error path; participant labels, tooltips, context menu entries | Removes `zed.dev/cla` branding from Gearbox path |
+| `crates/collab_ui/src/notifications/incoming_call_notification.rs` | Call notification text with username | Dynamic format |
+| `crates/debugger_ui/src/session/running.rs` | Debugger scenario error | |
+| `crates/debugger_ui/src/new_process_modal.rs` | Command placeholder (`ENV=Gearbox ~/bin/program`) | |
+| `crates/debugger_ui/src/debugger_panel.rs` | Empty-state labels | |
+| `crates/extensions_ui/src/extensions_ui.rs` | Version compatibility tooltips, doc/install labels | |
+| `crates/extensions_ui/src/extension_version_selector.rs` | Compatibility labels | |
+| `crates/oauth_callback_server/src/oauth_callback_server.rs` | OAuth success/failure browser pages | Zed wording kept when not `GEARBOX_GUI` |
 
-### Settings UI — own `gearbox_text` / `gearbox_shared_text` / `gearbox_setting_description`
+### Settings UI
+
+All files are `[MOD]` — Gearbox text layers added inside `GEARBOX_GUI=1` guards; upstream data model and JSON paths unchanged.
 
 | File | What | Notes |
 |------|------|-------|
-| `crates/settings_ui/src/settings_ui.rs` | Page names, section headers, item titles, descriptions, subpage links, action links, navigation entries, breadcrumbs, window title, search placeholder, settings-file buttons, user/project/server scope labels, workspace-restoration text, telemetry labels, scoped settings | Fallback → `gearbox_translate_text` / `gearbox_translate_setting_description`. `Zed`→`Gearbox` in descriptions. Data model unchanged. |
-| `crates/settings_ui/src/components/dropdown.rs` | Enum labels: `Last Session`→`上次会话`, `Last Workspace`→`上次工作区`, `Empty Tab`→`空白标签页`, on/off, light/dark/system | Enum values/settings unchanged |
-| `crates/settings_ui/src/components/font_picker.rs` | Placeholder `"Search fonts…"`→`"搜索字体..."` | |
+| `crates/settings_ui/src/settings_ui.rs` | Page names, section headers, item titles, descriptions, subpage links, action links, navigation entries, breadcrumbs, window title, search placeholder, settings-file buttons, user/project/server scope labels, workspace-restoration text, telemetry labels, scoped settings | Fallback → `gearbox_translate_text` / `gearbox_translate_setting_description`. `Zed`→`Gearbox` in descriptions. |
+| `crates/settings_ui/src/components/dropdown.rs` | Enum labels: `Last Session`→`上次会话`, etc. | Enum values/settings unchanged |
+| `crates/settings_ui/src/components/font_picker.rs` | Placeholder | |
 | `crates/settings_ui/src/components/theme_picker.rs` | Placeholder; `Zed` theme names→`Gearbox` display | Internal theme IDs unchanged |
 | `crates/settings_ui/src/components/icon_theme_picker.rs` | Placeholder; `Zed` icon theme names→`Gearbox` display | Internal IDs unchanged |
 | `crates/settings_ui/src/components/ollama_model_picker.rs` | Placeholder | |
-| `crates/settings_ui/src/pages/edit_prediction_provider_setup.rs` | Restart instruction→Gearbox wording | |
-| `crates/settings_ui/src/pages/llm_providers_page.rs` | Restart instruction→Gearbox wording | |
-| `crates/settings_ui/src/pages/tool_permissions_setup.rs` | Native-agent disclaimer→Gearbox wording | |
-| `crates/settings_ui/src/pages/sandbox_settings.rs` | Sandbox explanation→Gearbox wording | |
-| `crates/settings_ui/src/pages/skill_creator.rs` | Private-file retry→Gearbox wording | |
+| `crates/settings_ui/src/pages/edit_prediction_provider_setup.rs` | Restart instruction→Gearbox | |
+| `crates/settings_ui/src/pages/llm_providers_page.rs` | Restart instruction→Gearbox | |
+| `crates/settings_ui/src/pages/tool_permissions_setup.rs` | Native-agent disclaimer→Gearbox | |
+| `crates/settings_ui/src/pages/sandbox_settings.rs` | Sandbox explanation→Gearbox | |
+| `crates/settings_ui/src/pages/skill_creator.rs` | Private-file retry→Gearbox | |
 
 ### Language model & OAuth providers
 
-| File(s) | What | Notes |
-|---------|------|-------|
-| `crates/language_models/src/provider.rs` | Visible provider/help/error wording: `Zed`→`Gearbox` | |
-| `crates/language_models/src/provider/api_compatible.rs` | Same pattern | |
-| `crates/language_models/src/provider/bedrock.rs` | Same pattern | |
-| `crates/language_models/src/provider/cloud.rs` | Same pattern | |
-| `crates/language_models/src/provider/llama_cpp.rs` | Same pattern | |
-| `crates/language_models/src/provider/lmstudio.rs` | Same pattern | |
-| `crates/language_models/src/provider/mistral.rs` | Same pattern | |
-| `crates/language_models/src/provider/ollama.rs` | Same pattern | |
-| `crates/language_models/src/provider/openai_subscribed.rs` | Same pattern | |
-| `crates/language_models/src/provider/opencode.rs` | Same pattern | |
-| `crates/language_models/src/provider/vercel_ai_gateway.rs` | Same pattern | |
-| | **All providers:** internal type names, provider type names, plan enum variants unchanged. | |
-| `crates/context_server/src/context_server.rs` | Visible OAuth/client metadata→Gearbox wording | Endpoint constants kept |
-| `crates/context_server/src/oauth.rs` | Same | Endpoint constants kept |
+All are `[MOD]` — visible text replace `Zed`→`Gearbox` only. Internal type/plan/enum identifiers unchanged.
+
+| File(s) | What |
+|---------|------|
+| `crates/language_models/src/provider.rs` | Visible provider/help/error wording |
+| `crates/language_models/src/provider/{api_compatible,bedrock,cloud,llama_cpp,lmstudio,mistral,ollama,openai_subscribed,opencode,vercel_ai_gateway}.rs` | Same pattern across all 10 providers |
+| `crates/context_server/src/context_server.rs` | OAuth/client metadata→Gearbox; endpoint constants kept |
+| `crates/context_server/src/oauth.rs` | Same |
 
 ---
 
-## Gear Native Agent (`crates/gearbox_agent/`)
+## `[NEW]` Gear Native Agent (`crates/gearbox_agent/`)
 
 New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 
@@ -170,53 +198,63 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 
 ## Agent Integration Changes
 
-### `crates/agent/Cargo.toml`
+### `[NEW]` `crates/agent/Cargo.toml`
 - `+dep: gearbox_agent`
 
-### `crates/agent/src/agent.rs`
-- `+GEAR_AGENT_ID = AgentId::new("Gear")`
-- `+Session.gear_cancellation_token: Option<CancellationToken>`, `+Session.work_dirs: Option<PathList>`
-- `NativeAgentConnection::gear(agent)` constructor
-- `send_gear_prompt()`: routes prompts → `Orchestrator::run()` on `cx.background_spawn`
-  - Reads thread's selected model→`gear_coordinator_from_thread()`→`CoordinatorModel`
-  - `generate_gear_coordinator_brief()`: async LLM call for planning brief; skips test-provider (`"fake"`)
-  - `is_gear_executable_goal()`: filters greetings/small-talk; trims ASCII+CJK punctuation; checks action words + char count (≥12)
-  - Greeting path: `"你好，我是 Gear。请告诉我你想完成的目标..."` Chinese response
-  - `gear_workspace_for_session()`: work_dirs→visible_worktree fallback
-  - Event streaming: `async_channel` from orchestrator→ACP thread for live progress
-- `gear_worker_config_from_env()`: `GEARBOX_GEAR_WORKER` (kind), `GEARBOX_GEAR_WORKER_COMMAND`, fallback to legacy `GEARBOX_OPENCODE_COMMAND`. Warns on invalid kinds. `require_worker: true` when command configured.
-- `cancel()`: cancels Gear token + `thread.cancel()` for cleanup
-- `clear_gear_cancellation_token()`: clears token if same reference
+### `[MOD]` `crates/agent/src/agent.rs`
 
-### `crates/agent/src/native_agent_server.rs`
+| Marker | Function / Change | What |
+|--------|------------------|------|
+| `[NEW]` | `GEAR_AGENT_ID` | Static `LazyLock<AgentId>` for `"Gear"` |
+| `[MOD]` | `struct Session` | `+gear_cancellation_token: Option<CancellationToken>`, `+work_dirs: Option<PathList>` |
+| `[NEW]` | `NativeAgentConnection::gear()` | Constructor for Gear native connection |
+| `[NEW]` | `send_gear_prompt()` | Routes prompts → `Orchestrator::run()` on `cx.background_spawn` |
+| `[NEW]` | `gear_coordinator_from_thread()` | Reads thread's model → `CoordinatorModel` metadata |
+| `[NEW]` | `generate_gear_coordinator_brief()` | Async LLM call for planning brief; skips `"fake"` provider |
+| `[NEW]` | `is_gear_executable_goal()` | Filters greetings; trims ASCII+CJK punctuation; checks action words + length |
+| `[NEW]` | `gear_workspace_for_session()` | Resolves workspace: `work_dirs` → `visible_worktree` fallback |
+| `[NEW]` | `push_gear_assistant_markdown()` | Pushes markdown block into ACP thread + internal Thread |
+| `[NEW]` | `gear_request_from_prompt()` | Extracts text content from ACP prompt blocks |
+| `[NEW]` | `gear_worker_config_from_env()` | Reads `GEARBOX_GEAR_WORKER`, `GEARBOX_GEAR_WORKER_COMMAND`, fallback `GEARBOX_OPENCODE_COMMAND`. Warns on invalid kinds. `require_worker=true` when command set. |
+| `[NEW]` | `gear_verification_commands_from_env()` | Reads `GEARBOX_GEAR_VERIFY_COMMANDS` |
+| `[NEW]` | `gear_event_status_markdown()` | Event → markdown status line |
+| `[NEW]` | `gear_response_markdown()` | Final report → markdown summary |
+| `[NEW]` | `clear_gear_cancellation_token()` | Clears session token if same reference |
+| `[MOD]` | `cancel()` | +Gear token cancel; calls `token.cancel()` then `thread.cancel()` |
+| `[NEW]` | `test_gear_prompt_runs_gearbox_orchestrator` | GPUI integration test |
+| `[NEW]` | `test_gear_prompt_greeting_does_not_start_orchestrator` | GPUI test for small-talk filtering |
+
+**Imports added:** `gearbox_agent::runtime::*`, `gearbox_agent::tools::CancellationToken`, `gearbox_agent::workers::*`, `gearbox_agent::state::CoordinatorModel`, `language_model::{CompletionIntent, LanguageModelRequest, LanguageModelRequestMessage, Role}`
+
+### `[NEW]` `crates/agent/src/native_agent_server.rs`
 - `NativeAgentServer::gear()`: `agent_id: GEAR_AGENT_ID`, `telemetry_id: "gear"`, `logo: Sparkle`
 
-### `crates/agent/src/tests/mod.rs`
-- Updated native agent tests for explicit identity metadata fields (struct destructuring)
+### `[MOD]` `crates/agent/src/tests/mod.rs`
+- Native agent tests updated for explicit identity metadata struct fields (was tuple access)
 
-### `crates/agent_ui/src/agent_ui.rs`
+### `[MOD]` `crates/agent_ui/src/agent_ui.rs`
 - `+Agent::GearAgent` variant, serde alias `"GearAgent"`
 - `Agent::label()`: `"Agent"` under GEARBOX_GUI (from `"Zed Agent"`), `"Gear"` for GearAgent
 - `Agent::server()`: returns `NativeAgentServer::gear()`
 - `Agent::icon()`: `Sparkle` for GearAgent and Custom
 - `Agent::is_native()`: includes GearAgent
 
-### `crates/agent_ui/src/agent_panel.rs`
+### `[MOD]` `crates/agent_ui/src/agent_panel.rs`
 - Gear in `list_agents_and_models`: only when `GEARBOX_GUI=1`; shares native model list
 - Context menu entry: `"Gear"` with `Sparkle` icon, launches new thread
 - Agent ID routing for sibling thread creation
 
-### `crates/agent_ui/src/agent_connection_store.rs`
+### `[MOD]` `crates/agent_ui/src/agent_connection_store.rs`
 - `Agent::GearAgent` entries always retained
 
-### `crates/agent_ui/src/conversation_view/thread_view.rs`, `agent_ui/src/mention_set.rs`
+### `[MOD]` `crates/agent_ui/src/conversation_view/thread_view.rs`, `agent_ui/src/mention_set.rs`
 - Updated for native connection identity metadata (struct fields instead of tuple access)
 
 ---
 
 ## Gearbox Branding & Packaging
 
-### Binary entry point (`crates/gearbox/`)
+### `[NEW]` Binary entry point (`crates/gearbox/`)
 
 | File | Change |
 |------|--------|
@@ -227,7 +265,7 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 | `src/zed/quick_action_bar/repl_menu.rs` | `ZED_REPL_DOCUMENTATION` const→gearbox repo URL |
 | `build.rs` | Diagnostic prefix→`"gearbox build.rs:"` |
 
-### Packaging resources
+### `[NEW]` Packaging resources
 
 | File | Change |
 |------|--------|
@@ -236,6 +274,8 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 | `crates/gearbox/resources/snap/snapcraft.yaml.in` | Entry/command→`gearbox`; `ZED_BUNDLE_TYPE` kept |
 | `crates/gearbox_settings/assets/settings/*` | Settings with Gearbox comments/docs/menu strings. Internal IDs (`.ZedMono`, `Zed (Default)`, `ZedPredictModal`) kept; Gearbox display layer renames at render. |
 | `crates/gearbox_settings/assets/keymaps/*` | Keymaps with Gearbox strings. Internal context IDs kept. |
+| `[NEW]` `docs/gearbox-gear-agent-plan.md` | Design doc tracking Gear runtime progress and milestones |
+| `[NEW]` `docs/gearbox-gear-agent-plan.md` | Design doc tracking Gear runtime progress and milestones |
 
 ---
 

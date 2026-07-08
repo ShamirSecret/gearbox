@@ -47,7 +47,10 @@ use fs::Fs;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
-use gearbox_agent::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
+use gearbox_agent::runtime::{
+    CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
+    Orchestrator, RunOptions,
+};
 use gearbox_agent::state::CoordinatorModel;
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{WorkerConfig, WorkerKind, WorkerRoute};
@@ -2434,10 +2437,47 @@ impl NativeAgentConnection {
         });
 
         let (event_tx, event_rx) = async_channel::unbounded::<String>();
+        let (review_tx, review_rx) = async_channel::unbounded::<GearCoordinatorReviewJob>();
 
         let agent = self.agent.clone();
         let cancellation_session_id = session_id.clone();
         cx.spawn(async move |cx| {
+            let review_language_model = coordinator_language_model.clone();
+            let review_task = cx.spawn(async move |cx| {
+                while let Ok(job) = review_rx.recv().await {
+                    let review = generate_gear_coordinator_review(
+                        review_language_model.clone(),
+                        job.input,
+                        cx,
+                    )
+                    .await;
+                    if job.response_tx.send(Ok(review)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let coordinator_review_hook =
+                coordinator_language_model
+                    .as_ref()
+                    .map(|_| -> CoordinatorReviewHook {
+                        let review_tx = review_tx.clone();
+                        Arc::new(move |input: CoordinatorReviewInput| {
+                            let (response_tx, response_rx) = async_channel::bounded(1);
+                            smol::block_on(async {
+                                review_tx
+                                    .send(GearCoordinatorReviewJob { input, response_tx })
+                                    .await
+                                    .context("failed to send Gear coordinator review request")?;
+                                response_rx
+                                    .recv()
+                                    .await
+                                    .context("failed to receive Gear coordinator review response")?
+                            })
+                        })
+                    });
+            drop(review_tx);
+
             let coordinator_brief =
                 generate_gear_coordinator_brief(coordinator_language_model, &request, cx).await;
             let run_cancellation_token = cancellation_token.clone();
@@ -2455,13 +2495,14 @@ impl NativeAgentConnection {
                     worker: gear_worker_config_from_env(),
                     allowed_paths: Vec::new(),
                     forbidden_paths: Vec::new(),
-                    max_files_changed: 40,
+                    max_files_changed: gear_max_files_changed_from_env(),
                     install_dependencies: false,
                     event_sink: Some(event_sink),
                     cancellation_token: Some(run_cancellation_token),
-                    max_iterations: DEFAULT_MAX_ITERATIONS,
+                    max_iterations: gear_max_iterations_from_env(),
                     coordinator_model,
                     coordinator_brief,
+                    coordinator_review_hook,
                 })?;
                 let final_report = std_fs::read_to_string(&outcome.final_report_path)
                     .with_context(|| {
@@ -2505,6 +2546,7 @@ impl NativeAgentConnection {
                 &cancellation_token,
                 cx,
             );
+            review_task.await;
             response
         })
     }
@@ -2568,6 +2610,11 @@ fn gear_coordinator_from_thread(
     (metadata, model)
 }
 
+struct GearCoordinatorReviewJob {
+    input: CoordinatorReviewInput,
+    response_tx: async_channel::Sender<Result<Option<CoordinatorReview>>>,
+}
+
 async fn generate_gear_coordinator_brief(
     model: Option<Arc<dyn LanguageModel>>,
     request: &str,
@@ -2628,6 +2675,141 @@ async fn generate_gear_coordinator_brief(
     } else {
         Some(brief.to_string())
     }
+}
+
+async fn generate_gear_coordinator_review(
+    model: Option<Arc<dyn LanguageModel>>,
+    input: CoordinatorReviewInput,
+    cx: &AsyncApp,
+) -> Option<CoordinatorReview> {
+    let Some(model) = model else {
+        return None;
+    };
+
+    let review_request = format!(
+        r#"Goal id: {goal_id}
+Iteration: {iteration}/{max_iterations}
+
+Original request:
+{request}
+
+Worker:
+- status: {worker_status}
+- summary: {worker_summary}
+
+Verification passed: {verification_passed}
+Verification:
+{verification_summary}
+
+Scope:
+{scope_summary}
+
+Diff:
+{diff_summary}
+
+Return exactly these fields:
+GOAL_SATISFIED: yes|no|unknown
+SUMMARY: one concise sentence
+REPAIR_REQUEST: one concise instruction for the next worker, or none
+"#,
+        goal_id = input.goal_id,
+        iteration = input.iteration,
+        max_iterations = input.max_iterations,
+        request = input.request,
+        worker_status = input.worker_status,
+        worker_summary = input.worker_summary,
+        verification_passed = input.verification_passed,
+        verification_summary = input.verification_summary,
+        scope_summary = input.scope_summary,
+        diff_summary = input.diff_summary,
+    );
+
+    let request = LanguageModelRequest {
+        intent: Some(CompletionIntent::UserPrompt),
+        temperature: Some(0.1),
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![
+                    "You are Gear's coordinator review hook. Review whether the goal is actually satisfied after this iteration. Do not write code. Be conservative: if deterministic verification failed, do not mark the goal satisfied. Keep the response structured exactly as requested.".into(),
+                ],
+                cache: false,
+                reasoning_details: None,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![review_request.into()],
+                cache: false,
+                reasoning_details: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let mut stream = match model.stream_completion_text(request, cx).await {
+        Ok(stream) => stream.stream,
+        Err(error) => {
+            log::warn!("Gear coordinator review request failed: {error}");
+            return None;
+        }
+    };
+    let mut review = String::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(text) => {
+                review.push_str(&text);
+                if review.len() >= 4000 {
+                    break;
+                }
+            }
+            Err(error) => {
+                log::warn!("Gear coordinator review stream failed: {error}");
+                return None;
+            }
+        }
+    }
+
+    parse_gear_coordinator_review(&review)
+}
+
+fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
+    let raw_response = review.trim();
+    if raw_response.is_empty() {
+        return None;
+    }
+
+    let mut goal_satisfied = None;
+    let mut summary = None;
+    let mut repair_request = None;
+
+    for line in raw_response.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match key.as_str() {
+            "goal_satisfied" => {
+                goal_satisfied = match value.to_ascii_lowercase().as_str() {
+                    "yes" | "true" | "complete" => Some(true),
+                    "no" | "false" | "incomplete" => Some(false),
+                    _ => None,
+                };
+            }
+            "summary" if !value.is_empty() => summary = Some(value.to_string()),
+            "repair_request" if !value.is_empty() && !value.eq_ignore_ascii_case("none") => {
+                repair_request = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    Some(CoordinatorReview {
+        goal_satisfied,
+        summary: summary.unwrap_or_else(|| raw_response.lines().next().unwrap_or("").to_string()),
+        repair_request,
+        raw_response: raw_response.to_string(),
+    })
 }
 
 fn is_gear_executable_goal(request: &str) -> bool {
@@ -2792,12 +2974,11 @@ fn gear_worker_routes_from_env(
                 log::warn!("Ignoring unknown GEARBOX_GEAR_WORKER_SEQUENCE value `{worker}`");
                 return None;
             };
-            let worker_command =
-                gear_worker_command_for_kind(worker_kind).or_else(|| {
-                    (worker_kind == default_worker_kind)
-                        .then(|| default_worker_command.map(ToString::to_string))
-                        .flatten()
-                });
+            let worker_command = gear_worker_command_for_kind(worker_kind).or_else(|| {
+                (worker_kind == default_worker_kind)
+                    .then(|| default_worker_command.map(ToString::to_string))
+                    .flatten()
+            });
             Some(WorkerRoute {
                 worker_kind,
                 worker_command,
@@ -2836,6 +3017,27 @@ fn gear_verification_commands_from_env() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn gear_max_iterations_from_env() -> usize {
+    gear_usize_from_env("GEARBOX_GEAR_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)
+}
+
+fn gear_max_files_changed_from_env() -> usize {
+    gear_usize_from_env("GEARBOX_GEAR_MAX_FILES_CHANGED", 40)
+}
+
+fn gear_usize_from_env(name: &str, default_value: usize) -> usize {
+    let Some(value) = trimmed_env_value(name) else {
+        return default_value;
+    };
+    match value.parse::<usize>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            log::warn!("Ignoring invalid {name} value `{value}`; using {default_value}");
+            default_value
+        }
+    }
 }
 
 fn gear_event_status_markdown(event: &gearbox_agent::state::Event) -> String {
@@ -4393,6 +4595,21 @@ mod internal_tests {
         assert!(!is_gear_executable_goal("你好。"));
         assert!(!is_gear_executable_goal("我昨天看了一部很有趣的电影。"));
         assert!(is_gear_executable_goal("请帮我修复这个 bug。"));
+    }
+
+    #[test]
+    fn parses_gear_coordinator_review_fields() {
+        let review = parse_gear_coordinator_review(
+            "GOAL_SATISFIED: no\nSUMMARY: Needs another repair pass.\nREPAIR_REQUEST: Fix the failing build.",
+        )
+        .expect("review should parse");
+
+        assert_eq!(review.goal_satisfied, Some(false));
+        assert_eq!(review.summary, "Needs another repair pass.");
+        assert_eq!(
+            review.repair_request.as_deref(),
+            Some("Fix the failing build.")
+        );
     }
 
     async fn setup_native_agent_session(
