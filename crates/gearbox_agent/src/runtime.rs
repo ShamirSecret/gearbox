@@ -469,7 +469,7 @@ impl Orchestrator {
                     .status,
                 selected_route.require_worker,
                 &scope_check,
-                coordinator_review.as_ref(),
+                coordinator_review,
                 iteration,
                 max_iterations,
             );
@@ -485,7 +485,7 @@ impl Orchestrator {
                         .context("missing worker result for goal review")?,
                     &scope_check,
                     &verification_results,
-                    coordinator_review.as_ref(),
+                    coordinator_review,
                 ),
             )?;
             add_review_task(

@@ -114,31 +114,6 @@ Each crate has a local helper that checks `GEARBOX_GUI` and returns Chinese or E
 | `crates/extensions_ui/src/extensions_ui.rs` | Version compatibility tooltips, doc/install labels | |
 | `crates/extensions_ui/src/extension_version_selector.rs` | Compatibility labels | |
 | `crates/oauth_callback_server/src/oauth_callback_server.rs` | OAuth success/failure browser pages | Zed wording kept when not `GEARBOX_GUI` |
-|------|-----------------|-------|
-| `crates/onboarding/src/onboarding.rs` | Title, subtitle, finish button | |
-| `crates/onboarding/src/basics_page.rs` | Setup labels, descriptions | Theme/font IDs left as upstream values |
-| `crates/onboarding/src/base_keymap_picker.rs` | Placeholder | |
-| `crates/workspace/src/welcome.rs` | Welcome page sections, buttons, subtitle, agent card, recent header, tab title | |
-| `crates/workspace/src/notifications.rs` | Notification titles, secondary content, primary action labels | Catches text not entering via `Label::new` / `Button::new` |
-| `crates/workspace/src/pane_group.rs` | Dynamic collab location/share labels with usernames | Cannot exact-match |
-| `crates/workspace/src/security_modal.rs` | Restricted-mode text and buttons | |
-| `crates/project_panel/src/project_panel.rs` | Context menu (36 labels), discard-changes prompt, restore/cancel buttons | File-manager labels from `ui::utils` intentionally not changed |
-| `crates/recent_projects/src/recent_projects.rs` | Picker placeholder, section headers, no-match text, footer/action labels | |
-| `crates/recent_projects/src/sidebar_recent_projects.rs` | Picker placeholder, no-match, tooltip, error prompt | |
-| `crates/recent_projects/src/wsl_picker.rs` | Distro picker placeholder | |
-| `crates/recent_projects/src/remote_connections.rs` | Connection failure prompt titles, retry/cancel buttons | |
-| `crates/recent_projects/src/remote_servers.rs` | Remote-server and Dev Container action labels | |
-| `crates/command_palette/src/command_palette.rs` | Placeholder, run/add-keybinding buttons | Command names not localized (derived from action metadata; needs separate action-name translation layer) |
-| `crates/file_finder/src/file_finder.rs` | Placeholder, filter tooltip, create-file prompt, split/open labels | |
-| `crates/open_path_prompt/src/open_path_prompt.rs` | Create/replace confirmation body, buttons, empty-state text | Prompt title keeps target path, mostly upstream-formatted |
-| `crates/collab_ui/src/collab_panel.rs` | CLA error path; participant labels, tooltips, context menu entries | Removes `zed.dev/cla` branding from Gearbox path |
-| `crates/collab_ui/src/notifications/incoming_call_notification.rs` | Call notification text with username | Dynamic format |
-| `crates/debugger_ui/src/session/running.rs` | Debugger scenario error | |
-| `crates/debugger_ui/src/new_process_modal.rs` | Command placeholder (`ENV=Gearbox ~/bin/program`) | |
-| `crates/debugger_ui/src/debugger_panel.rs` | Empty-state labels | |
-| `crates/extensions_ui/src/extensions_ui.rs` | Version compatibility tooltips, doc/install labels | |
-| `crates/extensions_ui/src/extension_version_selector.rs` | Compatibility labels | |
-| `crates/oauth_callback_server/src/oauth_callback_server.rs` | OAuth success/failure browser pages | Zed wording kept when not `GEARBOX_GUI` |
 
 ### Settings UI
 
@@ -274,7 +249,6 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 | `crates/gearbox/resources/snap/snapcraft.yaml.in` | Entry/command→`gearbox`; `ZED_BUNDLE_TYPE` kept |
 | `crates/gearbox_settings/assets/settings/*` | Settings with Gearbox comments/docs/menu strings. Internal IDs (`.ZedMono`, `Zed (Default)`, `ZedPredictModal`) kept; Gearbox display layer renames at render. |
 | `crates/gearbox_settings/assets/keymaps/*` | Keymaps with Gearbox strings. Internal context IDs kept. |
-| `[NEW]` `docs/gearbox-gear-agent-plan.md` | Design doc tracking Gear runtime progress and milestones |
 | `[NEW]` `docs/gearbox-gear-agent-plan.md` | Design doc tracking Gear runtime progress and milestones |
 
 ---
