@@ -2464,16 +2464,12 @@ impl NativeAgentConnection {
                         let review_tx = review_tx.clone();
                         Arc::new(move |input: CoordinatorReviewInput| {
                             let (response_tx, response_rx) = async_channel::bounded(1);
-                            smol::block_on(async {
-                                review_tx
-                                    .send(GearCoordinatorReviewJob { input, response_tx })
-                                    .await
-                                    .context("failed to send Gear coordinator review request")?;
-                                response_rx
-                                    .recv()
-                                    .await
-                                    .context("failed to receive Gear coordinator review response")?
-                            })
+                            review_tx
+                                .send_blocking(GearCoordinatorReviewJob { input, response_tx })
+                                .context("failed to send Gear coordinator review request")?;
+                            response_rx
+                                .recv_blocking()
+                                .context("failed to receive Gear coordinator review response")?
                         })
                     });
             drop(review_tx);
