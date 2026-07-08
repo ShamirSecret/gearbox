@@ -25,6 +25,13 @@ pub struct Session {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoordinatorModel {
+    pub provider_id: String,
+    pub model_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Goal {
     pub id: String,
     pub title: String,
@@ -38,6 +45,10 @@ pub struct Goal {
     pub success_criteria: Vec<String>,
     pub budget: Budget,
     pub current_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_model: Option<CoordinatorModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_brief: Option<String>,
     pub summary: String,
 }
 

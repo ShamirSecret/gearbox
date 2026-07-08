@@ -6,8 +6,8 @@ use serde_json::json;
 use crate::languages::{LanguageDetection, detect_with_request};
 use crate::product;
 use crate::state::{
-    Budget, Event, EventKind, Goal, GoalStatus, Scope, Session, StateStore, Task, TaskInputs,
-    TaskKind, TaskOutputs, TaskStatus, event, id_timestamp, timestamp,
+    Budget, CoordinatorModel, Event, EventKind, Goal, GoalStatus, Scope, Session, StateStore, Task,
+    TaskInputs, TaskKind, TaskOutputs, TaskStatus, event, id_timestamp, timestamp,
 };
 use crate::tools::{
     CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_snapshot,
@@ -31,6 +31,8 @@ pub struct RunOptions {
     pub event_sink: Option<EventSink>,
     pub cancellation_token: Option<CancellationToken>,
     pub max_iterations: usize,
+    pub coordinator_model: Option<CoordinatorModel>,
+    pub coordinator_brief: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +98,8 @@ impl Orchestrator {
             success_criteria: success_criteria(&detection),
             budget: Budget::default(),
             current_task_id: None,
+            coordinator_model: options.coordinator_model.clone(),
+            coordinator_brief: options.coordinator_brief.clone(),
             summary: String::new(),
         };
 
@@ -122,6 +126,8 @@ impl Orchestrator {
                     "workspace": workspace.to_string_lossy(),
                     "language_profile": detection.profile.as_str(),
                     "evidence": &detection.evidence,
+                    "coordinator_model": &goal.coordinator_model,
+                    "coordinator_brief": &goal.coordinator_brief,
                 }),
             ),
         )?;
@@ -268,6 +274,8 @@ impl Orchestrator {
                 verification_commands: &detection.verification_commands,
                 config: &options.worker,
                 cancellation_token: options.cancellation_token.as_ref(),
+                coordinator_model: goal.coordinator_model.as_ref(),
+                coordinator_brief: goal.coordinator_brief.as_deref(),
             })?;
 
             update_worker_task(
@@ -924,6 +932,12 @@ mod tests {
             event_sink: Some(event_sink),
             cancellation_token: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            coordinator_model: Some(CoordinatorModel {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-4.1".to_string(),
+                name: "GPT-4.1".to_string(),
+            }),
+            coordinator_brief: Some("Prefer a compact local implementation.".to_string()),
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -931,6 +945,28 @@ mod tests {
         assert!(outcome.events_path.exists());
         assert!(outcome.artifacts_root.join("spec.md").exists());
         assert!(outcome.artifacts_root.join("plan.md").exists());
+        let goal = fs::read_to_string(
+            temp_dir
+                .path()
+                .join(".gearbox-agent")
+                .join("goals")
+                .join(format!("{}.json", outcome.goal_id)),
+        )?;
+        assert!(goal.contains("\"provider_id\": \"openai\""));
+        assert!(goal.contains("Prefer a compact local implementation."));
+        let packet = fs::read_to_string(
+            temp_dir
+                .path()
+                .join(".gearbox-agent")
+                .join("workers")
+                .join("task_003")
+                .join("packet.json"),
+        )?;
+        assert!(packet.contains("\"model_id\": \"gpt-4.1\""));
+        assert!(packet.contains("Prefer a compact local implementation."));
+        let final_report = fs::read_to_string(&outcome.final_report_path)?;
+        assert!(final_report.contains("GPT-4.1 (openai/gpt-4.1)"));
+        assert!(final_report.contains("Prefer a compact local implementation."));
         let verification = fs::read_to_string(outcome.artifacts_root.join("verification.md"))?;
         assert!(verification.contains("verify-ok"));
         let events = events.lock().expect("events mutex poisoned");
@@ -966,6 +1002,8 @@ mod tests {
             event_sink: None,
             cancellation_token: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            coordinator_model: None,
+            coordinator_brief: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Limited);
@@ -1007,6 +1045,8 @@ mod tests {
             event_sink: None,
             cancellation_token: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            coordinator_model: None,
+            coordinator_brief: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -1048,6 +1088,8 @@ mod tests {
             event_sink: None,
             cancellation_token: Some(cancellation_token),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            coordinator_model: None,
+            coordinator_brief: None,
         })
         .expect_err("run should be cancelled");
 

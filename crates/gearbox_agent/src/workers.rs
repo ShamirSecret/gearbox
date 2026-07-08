@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Scope, StateStore, Task, TaskInputs};
+use crate::state::{CoordinatorModel, Scope, StateStore, Task, TaskInputs};
 use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation};
 
 #[derive(Clone, Debug)]
@@ -60,6 +60,10 @@ pub struct WorkerPacket {
     pub task_id: String,
     pub worker: String,
     pub goal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinator_model: Option<CoordinatorModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinator_brief: Option<String>,
     pub scope: Scope,
     pub inputs: TaskInputs,
     pub constraints: Vec<String>,
@@ -107,6 +111,8 @@ pub struct WorkerRunRequest<'a> {
     pub verification_commands: &'a [String],
     pub config: &'a WorkerConfig,
     pub cancellation_token: Option<&'a CancellationToken>,
+    pub coordinator_model: Option<&'a CoordinatorModel>,
+    pub coordinator_brief: Option<&'a str>,
 }
 
 pub trait WorkerAdapter {
@@ -144,11 +150,15 @@ impl WorkerAdapter for CommandWorker {
             verification_commands,
             config,
             cancellation_token,
+            coordinator_model,
+            coordinator_brief,
         } = request;
         let packet = WorkerPacket {
             task_id: task.id.clone(),
             worker: self.name().to_string(),
             goal: goal.to_string(),
+            coordinator_model: coordinator_model.cloned(),
+            coordinator_brief: coordinator_brief.map(ToString::to_string),
             scope: task.scope.clone(),
             inputs: task.inputs.clone(),
             constraints: vec![
@@ -331,6 +341,8 @@ mod tests {
             verification_commands: &[],
             config: &config,
             cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
         })?;
 
         let packet = fs::read_to_string(result.packet_path)?;

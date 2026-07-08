@@ -16,6 +16,7 @@ pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
 
 - Product type: {}
 - Language profile: {}
+- Coordinator model: {}
 - Evidence: {}
 - Prefer reversible defaults when the prompt leaves details open.
 - Keep the first implementation local and runnable.
@@ -39,10 +40,15 @@ pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
 ## Generation Guidance
 
 {}
+
+## Coordinator Brief
+
+{}
 "#,
         goal.request,
         goal.product_type,
         detection.profile.as_str(),
+        coordinator_model_summary(goal),
         if detection.evidence.is_empty() {
             "none".to_string()
         } else {
@@ -53,7 +59,8 @@ pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
             .map(|criterion| format!("- {criterion}"))
             .collect::<Vec<_>>()
             .join("\n"),
-        generation_guidance
+        generation_guidance,
+        coordinator_brief_summary(goal)
     )
 }
 
@@ -86,6 +93,7 @@ Goal: `{}`
 
 ## Default Build Path
 
+- Use the coordinator model recorded below for Gear planning and review context when available.
 - Confirm the workspace facts with deterministic tools.
 - Follow the generation guidance below before writing code.
 - Send bounded implementation work to the configured worker adapter.
@@ -98,12 +106,40 @@ Goal: `{}`
 
 {}
 
+## Coordinator Model
+
+{}
+
+## Coordinator Brief
+
+{}
+
 ## Verification Commands
 
 {}
 "#,
-        goal.id, task_lines, generation_guidance, commands
+        goal.id,
+        task_lines,
+        generation_guidance,
+        coordinator_model_summary(goal),
+        coordinator_brief_summary(goal),
+        commands
     )
+}
+
+fn coordinator_model_summary(goal: &Goal) -> String {
+    goal.coordinator_model
+        .as_ref()
+        .map(|model| format!("{} ({}/{})", model.name, model.provider_id, model.model_id))
+        .unwrap_or_else(|| "not configured".to_string())
+}
+
+fn coordinator_brief_summary(goal: &Goal) -> String {
+    goal.coordinator_brief
+        .as_deref()
+        .filter(|brief| !brief.trim().is_empty())
+        .unwrap_or("not generated")
+        .to_string()
 }
 
 fn generation_guidance(detection: &LanguageDetection) -> String {
@@ -227,6 +263,14 @@ Status: `{}`
 - packet: `{}`
 - prompt: `{}`
 
+## Coordinator Model
+
+{}
+
+## Coordinator Brief
+
+{}
+
 ## Verification
 
 {}
@@ -254,6 +298,8 @@ Status: `{}`
         worker_result.summary,
         worker_result.packet_path.display(),
         worker_result.prompt_path.display(),
+        coordinator_model_summary(goal),
+        coordinator_brief_summary(goal),
         verification_summary,
         changed_files,
         scope_summary,

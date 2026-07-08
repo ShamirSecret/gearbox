@@ -48,6 +48,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
 use gearbox_agent::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
+use gearbox_agent::state::CoordinatorModel;
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{WorkerConfig, WorkerKind};
 use gpui::{
@@ -55,8 +56,9 @@ use gpui::{
     TaskExt, WeakEntity,
 };
 use language_model::{
-    IconOrSvg, LanguageModel, LanguageModelId, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelRegistry,
+    CompletionIntent, IconOrSvg, LanguageModel, LanguageModelId, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, Role,
 };
 use project::{
     AgentId, Project, ProjectItem, ProjectPath, Worktree, WorktreeId,
@@ -2402,19 +2404,14 @@ impl NativeAgentConnection {
             Err(error) => return Task::ready(Err(error)),
         };
 
-        self.agent.update(cx, |agent, _cx| {
-            if let Some(session) = agent.sessions.get_mut(&session_id) {
-                session.gear_cancellation_token = Some(cancellation_token.clone());
-            }
-        });
-
-        thread.update(cx, |thread, cx| {
+        let (coordinator_model, coordinator_language_model) = thread.update(cx, |thread, cx| {
             thread.push_acp_user_block(
                 client_user_message_id,
                 prompt_blocks.clone(),
                 path_style,
                 cx,
             );
+            gear_coordinator_from_thread(thread)
         });
 
         if !is_gear_executable_goal(&request) {
@@ -2437,40 +2434,45 @@ impl NativeAgentConnection {
         });
 
         let (event_tx, event_rx) = async_channel::unbounded::<String>();
-        let run_cancellation_token = cancellation_token.clone();
-        let run_task = cx.background_spawn(async move {
-            let event_sink = {
-                let event_tx = event_tx.clone();
-                Arc::new(move |event: &gearbox_agent::state::Event| {
-                    event_tx.try_send(gear_event_status_markdown(event)).ok();
-                }) as gearbox_agent::runtime::EventSink
-            };
-            let outcome = Orchestrator::run(RunOptions {
-                request,
-                workspace,
-                verification_commands: gear_verification_commands_from_env(),
-                worker: gear_worker_config_from_env(),
-                allowed_paths: Vec::new(),
-                forbidden_paths: Vec::new(),
-                max_files_changed: 40,
-                install_dependencies: false,
-                event_sink: Some(event_sink),
-                cancellation_token: Some(run_cancellation_token),
-                max_iterations: DEFAULT_MAX_ITERATIONS,
-            })?;
-            let final_report =
-                std_fs::read_to_string(&outcome.final_report_path).with_context(|| {
-                    format!(
-                        "failed to read Gear final report {}",
-                        outcome.final_report_path.display()
-                    )
-                })?;
-            anyhow::Ok((outcome, final_report))
-        });
 
         let agent = self.agent.clone();
         let cancellation_session_id = session_id.clone();
         cx.spawn(async move |cx| {
+            let coordinator_brief =
+                generate_gear_coordinator_brief(coordinator_language_model, &request, cx).await;
+            let run_cancellation_token = cancellation_token.clone();
+            let run_task = cx.background_spawn(async move {
+                let event_sink = {
+                    let event_tx = event_tx.clone();
+                    Arc::new(move |event: &gearbox_agent::state::Event| {
+                        event_tx.try_send(gear_event_status_markdown(event)).ok();
+                    }) as gearbox_agent::runtime::EventSink
+                };
+                let outcome = Orchestrator::run(RunOptions {
+                    request,
+                    workspace,
+                    verification_commands: gear_verification_commands_from_env(),
+                    worker: gear_worker_config_from_env(),
+                    allowed_paths: Vec::new(),
+                    forbidden_paths: Vec::new(),
+                    max_files_changed: 40,
+                    install_dependencies: false,
+                    event_sink: Some(event_sink),
+                    cancellation_token: Some(run_cancellation_token),
+                    max_iterations: DEFAULT_MAX_ITERATIONS,
+                    coordinator_model,
+                    coordinator_brief,
+                })?;
+                let final_report = std_fs::read_to_string(&outcome.final_report_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to read Gear final report {}",
+                            outcome.final_report_path.display()
+                        )
+                    })?;
+                anyhow::Ok((outcome, final_report))
+            });
+
             while let Ok(message) = event_rx.recv().await {
                 push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
             }
@@ -2552,6 +2554,83 @@ fn gear_request_from_prompt(prompt: &[acp::ContentBlock]) -> String {
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn gear_coordinator_from_thread(
+    thread: &Thread,
+) -> (Option<CoordinatorModel>, Option<Arc<dyn LanguageModel>>) {
+    let model = thread.model().cloned();
+    let metadata = model.as_ref().map(|model| CoordinatorModel {
+        provider_id: model.provider_id().0.to_string(),
+        model_id: model.id().0.to_string(),
+        name: model.name().0.to_string(),
+    });
+    (metadata, model)
+}
+
+async fn generate_gear_coordinator_brief(
+    model: Option<Arc<dyn LanguageModel>>,
+    request: &str,
+    cx: &AsyncApp,
+) -> Option<String> {
+    let Some(model) = model else {
+        return None;
+    };
+    if model.provider_id().0.as_ref() == "fake" {
+        return None;
+    }
+
+    let request = LanguageModelRequest {
+        intent: Some(CompletionIntent::UserPrompt),
+        temperature: Some(0.2),
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![
+                    "You are Gear, a lightweight coordinator agent. Create a concise planning and review brief for a code worker. Do not write code. Focus on goal, constraints, verification, and likely risks. Keep it under 160 words.".into(),
+                ],
+                cache: false,
+                reasoning_details: None,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![request.to_string().into()],
+                cache: false,
+                reasoning_details: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let mut stream = match model.stream_completion_text(request, cx).await {
+        Ok(stream) => stream.stream,
+        Err(error) => {
+            log::warn!("Gear coordinator model request failed: {error}");
+            return None;
+        }
+    };
+    let mut brief = String::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(text) => {
+                brief.push_str(&text);
+                if brief.len() >= 4000 {
+                    break;
+                }
+            }
+            Err(error) => {
+                log::warn!("Gear coordinator model stream failed: {error}");
+                return None;
+            }
+        }
+    }
+
+    let brief = brief.trim();
+    if brief.is_empty() {
+        None
+    } else {
+        Some(brief.to_string())
+    }
 }
 
 fn is_gear_executable_goal(request: &str) -> bool {

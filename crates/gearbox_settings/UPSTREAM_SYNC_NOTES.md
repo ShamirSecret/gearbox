@@ -430,6 +430,8 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 - Adds testable Gear worker env parsing coverage for explicit worker command, legacy `GEARBOX_OPENCODE_COMMAND` fallback, and invalid worker kind fallback.
 - Avoids re-entering `AcpThread` updates when Gear sends a prompt; the ACP thread already records the user message before calling the Gear connection, while Gear still mirrors the user block into its internal native `Thread` for persistence and runtime context.
 - Keeps short greetings and small-talk in the Gear GUI session instead of starting a Gear runtime goal and writing `.gearbox-agent` artifacts.
+- Passes the Gear native thread's selected provider/model into `gearbox_agent` as coordinator metadata so the Gear runtime can distinguish the planning/review model from implementation workers.
+- Calls the selected provider/model once before starting a Gear run to generate a bounded `coordinator_brief`; fake test providers are skipped so GPUI tests do not wait on unfinished model streams.
 
 ### `crates/gearbox/src/main.rs`
 ### `crates/gearbox/src/zed.rs`
@@ -451,7 +453,8 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 - Writes TypeScript Web App default stack guidance into generated spec and plan artifacts.
 - Adds guarded npm build verification commands for new TypeScript scaffold targets.
 - Includes task input artifact paths in worker packets so workers can read the generated spec and plan before editing.
+- Persists optional `coordinator_model` and `coordinator_brief` data in Gear goal ledgers, generated artifacts, and worker packets without depending on Gearbox GUI provider types inside the runtime crate.
 
 ### `docs/gearbox-gear-agent-plan.md`
 
-- Updates current progress to reflect that the goal-pursuit runtime loop exists and the next active track is TypeScript Web App sample generation.
+- Updates current progress to reflect that the goal-pursuit runtime loop exists, GUI selected model metadata and an initial provider-backed coordinator brief now reach the runtime, and the next active track is per-iteration provider-backed review plus TypeScript Web App sample generation.

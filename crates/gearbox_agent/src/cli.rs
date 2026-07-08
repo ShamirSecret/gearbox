@@ -84,6 +84,8 @@ pub fn run() -> Result<()> {
                 event_sink: None,
                 cancellation_token: None,
                 max_iterations: command.max_iterations,
+                coordinator_model: None,
+                coordinator_brief: None,
             })?;
 
             println!("Gear goal: {}", outcome.goal_id);
