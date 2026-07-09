@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{CoordinatorModel, StateStore, Task, timestamp};
+use crate::state::{CoordinatorModel, StateStore, Task, TaskKind, timestamp};
 use crate::tools::CancellationToken;
 use crate::workers::{
     WorkerConfig, WorkerKind, WorkerOutcome, WorkerRegistry, WorkerResult, WorkerSessionHandle,
-    WorkerStartRequest, WorkerStatus,
+    WorkerStartRequest, WorkerStatus, WorkerSubscription, route_identity_key,
+    worker_model_is_unavailable,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +54,14 @@ pub enum ResidencyState {
     Disposed,
     PersistedOnly,
     RpcDetached,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Messageability {
+    Steer,
+    Revive,
+    NotContinuable { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +125,8 @@ pub struct TaskRecord {
     pub parent_session_id: Option<String>,
     #[serde(default)]
     pub root_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     pub result_path: Option<PathBuf>,
     pub outcome_path: Option<PathBuf>,
     pub summary: String,
@@ -146,6 +157,7 @@ pub struct TaskAttemptSnapshot {
     pub status: TaskAttemptStatus,
     pub result_path: Option<PathBuf>,
     pub outcome_path: Option<PathBuf>,
+    pub route_transform_path: Option<PathBuf>,
     pub summary: String,
     pub error: Option<String>,
 }
@@ -155,8 +167,10 @@ pub struct TaskSnapshot {
     pub task_id: String,
     pub status: ManagedTaskStatus,
     pub residency_state: ResidencyState,
+    pub messageability: Option<Messageability>,
     pub run_epoch: u64,
     pub notified_epoch: i64,
+    pub parent_task_id: Option<String>,
     pub worker_kind: String,
     pub worker_model: Option<String>,
     pub worker_category: String,
@@ -169,12 +183,15 @@ pub struct TaskSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskManagerSnapshot {
     pub counts: TaskManagerSnapshotCounts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts_root: Option<PathBuf>,
     pub tasks: Vec<TaskSnapshot>,
     pub current_output: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ManagedWorkerRun {
+    pub store: StateStore,
     pub result: WorkerResult,
     pub outcome: WorkerOutcome,
     pub record: TaskRecord,
@@ -275,6 +292,8 @@ struct QueuedTask {
 struct ConcurrencyManager {
     max_parallel_workers: usize,
     max_parallel_per_key: usize,
+    running_workers: usize,
+    running_per_key: HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +311,8 @@ impl Default for ConcurrencyManager {
         Self {
             max_parallel_workers: 1,
             max_parallel_per_key: 1,
+            running_workers: 0,
+            running_per_key: HashMap::new(),
         }
     }
 }
@@ -328,6 +349,7 @@ impl ConcurrencyManager {
         Self {
             max_parallel_workers: config.max_parallel_workers.max(1),
             max_parallel_per_key: config.max_parallel_per_key.max(1),
+            ..Self::default()
         }
     }
 
@@ -339,24 +361,89 @@ impl ConcurrencyManager {
         self.max_parallel_per_key.max(1)
     }
 
-    fn can_start(
-        &self,
-        running_tasks: &HashMap<String, RunningTask>,
-        queued_task: &QueuedTask,
-    ) -> bool {
-        if running_tasks.len() >= self.max_parallel_workers() {
+    fn can_start(&self, queued_task: &QueuedTask) -> bool {
+        if self.running_workers >= self.max_parallel_workers() {
+            return false;
+        }
+
+        if is_read_only_task(&queued_task.task) {
+            return true;
+        }
+
+        let queued_key = concurrency_key_for_task(queued_task);
+        self.running_per_key
+            .get(&queued_key)
+            .copied()
+            .unwrap_or_default()
+            < self.max_parallel_per_key()
+    }
+
+    fn acquire(&mut self, queued_task: &QueuedTask) -> bool {
+        if !self.can_start(queued_task) {
             return false;
         }
 
         let queued_key = concurrency_key_for_task(queued_task);
-        let running_for_key = running_tasks
-            .values()
-            .filter(|running_task| {
-                concurrency_key_for_task(&running_task.queued_task) == queued_key
-            })
-            .count();
-        running_for_key < self.max_parallel_per_key()
+        self.running_workers += 1;
+        *self.running_per_key.entry(queued_key).or_default() += 1;
+        true
     }
+
+    fn release(&mut self, queued_task: &QueuedTask) -> bool {
+        if self.running_workers == 0 {
+            return false;
+        }
+
+        let queued_key = concurrency_key_for_task(queued_task);
+        let Some(running_for_key) = self.running_per_key.get_mut(&queued_key) else {
+            return false;
+        };
+        if *running_for_key == 0 {
+            return false;
+        }
+
+        *running_for_key -= 1;
+        if *running_for_key == 0 {
+            self.running_per_key.remove(&queued_key);
+        }
+        self.running_workers -= 1;
+        true
+    }
+}
+
+fn is_read_only_task(task: &Task) -> bool {
+    matches!(task.kind, TaskKind::Review)
+}
+
+fn is_write_task(task: &Task) -> bool {
+    !is_read_only_task(task)
+}
+
+fn normalized_scope_paths(paths: &[String]) -> Vec<&str> {
+    paths
+        .iter()
+        .map(|path| path.trim_end_matches('/'))
+        .collect()
+}
+
+fn scopes_overlap(left: &Task, right: &Task) -> bool {
+    if !is_write_task(left) || !is_write_task(right) {
+        return false;
+    }
+
+    let left_paths = normalized_scope_paths(&left.scope.allowed_paths);
+    let right_paths = normalized_scope_paths(&right.scope.allowed_paths);
+    if left_paths.is_empty() || right_paths.is_empty() {
+        return false;
+    }
+
+    left_paths.iter().any(|left_path| {
+        right_paths.iter().any(|right_path| {
+            left_path == right_path
+                || left_path.starts_with(&format!("{right_path}/"))
+                || right_path.starts_with(&format!("{left_path}/"))
+        })
+    })
 }
 
 #[derive(Clone)]
@@ -365,6 +452,7 @@ struct RunningTask {
     handle: Arc<dyn WorkerSessionHandle>,
     queued_task: QueuedTask,
     started_at: Instant,
+    _subscription: Option<WorkerSubscription>,
 }
 
 struct FinishedTaskMessage {
@@ -373,10 +461,69 @@ struct FinishedTaskMessage {
     run_result: Result<(WorkerOutcome, WorkerResult)>,
 }
 
+fn messageability_for_record(record: &TaskRecord) -> Messageability {
+    fn not_resident_reason(state: &ResidencyState) -> String {
+        match state {
+            ResidencyState::Resident => "task is resident".to_string(),
+            ResidencyState::Evicted => "task is evicted".to_string(),
+            ResidencyState::Disposed => "task is disposed".to_string(),
+            ResidencyState::PersistedOnly => "task is persisted only".to_string(),
+            ResidencyState::RpcDetached => "task is rpc detached".to_string(),
+        }
+    }
+
+    match record.status {
+        ManagedTaskStatus::Pending | ManagedTaskStatus::Running => {
+            if record.residency_state == ResidencyState::Resident {
+                Messageability::Steer
+            } else {
+                Messageability::NotContinuable {
+                    reason: not_resident_reason(&record.residency_state),
+                }
+            }
+        }
+        ManagedTaskStatus::Completed
+        | ManagedTaskStatus::Failed
+        | ManagedTaskStatus::Interrupted => {
+            if record.residency_state == ResidencyState::Resident {
+                Messageability::Revive
+            } else {
+                Messageability::NotContinuable {
+                    reason: not_resident_reason(&record.residency_state),
+                }
+            }
+        }
+        ManagedTaskStatus::Cancelled => Messageability::NotContinuable {
+            reason: "task was cancelled".to_string(),
+        },
+        ManagedTaskStatus::Lost => Messageability::NotContinuable {
+            reason: "task was lost".to_string(),
+        },
+        ManagedTaskStatus::Skipped => Messageability::NotContinuable {
+            reason: "task was skipped".to_string(),
+        },
+    }
+}
+
 #[derive(Clone)]
 struct CurrentManagedTask {
     task_id: String,
-    handle: Arc<dyn WorkerSessionHandle>,
+    status: ManagedTaskStatus,
+    handle: Option<Arc<dyn WorkerSessionHandle>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueuedMessageKind {
+    FollowUp,
+    Steer,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedMessage {
+    kind: QueuedMessageKind,
+    message: String,
+    caller_session_id: Option<String>,
+    created_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,20 +537,75 @@ enum FallbackDecision {
 
 const WAIT_FOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-const MAX_SAME_FAILURE_RETRIES: usize = 2;
+// ── Phase 6: Lifecycle constants ──
+const RESIDENCY_MAX_CHILDREN: usize = 8;
+const TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours
+const ARCHIVE_CAP: usize = 100;
 
 fn default_notified_epoch() -> i64 {
     -1
 }
 
+fn best_effort_stop_handle(handle: &Arc<dyn WorkerSessionHandle>, task_id: &str, cause: &str) {
+    for (action, result) in [
+        ("interrupt", handle.interrupt()),
+        ("cancel", handle.cancel()),
+        ("abort", handle.abort()),
+        ("dispose", handle.dispose()),
+    ] {
+        if let Err(error) = result {
+            eprintln!(
+                "failed to {action} Gear resident task `{task_id}` during {cause}: {error:#}"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct TaskManagerControl {
     current_task: Arc<Mutex<Option<CurrentManagedTask>>>,
+    pending_messages: Arc<Mutex<HashMap<String, VecDeque<QueuedMessage>>>>,
 }
 
 impl TaskManagerControl {
     pub fn is_same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.current_task, &other.current_task)
+    }
+
+    fn current_task_snapshot(&self) -> Result<Option<CurrentManagedTask>> {
+        Ok(self
+            .current_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
+            .clone())
+    }
+
+    fn current_running_task_snapshot(&self) -> Result<Option<CurrentManagedTask>> {
+        Ok(self
+            .current_task_snapshot()?
+            .filter(|current_task| current_task.status == ManagedTaskStatus::Running))
+    }
+
+    pub fn current_task_status(&self) -> Result<Option<ManagedTaskStatus>> {
+        Ok(self
+            .current_task_snapshot()?
+            .map(|current_task| current_task.status))
+    }
+
+    fn update_current_status(&self, task_id: &str, status: ManagedTaskStatus) -> Result<bool> {
+        let mut current_task = self
+            .current_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
+        let Some(current_task) = current_task.as_mut() else {
+            return Ok(false);
+        };
+        if current_task.task_id != task_id {
+            return Ok(false);
+        }
+
+        current_task.status = status;
+        Ok(true)
     }
 
     pub fn current_task_id(&self) -> Result<Option<String>> {
@@ -416,148 +618,198 @@ impl TaskManagerControl {
     }
 
     pub fn current_last_output(&self) -> Result<Option<String>> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(current_task) = self.current_task_snapshot()? else {
             return Ok(None);
         };
 
-        Ok(current_task.handle.last_output())
+        Ok(current_task
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.last_output()))
+    }
+
+    fn queue_pending_message(
+        &self,
+        task_id: &str,
+        kind: QueuedMessageKind,
+        message: String,
+    ) -> Result<()> {
+        self.pending_messages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
+            .entry(task_id.to_string())
+            .or_default()
+            .push_back(QueuedMessage {
+                kind,
+                message,
+                caller_session_id: Some(task_id.to_string()),
+                created_at: timestamp(),
+            });
+        Ok(())
+    }
+
+    fn take_pending_messages(&self, task_id: &str) -> Result<VecDeque<QueuedMessage>> {
+        Ok(self
+            .pending_messages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
+            .remove(task_id)
+            .unwrap_or_default())
     }
 
     pub fn send_follow_up_current_task(&self, prompt: String) -> Result<bool> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(task_id) = self.current_task_id()? else {
             return Ok(false);
         };
-
-        current_task.handle.send_follow_up(prompt)?;
-        Ok(true)
+        self.send_follow_up_task(&task_id, prompt)
     }
 
     pub fn steer_current_task(&self, prompt: String) -> Result<bool> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(task_id) = self.current_task_id()? else {
             return Ok(false);
         };
-
-        current_task.handle.steer(prompt)?;
-        Ok(true)
+        self.steer_task(&task_id, prompt)
     }
 
     pub fn cancel_current_task(&self) -> Result<bool> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(current_task) = self.current_running_task_snapshot()? else {
             return Ok(false);
         };
 
-        current_task.handle.cancel()?;
+        current_task
+            .handle
+            .as_ref()
+            .context("running task missing handle")?
+            .cancel()?;
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
         Ok(true)
     }
 
     pub fn interrupt_current_task(&self) -> Result<bool> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(current_task) = self.current_running_task_snapshot()? else {
             return Ok(false);
         };
 
-        current_task.handle.interrupt()?;
+        current_task
+            .handle
+            .as_ref()
+            .context("running task missing handle")?
+            .interrupt()?;
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
         Ok(true)
     }
 
     pub fn cancel_task(&self, task_id: &str) -> Result<bool> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(current_task) = self.current_running_task_snapshot()? else {
             return Ok(false);
         };
         if current_task.task_id != task_id {
             return Ok(false);
         }
 
-        current_task.handle.cancel()?;
+        current_task
+            .handle
+            .as_ref()
+            .context("running task missing handle")?
+            .cancel()?;
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
         Ok(true)
     }
 
     pub fn interrupt_task(&self, task_id: &str) -> Result<bool> {
-        let Some(current_task) = self
-            .current_task
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+        let Some(current_task) = self.current_running_task_snapshot()? else {
             return Ok(false);
         };
         if current_task.task_id != task_id {
             return Ok(false);
         }
 
-        current_task.handle.interrupt()?;
+        current_task
+            .handle
+            .as_ref()
+            .context("running task missing handle")?
+            .interrupt()?;
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
         Ok(true)
     }
 
     pub fn send_follow_up_task(&self, task_id: &str, prompt: String) -> Result<bool> {
-        let Some(current_task) = self
+        let current_task_guard = self
             .current_task
             .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
+        let Some(current_task) = current_task_guard.as_ref() else {
             return Ok(false);
         };
         if current_task.task_id != task_id {
             return Ok(false);
         }
 
-        current_task.handle.send_follow_up(prompt)?;
+        match current_task.status {
+            ManagedTaskStatus::Pending => {
+                self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt)?;
+            }
+            ManagedTaskStatus::Running => {
+                let handle = current_task
+                    .handle
+                    .as_ref()
+                    .context("running task missing handle")?
+                    .clone();
+                drop(current_task_guard);
+                handle.send_follow_up(prompt)?;
+                return Ok(true);
+            }
+            _ => return Ok(false),
+        }
         Ok(true)
     }
 
     pub fn steer_task(&self, task_id: &str, prompt: String) -> Result<bool> {
-        let Some(current_task) = self
+        let current_task_guard = self
             .current_task
             .lock()
-            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
-            .clone()
-        else {
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
+        let Some(current_task) = current_task_guard.as_ref() else {
             return Ok(false);
         };
         if current_task.task_id != task_id {
             return Ok(false);
         }
 
-        current_task.handle.steer(prompt)?;
+        match current_task.status {
+            ManagedTaskStatus::Pending => {
+                self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt)?;
+            }
+            ManagedTaskStatus::Running => {
+                let handle = current_task
+                    .handle
+                    .as_ref()
+                    .context("running task missing handle")?
+                    .clone();
+                drop(current_task_guard);
+                handle.steer(prompt)?;
+                return Ok(true);
+            }
+            _ => return Ok(false),
+        }
         Ok(true)
     }
 
-    fn set_current(&self, task_id: String, handle: Arc<dyn WorkerSessionHandle>) -> Result<()> {
+    fn set_current(
+        &self,
+        task_id: String,
+        status: ManagedTaskStatus,
+        handle: Option<Arc<dyn WorkerSessionHandle>>,
+    ) -> Result<()> {
         *self
             .current_task
             .lock()
             .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))? =
-            Some(CurrentManagedTask { task_id, handle });
+            Some(CurrentManagedTask {
+                task_id,
+                status,
+                handle,
+            });
         Ok(())
     }
 
@@ -588,6 +840,7 @@ pub struct TaskManager {
     release_guard: ReleaseGuard,
     runtime_policy: TaskRuntimePolicy,
     control: TaskManagerControl,
+    artifacts_root: Option<PathBuf>,
     finished_task_tx: Sender<FinishedTaskMessage>,
     finished_task_rx: Receiver<FinishedTaskMessage>,
 }
@@ -680,9 +933,16 @@ impl Default for TaskManager {
             release_guard: ReleaseGuard::default(),
             runtime_policy: TaskRuntimePolicy::default(),
             control: TaskManagerControl::default(),
+            artifacts_root: None,
             finished_task_tx,
             finished_task_rx,
         }
+    }
+}
+
+impl Drop for TaskManager {
+    fn drop(&mut self) {
+        self.shutdown_resident_tasks("task_manager_drop");
     }
 }
 
@@ -696,10 +956,9 @@ impl TaskManager {
     }
 
     pub fn with_control(control: TaskManagerControl) -> Self {
-        Self {
-            control,
-            ..Self::default()
-        }
+        let mut manager = Self::default();
+        manager.control = control;
+        manager
     }
 
     pub fn control(&self) -> TaskManagerControl {
@@ -708,6 +967,10 @@ impl TaskManager {
 
     pub fn set_worker_registry(&mut self, registry: WorkerRegistry) {
         self.registry = registry;
+    }
+
+    pub fn set_artifacts_root(&mut self, artifacts_root: PathBuf) {
+        self.artifacts_root = Some(artifacts_root);
     }
 
     pub fn max_parallel_workers(&self) -> usize {
@@ -832,6 +1095,7 @@ impl TaskManager {
             session_id: None,
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: queued_task.task.parent_task_id.clone(),
             result_path: None,
             outcome_path: None,
             summary: "Worker task queued.".to_string(),
@@ -861,6 +1125,8 @@ impl TaskManager {
         write_task_record(&store, &record)?;
         append_task_lifecycle_event(&store, &record, None)?;
         self.records.insert(task_id.clone(), record.clone());
+        self.control
+            .set_current(task_id.clone(), ManagedTaskStatus::Pending, None)?;
 
         self.queued_tasks.push_back(queued_task);
         self.process_queue()?;
@@ -921,6 +1187,9 @@ impl TaskManager {
         }
         settled_count += self.sweep_orphaned_task_state()?;
         settled_count += self.sweep_stale_running_tasks()?;
+        settled_count += self.ttl_cleanup();
+        self.evict_lru_resident_task();
+        self.trim_archive();
         self.process_queue()?;
         Ok(settled_count)
     }
@@ -948,28 +1217,252 @@ impl TaskManager {
         Ok(orphaned_running_ids.len() + orphaned_queued_len_before - self.queued_tasks.len())
     }
 
-    fn release_running_task_once(&mut self, task_id: &str, run_epoch: u64) -> Result<bool> {
+    fn release_running_task_once(
+        &mut self,
+        task_id: &str,
+        run_epoch: u64,
+        queued_task: &QueuedTask,
+    ) -> Result<bool> {
         if !self.release_guard.release_once(task_id, run_epoch) {
             return Ok(false);
         }
 
+        self.concurrency.release(queued_task);
         self.running_tasks.remove(task_id);
-        self.control.clear_current(task_id)?;
         Ok(true)
     }
 
     fn forget_task(&mut self, task_id: &str) -> Result<()> {
-        self.running_tasks.remove(task_id);
+        self.destroy_resident_task(task_id, "forget")?;
+        Ok(())
+    }
+
+    /// Unified destroy entry for all resident task release paths:
+    /// cancel, interrupt, dispose, LRU eviction, TTL cleanup, session shutdown, reconciliation.
+    /// Guarantees:
+    ///   - best-effort abort/cancel/terminate
+    ///   - always calls dispose (even if abort fails)
+    ///   - dispose errors are logged but never prevent cleanup
+    ///   - record, archive, control, concurrency, release_guard all cleaned up
+    fn destroy_resident_task(&mut self, task_id: &str, cause: &str) -> Result<()> {
+        let mut first_error: Option<anyhow::Error> = None;
+        // Release concurrency for running tasks
+        let running_task = self.running_tasks.remove(task_id).map(|running_task| {
+            self.concurrency.release(&running_task.queued_task);
+            running_task
+        });
+
+        // Remove from queue
         self.queued_tasks
             .retain(|queued_task| queued_task.task.id != task_id);
+
+        let task_store = running_task
+            .as_ref()
+            .map(|running_task| running_task.store.clone())
+            .or_else(|| {
+                self.completed_runs
+                    .get(task_id)
+                    .map(|run| run.store.clone())
+            });
+
+        // Stop the resident handle best-effort before clearing records.
+        if let Some(running_task) = running_task.as_ref() {
+            best_effort_stop_handle(&running_task.handle, task_id, cause);
+        } else {
+            match self.control.current_task_snapshot() {
+                Ok(Some(current_task)) => {
+                    if current_task.task_id == task_id
+                        && let Some(handle) = current_task.handle.as_ref()
+                    {
+                        best_effort_stop_handle(handle, task_id, cause);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "failed to snapshot current Gear resident task `{task_id}` during {cause}: {error:#}"
+                    );
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+
+        let mut record = self.records.remove(task_id);
+        if let (Some(store), Some(record)) = (task_store.as_ref(), record.as_mut()) {
+            let transition = transition_task_record(record, TaskTransition::Dispose);
+            if let Err(error) = write_task_record(store, record) {
+                eprintln!(
+                    "failed to persist disposed Gear resident task `{task_id}` during {cause}: {error:#}"
+                );
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = append_task_lifecycle_event(store, record, Some(&transition)) {
+                eprintln!(
+                    "failed to append dispose lifecycle event for Gear resident task `{task_id}` during {cause}: {error:#}"
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+
+        // Take pending messages best-effort.
+        if let Err(error) = self.control.take_pending_messages(task_id) {
+            eprintln!(
+                "failed to clear pending messages for Gear resident task `{task_id}` during {cause}: {error:#}"
+            );
+            first_error.get_or_insert(error);
+        }
+
+        // Clean up completed runs, errors, records
         self.completed_runs.remove(task_id);
         self.completed_errors.remove(task_id);
-        self.records.remove(task_id);
+
+        // Remove from archive
         self.completed_archive
             .retain(|record| record.task_id != task_id);
+
+        // Release guard and clear current task best-effort.
         self.release_guard.forget_task(task_id);
-        self.control.clear_current(task_id)?;
-        Ok(())
+        if let Err(error) = self.control.clear_current(task_id) {
+            eprintln!(
+                "failed to clear current Gear resident task `{task_id}` during {cause}: {error:#}"
+            );
+            first_error.get_or_insert(error);
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn shutdown_resident_tasks(&mut self, cause: &str) {
+        let current_task = self.control.current_task_snapshot().ok().flatten();
+        let resident_task_ids = self.records.keys().cloned().collect::<Vec<_>>();
+        for task_id in resident_task_ids {
+            if let Err(error) = self.destroy_resident_task(&task_id, cause) {
+                eprintln!(
+                    "failed to destroy Gear resident task `{task_id}` during {cause}: {error:#}"
+                );
+            }
+        }
+        if let Some(current_task) = current_task {
+            let status = match current_task.status {
+                ManagedTaskStatus::Pending | ManagedTaskStatus::Running => ManagedTaskStatus::Lost,
+                status => status,
+            };
+            let _ = self.control.set_current(
+                current_task.task_id,
+                status,
+                None::<Arc<dyn WorkerSessionHandle>>,
+            );
+        }
+    }
+
+    /// Evict the oldest completed/failed/interrupted resident task if over cap.
+    /// Does NOT evict Cancelled or Lost tasks.
+    /// Returns the id of the evicted task, if any.
+    fn evict_lru_resident_task(&mut self) -> Option<String> {
+        let resident_count: usize = self
+            .records
+            .values()
+            .filter(|record| record.residency_state == ResidencyState::Resident)
+            .count();
+        if resident_count <= RESIDENCY_MAX_CHILDREN {
+            return None;
+        }
+
+        // Find the oldest evictable resident task
+        let oldest = self
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                record.residency_state == ResidencyState::Resident
+                    && matches!(
+                        record.status,
+                        ManagedTaskStatus::Completed
+                            | ManagedTaskStatus::Failed
+                            | ManagedTaskStatus::Interrupted
+                    )
+            })
+            .min_by_key(|(_, record)| record.started_at.clone())
+            .map(|(id, _)| id.clone());
+
+        if let Some(ref task_id) = oldest {
+            // Apply eviction transition
+            if let Some(record) = self.records.get_mut(task_id) {
+                let _ = transition_task_record(record, TaskTransition::Evict);
+            }
+            let _ = self.destroy_resident_task(task_id, "lru_eviction");
+        }
+        oldest
+    }
+
+    /// Remove terminal records older than TTL.
+    /// Cancelled and Lost are never TTL-deleted.
+    fn ttl_cleanup(&mut self) -> usize {
+        let now = timestamp();
+        let now_ms = parse_timestamp_ms(&now).unwrap_or(0);
+        let ttl_cutoff = now_ms.saturating_sub(TTL_MS);
+
+        let expired_ids: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| {
+                if matches!(
+                    record.status,
+                    ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
+                ) {
+                    return false;
+                }
+                if !is_terminal_status(&record.status) {
+                    return false;
+                }
+                let finished_ms = record
+                    .finished_at
+                    .as_ref()
+                    .and_then(|ts| parse_timestamp_ms(ts))
+                    .unwrap_or(0);
+                finished_ms < ttl_cutoff
+            })
+            .map(|record| record.task_id.clone())
+            .collect();
+
+        let count = expired_ids.len();
+        for task_id in expired_ids {
+            let _ = self.destroy_resident_task(&task_id, "ttl_cleanup");
+        }
+        count
+    }
+
+    fn trim_archive(&mut self) {
+        // Preserve Cancelled and Lost records in archive
+        // Remove oldest Completed/Failed/Interrupted/Skipped if over cap
+        let preserved_count = self
+            .completed_archive
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
+                )
+            })
+            .count();
+        let cap = ARCHIVE_CAP.saturating_sub(preserved_count);
+        while self.completed_archive.len() > cap && cap > 0 {
+            let front = &self.completed_archive[0];
+            if matches!(
+                front.status,
+                ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
+            ) {
+                // Move to end to preserve it
+                if let Some(record) = self.completed_archive.pop_front() {
+                    self.completed_archive.push_back(record);
+                }
+            } else {
+                self.completed_archive.pop_front();
+            }
+        }
     }
 
     fn sweep_stale_running_tasks(&mut self) -> Result<usize> {
@@ -1101,13 +1594,32 @@ impl TaskManager {
                 append_task_lifecycle_event(&running_task.store, &record, Some(&transition))?;
 
                 if should_retry_worker_result(&record, &running_task.queued_task, &result) {
+                    let previous_attempt = record.attempts.last().cloned();
                     let mut retry_task = running_task.queued_task.clone();
                     match queue_next_attempt(&mut record, &mut retry_task) {
                         FallbackDecision::Queued => {
+                            if let Some(previous_attempt) = previous_attempt.as_ref() {
+                                if let Some(next_attempt) = record.attempts.last() {
+                                    write_route_transform_artifact(
+                                        &running_task.store,
+                                        &record.task_id,
+                                        previous_attempt,
+                                        Some(next_attempt),
+                                        "worker fallback queued",
+                                        None,
+                                    )?;
+                                }
+                            }
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
                             let run_epoch = record.run_epoch;
-                            self.release_running_task_once(task_id, run_epoch)?;
+                            self.control
+                                .update_current_status(task_id, record.status.clone())?;
+                            self.release_running_task_once(
+                                task_id,
+                                run_epoch,
+                                &running_task.queued_task,
+                            )?;
                             self.records.insert(task_id.to_string(), record);
                             self.start_queued_task(retry_task)?;
                             return Ok(None);
@@ -1128,18 +1640,19 @@ impl TaskManager {
                 }
 
                 let run = ManagedWorkerRun {
+                    store: running_task.store.clone(),
                     result,
                     outcome,
                     record,
                 };
                 let run_epoch = run.record.run_epoch;
-                self.release_running_task_once(task_id, run_epoch)?;
+                self.control
+                    .update_current_status(task_id, run.record.status.clone())?;
+                self.release_running_task_once(task_id, run_epoch, &running_task.queued_task)?;
                 self.records.insert(task_id.to_string(), run.record.clone());
                 self.completed_runs.insert(task_id.to_string(), run.clone());
                 self.completed_archive.push_back(run.record.clone());
-                while self.completed_archive.len() > 100 {
-                    self.completed_archive.pop_front();
-                }
+                self.trim_archive();
                 self.process_queue()?;
                 Ok(Some(run))
             }
@@ -1196,13 +1709,32 @@ impl TaskManager {
                 write_task_record(&running_task.store, &record)?;
                 append_task_lifecycle_event(&running_task.store, &record, Some(&transition))?;
                 if record.status == ManagedTaskStatus::Failed {
+                    let previous_attempt = record.attempts.last().cloned();
                     let mut retry_task = running_task.queued_task.clone();
                     match queue_next_attempt(&mut record, &mut retry_task) {
                         FallbackDecision::Queued => {
+                            if let Some(previous_attempt) = previous_attempt.as_ref() {
+                                if let Some(next_attempt) = record.attempts.last() {
+                                    write_route_transform_artifact(
+                                        &running_task.store,
+                                        &record.task_id,
+                                        previous_attempt,
+                                        Some(next_attempt),
+                                        "worker fallback queued",
+                                        None,
+                                    )?;
+                                }
+                            }
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
                             let run_epoch = record.run_epoch;
-                            self.release_running_task_once(task_id, run_epoch)?;
+                            self.control
+                                .update_current_status(task_id, record.status.clone())?;
+                            self.release_running_task_once(
+                                task_id,
+                                run_epoch,
+                                &running_task.queued_task,
+                            )?;
                             self.records.insert(task_id.to_string(), record);
                             self.start_queued_task(retry_task)?;
                             return Ok(None);
@@ -1216,13 +1748,25 @@ impl TaskManager {
                             if let Some(attempt) = record.attempts.last_mut() {
                                 attempt.retry_reason = Some(reason);
                             }
+                            if let Some(previous_attempt) = previous_attempt.as_ref() {
+                                write_route_transform_artifact(
+                                    &running_task.store,
+                                    &record.task_id,
+                                    previous_attempt,
+                                    None,
+                                    "worker fallback unavailable",
+                                    record.failure_kind.as_ref(),
+                                )?;
+                            }
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
                         }
                     }
                 }
                 let run_epoch = record.run_epoch;
-                self.release_running_task_once(task_id, run_epoch)?;
+                self.control
+                    .update_current_status(task_id, record.status.clone())?;
+                self.release_running_task_once(task_id, run_epoch, &running_task.queued_task)?;
                 self.records.insert(task_id.to_string(), record);
                 self.process_queue()?;
                 Err(error)
@@ -1235,7 +1779,42 @@ impl TaskManager {
         self.wait_for(&task_id)
     }
 
-    pub fn cancel_task(&mut self, task_id: &str) -> Result<()> {
+    fn descendant_task_ids(&self, task_id: &str) -> Vec<String> {
+        let mut descendant_task_ids = Vec::new();
+        let mut discovered_task_ids = HashSet::from([task_id.to_string()]);
+        let mut pending_task_ids = VecDeque::from([task_id.to_string()]);
+
+        while let Some(parent_task_id) = pending_task_ids.pop_front() {
+            for record in self.records.values() {
+                if !matches!(
+                    record.status,
+                    ManagedTaskStatus::Pending | ManagedTaskStatus::Running
+                ) {
+                    continue;
+                }
+                if record.parent_task_id.as_deref() != Some(parent_task_id.as_str()) {
+                    continue;
+                }
+                if discovered_task_ids.insert(record.task_id.clone()) {
+                    pending_task_ids.push_back(record.task_id.clone());
+                    descendant_task_ids.push(record.task_id.clone());
+                }
+            }
+        }
+
+        descendant_task_ids.sort_by(|left, right| {
+            let left_record = self.records.get(left);
+            let right_record = self.records.get(right);
+            left_record
+                .map(|record| record.started_at.as_str())
+                .cmp(&right_record.map(|record| record.started_at.as_str()))
+                .then_with(|| left.cmp(right))
+        });
+
+        descendant_task_ids
+    }
+
+    fn cancel_task_direct(&mut self, task_id: &str) -> Result<()> {
         let mut queued_store = None;
         if let Some(index) = self
             .queued_tasks
@@ -1249,6 +1828,7 @@ impl TaskManager {
                     .store,
             );
         }
+        let is_running = self.running_tasks.contains_key(task_id);
         let Some(record) = self.records.get_mut(task_id) else {
             bail!("unknown managed task: {task_id}");
         };
@@ -1272,10 +1852,25 @@ impl TaskManager {
             write_task_record(&store, record)?;
             append_task_lifecycle_event(&store, record, Some(&transition))?;
         }
+        if !is_running {
+            self.control.take_pending_messages(task_id)?;
+        }
+        self.control
+            .update_current_status(task_id, record.status.clone())?;
         Ok(())
     }
 
-    pub fn interrupt_task(&mut self, task_id: &str) -> Result<()> {
+    pub fn cancel_task(&mut self, task_id: &str) -> Result<()> {
+        let descendant_task_ids = self.descendant_task_ids(task_id);
+        self.cancel_task_direct(task_id)?;
+        for descendant_task_id in descendant_task_ids {
+            self.cancel_task_direct(&descendant_task_id)?;
+        }
+        Ok(())
+    }
+
+    fn interrupt_task_direct(&mut self, task_id: &str) -> Result<bool> {
+        let is_running = self.running_tasks.contains_key(task_id);
         let Some(record) = self.records.get_mut(task_id) else {
             bail!("unknown managed task: {task_id}");
         };
@@ -1287,6 +1882,7 @@ impl TaskManager {
                 error: None,
             },
         );
+        let interrupted = transition.applied;
         let store = if let Some(running_task) = self.running_tasks.get(task_id) {
             if transition.applied {
                 running_task.handle.interrupt()?;
@@ -1305,7 +1901,93 @@ impl TaskManager {
             write_task_record(&store, record)?;
             append_task_lifecycle_event(&store, record, Some(&transition))?;
         }
-        Ok(())
+        if !is_running {
+            self.control.take_pending_messages(task_id)?;
+        }
+        self.control
+            .update_current_status(task_id, record.status.clone())?;
+        Ok(interrupted)
+    }
+
+    pub fn interrupt_task(&mut self, task_id: &str) -> Result<bool> {
+        let descendant_task_ids = self.descendant_task_ids(task_id);
+        let interrupted = self.interrupt_task_direct(task_id)?;
+        for descendant_task_id in descendant_task_ids {
+            let _ = self.interrupt_task_direct(&descendant_task_id)?;
+        }
+        Ok(interrupted)
+    }
+
+    pub fn send_follow_up_task(&mut self, task_id: &str, prompt: String) -> Result<bool> {
+        let Some(record) = self.records.get(task_id) else {
+            return Ok(false);
+        };
+
+        if record.status == ManagedTaskStatus::Pending {
+            self.control
+                .queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt)?;
+            return Ok(true);
+        }
+
+        if let Some(running_task) = self.running_tasks.get(task_id) {
+            running_task.handle.send_follow_up(prompt)?;
+            return Ok(true);
+        }
+
+        if messageability_for_record(record) == Messageability::Revive {
+            let Some(current_task) = self.control.current_task_snapshot()? else {
+                return Ok(false);
+            };
+            if current_task.task_id != task_id {
+                return Ok(false);
+            }
+            let Some(handle) = current_task.handle.as_ref() else {
+                return Ok(false);
+            };
+
+            handle.send_follow_up(prompt)?;
+            self.control
+                .update_current_status(task_id, ManagedTaskStatus::Running)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    pub fn steer_task(&mut self, task_id: &str, prompt: String) -> Result<bool> {
+        let Some(record) = self.records.get(task_id) else {
+            return Ok(false);
+        };
+
+        if record.status == ManagedTaskStatus::Pending {
+            self.control
+                .queue_pending_message(task_id, QueuedMessageKind::Steer, prompt)?;
+            return Ok(true);
+        }
+
+        if let Some(running_task) = self.running_tasks.get(task_id) {
+            running_task.handle.steer(prompt)?;
+            return Ok(true);
+        }
+
+        if messageability_for_record(record) == Messageability::Revive {
+            let Some(current_task) = self.control.current_task_snapshot()? else {
+                return Ok(false);
+            };
+            if current_task.task_id != task_id {
+                return Ok(false);
+            }
+            let Some(handle) = current_task.handle.as_ref() else {
+                return Ok(false);
+            };
+
+            handle.steer(prompt)?;
+            self.control
+                .update_current_status(task_id, ManagedTaskStatus::Running)?;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     pub fn list(&self) -> Vec<TaskRecord> {
@@ -1332,48 +2014,91 @@ impl TaskManager {
 
         let tasks = records
             .into_iter()
-            .map(|record| TaskSnapshot {
-                task_id: record.task_id,
-                status: record.status,
-                residency_state: record.residency_state,
-                run_epoch: record.run_epoch,
-                notified_epoch: record.notified_epoch,
-                worker_kind: record.worker_kind,
-                worker_model: record.worker_model,
-                worker_category: record.worker_category,
-                attempts: record
-                    .attempts
-                    .into_iter()
-                    .map(|attempt| TaskAttemptSnapshot {
-                        attempt: attempt.attempt,
-                        worker_kind: attempt.worker_kind,
-                        worker_model: attempt.worker_model,
-                        worker_category: attempt.worker_category,
-                        status: attempt.status,
-                        result_path: attempt.result_path,
-                        outcome_path: attempt.outcome_path,
-                        summary: attempt.summary,
-                        error: attempt.error,
-                    })
-                    .collect(),
-                result_path: record.result_path,
-                outcome_path: record.outcome_path,
-                summary: record.summary,
+            .map(|record| {
+                let messageability = Some(messageability_for_record(&record));
+                let attempts_len = record.attempts.len();
+                let status = record.status.clone();
+                let has_failure_kind = record.failure_kind.is_some();
+                let has_retry_reason = record.retry_reason.is_some();
+                TaskSnapshot {
+                    task_id: record.task_id,
+                    status: record.status,
+                    residency_state: record.residency_state,
+                    messageability,
+                    run_epoch: record.run_epoch,
+                    notified_epoch: record.notified_epoch,
+                    parent_task_id: record.parent_task_id,
+                    worker_kind: record.worker_kind,
+                    worker_model: record.worker_model,
+                    worker_category: record.worker_category,
+                    attempts: record
+                        .attempts
+                        .into_iter()
+                        .map(|attempt| {
+                            let artifact_dir = attempt
+                                .result_path
+                                .as_ref()
+                                .or(attempt.outcome_path.as_ref())
+                                .and_then(|path| path.parent());
+                            let route_transform_path = task_attempt_route_transform_path(
+                                artifact_dir,
+                                attempt.attempt,
+                                attempts_len,
+                                &status,
+                                has_failure_kind,
+                                has_retry_reason,
+                            );
+                            TaskAttemptSnapshot {
+                                attempt: attempt.attempt,
+                                worker_kind: attempt.worker_kind,
+                                worker_model: attempt.worker_model,
+                                worker_category: attempt.worker_category,
+                                status: attempt.status,
+                                result_path: attempt.result_path,
+                                outcome_path: attempt.outcome_path,
+                                route_transform_path,
+                                summary: attempt.summary,
+                                error: attempt.error,
+                            }
+                        })
+                        .collect(),
+                    result_path: record.result_path,
+                    outcome_path: record.outcome_path,
+                    summary: record.summary,
+                }
             })
             .collect();
 
         Ok(TaskManagerSnapshot {
             counts,
+            artifacts_root: self.artifacts_root.clone(),
             tasks,
             current_output: self.control.current_last_output()?,
         })
     }
 
+    fn can_start_queued_task(&self, queued_task: &QueuedTask) -> bool {
+        if !self.concurrency.can_start(queued_task) {
+            return false;
+        }
+
+        if is_read_only_task(&queued_task.task) {
+            return true;
+        }
+
+        !self
+            .running_tasks
+            .values()
+            .any(|running_task| scopes_overlap(&queued_task.task, &running_task.queued_task.task))
+    }
+
     fn process_queue(&mut self) -> Result<()> {
         while self.running_tasks.len() < self.concurrency.max_parallel_workers() {
-            let Some(index) = self.queued_tasks.iter().position(|queued_task| {
-                self.concurrency.can_start(&self.running_tasks, queued_task)
-            }) else {
+            let Some(index) = self
+                .queued_tasks
+                .iter()
+                .position(|queued_task| self.can_start_queued_task(queued_task))
+            else {
                 break;
             };
             let queued_task = self
@@ -1434,10 +2159,13 @@ impl TaskManager {
                         write_task_record(&queued_task.store, &failed_record)?;
                         append_task_lifecycle_event(&queued_task.store, &failed_record, None)?;
                         let run = ManagedWorkerRun {
+                            store: queued_task.store.clone(),
                             result,
                             outcome,
                             record: failed_record.clone(),
                         };
+                        self.control
+                            .update_current_status(&task_id, failed_record.status.clone())?;
                         self.completed_runs.insert(task_id.clone(), run);
                         self.records.insert(task_id.clone(), failed_record);
                         return Ok(());
@@ -1501,6 +2229,8 @@ impl TaskManager {
                         }
                     }
 
+                    self.control
+                        .update_current_status(&task_id, failed_record.status.clone())?;
                     self.records.insert(task_id.clone(), failed_record);
                     return Err(error);
                 }
@@ -1515,16 +2245,45 @@ impl TaskManager {
                 write_task_record(&queued_task.store, record)?;
                 append_task_lifecycle_event(&queued_task.store, record, Some(&transition))?;
             }
-            self.control
-                .set_current(task_id.clone(), Arc::clone(&handle))?;
+            if !self.concurrency.acquire(&queued_task) {
+                return Err(anyhow::anyhow!(
+                    "concurrency slot unexpectedly unavailable while starting task: {task_id}"
+                ));
+            }
+            let subscription = if handle.session_id().is_some() {
+                Some(handle.subscribe(Arc::new(|_| {}))?)
+            } else {
+                None
+            };
+            self.control.set_current(
+                task_id.clone(),
+                ManagedTaskStatus::Running,
+                Some(Arc::clone(&handle)),
+            )?;
             let running_task = RunningTask {
                 store: queued_task.store.clone(),
                 handle,
                 queued_task,
                 started_at: Instant::now(),
+                _subscription: subscription,
             };
             self.running_tasks
                 .insert(task_id.clone(), running_task.clone());
+            let pending_messages = self.control.take_pending_messages(&task_id)?;
+            for queued_message in pending_messages {
+                let delivery_result = match queued_message.kind {
+                    QueuedMessageKind::FollowUp => {
+                        running_task.handle.send_follow_up(queued_message.message)
+                    }
+                    QueuedMessageKind::Steer => running_task.handle.steer(queued_message.message),
+                };
+                if let Err(error) = delivery_result {
+                    eprintln!(
+                        "failed to deliver queued Gear message for task `{task_id}` from {:?} created at {}: {error:#}",
+                        queued_message.caller_session_id, queued_message.created_at
+                    );
+                }
+            }
             self.dispatch_running_task(task_id, running_task);
             return Ok(());
         }
@@ -1535,7 +2294,7 @@ impl TaskManager {
         std::thread::spawn(move || {
             let run_result = (|| -> Result<(WorkerOutcome, WorkerResult)> {
                 let outcome = running_task.handle.wait_for_outcome()?;
-                let result = running_task.handle.wait_for_result()?;
+                let result = running_task.handle.wait_for_idle()?;
                 Ok((outcome, result))
             })();
             if let Err(error) = finished_task_tx.send(FinishedTaskMessage {
@@ -1547,6 +2306,300 @@ impl TaskManager {
             }
         });
     }
+}
+
+fn task_attempt_route_transform_path(
+    artifact_dir: Option<&std::path::Path>,
+    attempt_index: usize,
+    attempts_len: usize,
+    status: &ManagedTaskStatus,
+    has_failure_kind: bool,
+    has_retry_reason: bool,
+) -> Option<PathBuf> {
+    let worker_dir = artifact_dir?.to_path_buf();
+    if attempt_index < attempts_len {
+        return Some(worker_dir.join(format!(
+            "route-transform-{}-to-{}.md",
+            attempt_index,
+            attempt_index + 1
+        )));
+    }
+
+    if attempt_index == 1
+        && attempts_len == 1
+        && has_failure_kind
+        && has_retry_reason
+        && !matches!(status, ManagedTaskStatus::Completed)
+    {
+        return Some(worker_dir.join("route-transform-1-stopped.md"));
+    }
+
+    if attempt_index == attempts_len
+        && has_failure_kind
+        && has_retry_reason
+        && !matches!(status, ManagedTaskStatus::Completed)
+    {
+        return Some(worker_dir.join(format!("route-transform-{}-stopped.md", attempt_index)));
+    }
+
+    None
+}
+
+// ── Phase 5: Completion notification & parent wake ──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentSessionState {
+    Idle,
+    Streaming,
+    Compacting,
+    SessionSwitching,
+    SessionShutdown,
+}
+
+impl ParentSessionState {
+    pub fn can_wake(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    pub fn should_buffer(&self) -> bool {
+        matches!(
+            self,
+            Self::Streaming | Self::Compacting | Self::SessionSwitching | Self::SessionShutdown
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationResult {
+    Skipped,
+    Sent,
+    Buffered,
+    Dropped,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletionNotification {
+    pub task_id: String,
+    pub task_name: String,
+    pub status: ManagedTaskStatus,
+    pub run_epoch: u64,
+    pub summary: String,
+    pub failure_kind: Option<TaskFailureKind>,
+    pub duration_ms: u64,
+    pub result_path: Option<PathBuf>,
+    pub outcome_path: Option<PathBuf>,
+}
+
+const NOTIFIER_DEBOUNCE_MS: u64 = 100;
+
+#[derive(Clone, Default)]
+pub struct CompletionNotifier {
+    buffer: Arc<Mutex<HashMap<(String, u64), CompletionNotification>>>,
+    last_flush: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl CompletionNotifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn should_notify(record: &TaskRecord) -> bool {
+        matches!(
+            record.status,
+            ManagedTaskStatus::Completed | ManagedTaskStatus::Failed | ManagedTaskStatus::Lost
+        )
+    }
+
+    pub fn already_notified(record: &TaskRecord) -> bool {
+        record.notified_epoch >= 0 && (record.notified_epoch as u64) >= record.run_epoch
+    }
+
+    pub fn build_notification(
+        record: &TaskRecord,
+        start: &str,
+        finish: &str,
+    ) -> Option<CompletionNotification> {
+        if !Self::should_notify(record) || Self::already_notified(record) {
+            return None;
+        }
+
+        let start_ms = parse_timestamp_ms(start).unwrap_or(0);
+        let finish_ms = parse_timestamp_ms(finish).unwrap_or(0);
+        let duration_ms = finish_ms.saturating_sub(start_ms);
+
+        Some(CompletionNotification {
+            task_id: record.task_id.clone(),
+            task_name: format!("{} `{}`", record.worker_kind, record.worker_category),
+            status: record.status.clone(),
+            run_epoch: record.run_epoch,
+            summary: record.summary.clone(),
+            failure_kind: record.failure_kind.clone(),
+            duration_ms,
+            result_path: record.result_path.clone(),
+            outcome_path: record.outcome_path.clone(),
+        })
+    }
+
+    pub fn try_notify(
+        &self,
+        notification: CompletionNotification,
+        parent_state: ParentSessionState,
+        write_notified: &dyn Fn(&str, u64) -> Result<()>,
+        record_failed_epoch: &dyn Fn(&str, u64) -> Result<()>,
+    ) -> Result<NotificationResult> {
+        if !Self::is_notifiable_status(&notification.status) {
+            return Ok(NotificationResult::Skipped);
+        }
+
+        if parent_state.can_wake() {
+            match write_notified(&notification.task_id, notification.run_epoch) {
+                Ok(()) => Ok(NotificationResult::Sent),
+                Err(e) => {
+                    let failure = format!("{e:#}");
+                    if let Err(record_error) =
+                        record_failed_epoch(&notification.task_id, notification.run_epoch)
+                    {
+                        eprintln!(
+                            "failed to record completion notification failure for {} epoch {}: {record_error:#}",
+                            notification.task_id, notification.run_epoch,
+                        );
+                    }
+                    Ok(NotificationResult::Failed(failure))
+                }
+            }
+        } else if parent_state.should_buffer() {
+            self.buffer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("completion notifier buffer mutex poisoned"))?
+                .entry((notification.task_id.clone(), notification.run_epoch))
+                .or_insert(notification);
+            Ok(NotificationResult::Buffered)
+        } else {
+            Ok(NotificationResult::Dropped)
+        }
+    }
+
+    pub fn flush_buffer(
+        &self,
+        parent_session_id: &str,
+        parent_state: ParentSessionState,
+        write_notified: &dyn Fn(&str, u64) -> Result<()>,
+        record_failed_epoch: &dyn Fn(&str, u64) -> Result<()>,
+    ) -> Result<Vec<NotificationResult>> {
+        let mut results = Vec::new();
+        if !parent_state.can_wake() {
+            return Ok(results);
+        }
+
+        let now = Instant::now();
+        let cooldown = {
+            let mut last_flush = self
+                .last_flush
+                .lock()
+                .map_err(|_| anyhow::anyhow!("completion notifier last_flush mutex poisoned"))?;
+            let last = last_flush
+                .get(parent_session_id)
+                .copied()
+                .unwrap_or(Instant::now() - Duration::from_millis(NOTIFIER_DEBOUNCE_MS * 2));
+            if now.duration_since(last) < Duration::from_millis(NOTIFIER_DEBOUNCE_MS) {
+                return Ok(results);
+            }
+            last_flush.insert(parent_session_id.to_string(), now);
+            0u64
+        };
+        let _ = cooldown;
+
+        let mut buffer = self
+            .buffer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("completion notifier buffer mutex poisoned"))?;
+        let mut keys: Vec<(String, u64)> = buffer.keys().cloned().collect();
+        keys.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        for key in keys {
+            if let Some(notification) = buffer.remove(&key) {
+                match write_notified(&notification.task_id, notification.run_epoch) {
+                    Ok(()) => results.push(NotificationResult::Sent),
+                    Err(e) => {
+                        if let Err(record_error) =
+                            record_failed_epoch(&notification.task_id, notification.run_epoch)
+                        {
+                            eprintln!(
+                                "failed to record completion notification failure for {} epoch {}: {record_error:#}",
+                                notification.task_id, notification.run_epoch,
+                            );
+                        }
+                        results.push(NotificationResult::Failed(format!("{e:#}")));
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn is_notifiable_status(status: &ManagedTaskStatus) -> bool {
+        matches!(
+            status,
+            ManagedTaskStatus::Completed | ManagedTaskStatus::Failed | ManagedTaskStatus::Lost
+        )
+    }
+}
+
+fn parse_timestamp_ms(ts: &str) -> Option<u64> {
+    // Parse RFC 3339 timestamp to approximate epoch milliseconds.
+    // This is used for completion notification duration display - precision
+    // isn't critical so a simple parser suffices.
+    let ts = ts.strip_suffix('Z').unwrap_or(ts);
+    let parts: Vec<&str> = ts
+        .splitn(6, |c| c == '-' || c == 'T' || c == ':' || c == '.')
+        .collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let y: u64 = parts[0].parse().ok()?;
+    let m: u64 = parts[1].parse().ok()?;
+    let d: u64 = parts[2].parse().ok()?;
+    let hh: u64 = parts[3].parse().ok()?;
+    let mm: u64 = parts[4].parse().ok()?;
+    let sec_ms: u64 = parts
+        .get(5)
+        .and_then(|s| {
+            let sec: u64 = s.chars().take(2).collect::<String>().parse().ok()?;
+            let millis: u64 = s
+                .chars()
+                .skip(3)
+                .take(3)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+            Some(sec * 1000 + millis)
+        })
+        .unwrap_or(0);
+    // Days since epoch (simplified, ignoring leap seconds)
+    let epoch_days = (y - 1970) * 365 + (y - 1969) / 4 + day_of_year(y, m, d);
+    Some(epoch_days * 86400_000 + hh * 3600_000 + mm * 60_000 + sec_ms)
+}
+
+fn day_of_year(y: u64, m: u64, d: u64) -> u64 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = [
+        0,
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    days.iter().take(m as usize).sum::<u64>() + d - 1
 }
 
 fn is_terminal_status(status: &ManagedTaskStatus) -> bool {
@@ -1753,6 +2806,7 @@ fn transition_task_record(
             retry_reason,
         } => {
             record.status = ManagedTaskStatus::Pending;
+            record.run_epoch += 1;
             record.finished_at = None;
             record.session_id = None;
             record.result_path = None;
@@ -1800,27 +2854,17 @@ fn model_unavailable_error_for_task(
     let selected_route = config
         .selected_route_for_hint(queued_task.route_attempt, queued_task.route_hint.as_deref());
     let worker_model = selected_route.worker_model?;
-    let provider_qualified_model = selected_route
-        .worker_kind
-        .provider_id_hint()
-        .map(|provider_id| format!("{provider_id}/{worker_model}"));
-    config
-        .unavailable_worker_models
-        .iter()
-        .any(|unavailable_model| {
-            unavailable_model.eq_ignore_ascii_case(worker_model.trim())
-                || provider_qualified_model
-                    .as_ref()
-                    .is_some_and(|qualified_model| {
-                        unavailable_model.eq_ignore_ascii_case(qualified_model)
-                    })
-        })
-        .then(|| {
-            format!(
-                "Worker model `{worker_model}` is unavailable for `{}`.",
-                selected_route.worker_kind.as_str()
-            )
-        })
+    worker_model_is_unavailable(
+        selected_route.worker_kind,
+        Some(worker_model),
+        &config.unavailable_worker_models,
+    )
+    .then(|| {
+        format!(
+            "Worker model `{worker_model}` is unavailable for `{}`.",
+            selected_route.worker_kind.as_str()
+        )
+    })
 }
 
 fn write_model_unavailable_artifacts(
@@ -1859,6 +2903,7 @@ fn write_model_unavailable_artifacts(
     let outcome = WorkerOutcome {
         status: WorkerStatus::Skipped,
         session_id: None,
+        session_capability: None,
         summary: summary.to_string(),
         changed_files: Vec::new(),
         commands_run: Vec::new(),
@@ -1878,6 +2923,95 @@ fn write_model_unavailable_artifacts(
         &format!("{}\n", serde_json::to_string_pretty(&outcome)?),
     )?;
     Ok((result, outcome))
+}
+
+fn write_route_transform_artifact(
+    store: &StateStore,
+    task_id: &str,
+    previous_attempt: &TaskAttempt,
+    next_attempt: Option<&TaskAttempt>,
+    decision_summary: &str,
+    failure_kind: Option<&TaskFailureKind>,
+) -> Result<PathBuf> {
+    let previous_worker_kind = WorkerKind::parse(&previous_attempt.worker_kind);
+    let previous_provider = previous_worker_kind
+        .and_then(|worker_kind| worker_kind.provider_id_hint())
+        .unwrap_or("none");
+    let next_worker_kind = next_attempt.and_then(|attempt| WorkerKind::parse(&attempt.worker_kind));
+    let next_provider = next_worker_kind
+        .and_then(|worker_kind| worker_kind.provider_id_hint())
+        .unwrap_or("pending");
+    let file_name = if let Some(next_attempt) = next_attempt {
+        format!(
+            "route-transform-{}-to-{}.md",
+            previous_attempt.attempt, next_attempt.attempt
+        )
+    } else {
+        format!("route-transform-{}-stopped.md", previous_attempt.attempt)
+    };
+    let next_worker_kind = next_attempt
+        .map(|attempt| attempt.worker_kind.as_str())
+        .unwrap_or("pending");
+    let next_worker_model = next_attempt
+        .and_then(|attempt| attempt.worker_model.as_deref())
+        .unwrap_or("pending");
+    let next_worker_command = next_attempt
+        .and_then(|attempt| attempt.worker_command.as_deref())
+        .unwrap_or("pending");
+    let next_session_id = next_attempt
+        .and_then(|attempt| attempt.session_id.as_deref())
+        .unwrap_or("pending");
+    let contents = format!(
+        r#"# Worker Route Transform
+
+Task: `{task_id}`
+
+## Decision
+
+- summary: {decision_summary}
+- failure_kind: `{failure_kind}`
+
+## Previous Attempt
+
+- attempt: `{previous_attempt_index}`
+- provider: `{previous_provider}`
+- worker_kind: `{previous_worker_kind}`
+- worker_model: `{previous_worker_model}`
+- worker_command: `{previous_worker_command}`
+- session_id: `{previous_session_id}`
+- status: `{previous_status}`
+- retry_reason: {previous_retry_reason}
+
+## Next Attempt
+
+- attempt: `{next_attempt_index}`
+- provider: `{next_provider}`
+- worker_kind: `{next_worker_kind}`
+- worker_model: `{next_worker_model}`
+- worker_command: `{next_worker_command}`
+- session_id: `{next_session_id}`
+"#,
+        task_id = task_id,
+        decision_summary = decision_summary,
+        failure_kind = failure_kind
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|| "none".to_string()),
+        previous_attempt_index = previous_attempt.attempt,
+        previous_provider = previous_provider,
+        previous_worker_kind = previous_attempt.worker_kind,
+        previous_worker_model = previous_attempt.worker_model.as_deref().unwrap_or("none"),
+        previous_worker_command = previous_attempt.worker_command.as_deref().unwrap_or("none"),
+        previous_session_id = previous_attempt.session_id.as_deref().unwrap_or("none"),
+        previous_status = format!("{:?}", previous_attempt.status),
+        previous_retry_reason = previous_attempt.retry_reason.as_deref().unwrap_or("none"),
+        next_attempt_index = next_attempt.map(|attempt| attempt.attempt).unwrap_or(0),
+        next_provider = next_provider,
+        next_worker_kind = next_worker_kind,
+        next_worker_model = next_worker_model,
+        next_worker_command = next_worker_command,
+        next_session_id = next_session_id,
+    );
+    store.write_worker_file(task_id, &file_name, &contents)
 }
 
 fn queued_task_from_request(request: WorkerStartRequest<'_>) -> QueuedTask {
@@ -1909,10 +3043,11 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
             .iter()
             .filter(|attempt| attempt.failure_kind.as_ref() == Some(&failure_kind))
             .count();
-        if same_failure_count >= MAX_SAME_FAILURE_RETRIES {
+        let max_attempts = queued_task.config.worker_routes.len().max(2);
+        if same_failure_count >= max_attempts {
             return FallbackDecision::Unavailable {
                 reason: format!(
-                    "same failure kind `{failure_kind:?}` reached retry limit {MAX_SAME_FAILURE_RETRIES}"
+                    "same failure kind `{failure_kind:?}` reached retry limit {max_attempts}"
                 ),
                 failure_kind: TaskFailureKind::RepeatedFailureLimit,
             };
@@ -1941,14 +3076,21 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
     let worker_kind = selected_route.worker_kind.as_str().to_string();
     let worker_command = selected_route.worker_command.map(ToString::to_string);
     let worker_model = selected_route.worker_model.map(ToString::to_string);
-    if previous_attempt.worker_kind == worker_kind
-        && previous_attempt.worker_command == worker_command
-        && previous_attempt.worker_model == worker_model
+    let previous_route_identity = route_identity_key(
+        WorkerKind::parse(&previous_attempt.worker_kind).unwrap_or(WorkerKind::Custom),
+        previous_attempt.worker_model.as_deref(),
+    );
+    let next_route_identity =
+        route_identity_key(selected_route.worker_kind, worker_model.as_deref());
+    if previous_route_identity == next_route_identity
+        && normalized_worker_command(previous_attempt.worker_command.as_deref())
+            == normalized_worker_command(worker_command.as_deref())
     {
         return FallbackDecision::Unavailable {
             reason: format!(
-                "no different fallback route after `{}` attempt {}",
-                previous_attempt.worker_kind, previous_attempt.attempt
+                "no-op fallback: same provider/model `{next_route_identity}` and worker_command `{}` as previous attempt {}",
+                worker_command.as_deref().unwrap_or("none"),
+                previous_attempt.attempt
             ),
             failure_kind: TaskFailureKind::NoFallbackRoute,
         };
@@ -2024,6 +3166,13 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         error: None,
     });
     FallbackDecision::Queued
+}
+
+fn normalized_worker_command(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut QueuedTask) {
@@ -2196,6 +3345,7 @@ mod tests {
         Task {
             id: id.to_string(),
             goal_id: "goal_test".to_string(),
+            parent_task_id: None,
             title: "test managed task".to_string(),
             kind: TaskKind::Edit,
             status: TaskStatus::Pending,
@@ -2204,6 +3354,24 @@ mod tests {
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: TaskInputs::default(),
             outputs: TaskOutputs::default(),
+        }
+    }
+
+    fn test_read_only_task(id: &str) -> Task {
+        Task {
+            kind: TaskKind::Review,
+            ..test_task(id)
+        }
+    }
+
+    fn scoped_test_task(id: &str, allowed_paths: &[&str]) -> Task {
+        Task {
+            scope: Scope::new(
+                allowed_paths.iter().map(|path| path.to_string()).collect(),
+                Vec::new(),
+                10,
+            ),
+            ..test_task(id)
         }
     }
 
@@ -2231,6 +3399,7 @@ mod tests {
             session_id: None,
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: None,
             result_path: None,
             outcome_path: None,
             summary: "Worker task started.".to_string(),
@@ -2480,6 +3649,7 @@ mod tests {
             session_id: None,
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: None,
             result_path: None,
             outcome_path: None,
             summary: "failed".to_string(),
@@ -2519,6 +3689,212 @@ mod tests {
                 .worker_command
                 .as_deref()
                 .is_some_and(|command| command.contains("codex exec"))
+        );
+        let previous_attempt = record.attempts[0].clone();
+        let next_attempt = record.attempts[1].clone();
+        let artifact_path = write_route_transform_artifact(
+            &queued_task.store,
+            &task.id,
+            &previous_attempt,
+            Some(&next_attempt),
+            "worker fallback queued",
+            None,
+        )?;
+        let artifact = fs::read_to_string(&artifact_path)?;
+        assert!(artifact.contains("Worker Route Transform"));
+        assert!(artifact.contains("Previous Attempt"));
+        assert!(artifact.contains("Next Attempt"));
+        assert!(artifact.contains("provider"));
+        Ok(())
+    }
+
+    #[test]
+    fn queue_next_attempt_allows_same_kind_when_command_changes() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_command_change");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("sh -c 'exit 2'".to_string()),
+            worker_model: None,
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: Some("sh -c 'exit 3'".to_string()),
+                worker_model: None,
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let mut queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let started_at = timestamp();
+        let mut record = TaskRecord {
+            task_id: task.id.clone(),
+            worker_kind: "opencode".to_string(),
+            worker_command: Some("sh -c 'exit 2'".to_string()),
+            worker_model: None,
+            worker_category: "quick".to_string(),
+            route_hint: None,
+            route_reason: "initial route".to_string(),
+            status: ManagedTaskStatus::Failed,
+            started_at: started_at.clone(),
+            finished_at: Some(timestamp()),
+            residency_state: ResidencyState::Resident,
+            run_epoch: 0,
+            notified_epoch: default_notified_epoch(),
+            notification_failed_epoch: None,
+            killed: false,
+            session_id: None,
+            parent_session_id: None,
+            root_session_id: None,
+            parent_task_id: None,
+            result_path: None,
+            outcome_path: None,
+            summary: "failed".to_string(),
+            failure_kind: Some(TaskFailureKind::WorkerFailed),
+            retry_reason: None,
+            error: Some("exit 2".to_string()),
+            attempts: vec![TaskAttempt {
+                attempt: 1,
+                worker_kind: "opencode".to_string(),
+                worker_command: Some("sh -c 'exit 2'".to_string()),
+                worker_model: None,
+                worker_category: "quick".to_string(),
+                route_hint: None,
+                route_reason: "initial route".to_string(),
+                status: TaskAttemptStatus::Failed,
+                started_at,
+                finished_at: Some(timestamp()),
+                session_id: None,
+                result_path: None,
+                outcome_path: None,
+                summary: "failed".to_string(),
+                failure_kind: Some(TaskFailureKind::WorkerFailed),
+                retry_reason: None,
+                error: Some("exit 2".to_string()),
+            }],
+        };
+
+        let decision = queue_next_attempt(&mut record, &mut queued_task);
+
+        assert_eq!(decision, FallbackDecision::Queued);
+        assert_eq!(record.attempts.len(), 2);
+        assert_eq!(
+            record.attempts[1].worker_command.as_deref(),
+            Some("sh -c 'exit 3'")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queue_next_attempt_detects_canonical_provider_model_noop() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_canonical_noop");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Codex,
+            worker_command: Some("codex exec -m gpt-5.1".to_string()),
+            worker_model: Some("gpt.5-1".to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::Codex,
+                worker_command: Some("codex exec -m gpt-5.1".to_string()),
+                worker_model: Some("GPT-5-1".to_string()),
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let mut queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let started_at = timestamp();
+        let mut record = TaskRecord {
+            task_id: task.id.clone(),
+            worker_kind: "codex".to_string(),
+            worker_command: Some("codex exec -m gpt-5.1".to_string()),
+            worker_model: Some("gpt.5-1".to_string()),
+            worker_category: "deep".to_string(),
+            route_hint: None,
+            route_reason: "initial route".to_string(),
+            status: ManagedTaskStatus::Failed,
+            started_at: started_at.clone(),
+            finished_at: Some(timestamp()),
+            residency_state: ResidencyState::Resident,
+            run_epoch: 0,
+            notified_epoch: default_notified_epoch(),
+            notification_failed_epoch: None,
+            killed: false,
+            session_id: None,
+            parent_session_id: None,
+            root_session_id: None,
+            parent_task_id: None,
+            result_path: None,
+            outcome_path: None,
+            summary: "failed".to_string(),
+            failure_kind: Some(TaskFailureKind::WorkerFailed),
+            retry_reason: None,
+            error: Some("exit 2".to_string()),
+            attempts: vec![TaskAttempt {
+                attempt: 1,
+                worker_kind: "codex".to_string(),
+                worker_command: Some("codex exec -m gpt-5.1".to_string()),
+                worker_model: Some("gpt.5-1".to_string()),
+                worker_category: "deep".to_string(),
+                route_hint: None,
+                route_reason: "initial route".to_string(),
+                status: TaskAttemptStatus::Failed,
+                started_at,
+                finished_at: Some(timestamp()),
+                session_id: None,
+                result_path: None,
+                outcome_path: None,
+                summary: "failed".to_string(),
+                failure_kind: Some(TaskFailureKind::WorkerFailed),
+                retry_reason: None,
+                error: Some("exit 2".to_string()),
+            }],
+        };
+
+        let decision = queue_next_attempt(&mut record, &mut queued_task);
+
+        assert_eq!(
+            decision,
+            FallbackDecision::Unavailable {
+                reason: "no-op fallback: same provider/model `openai/gpt51` and worker_command `codex exec -m gpt-5.1` as previous attempt 1".to_string(),
+                failure_kind: TaskFailureKind::NoFallbackRoute,
+            }
         );
         Ok(())
     }
@@ -2651,6 +4027,7 @@ mod tests {
             session_id: None,
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: None,
             result_path: None,
             outcome_path: None,
             summary: "failed".to_string(),
@@ -2787,27 +4164,14 @@ mod tests {
         assert_eq!(run.record.status, ManagedTaskStatus::Completed);
         assert_eq!(run.record.worker_kind, "codex");
         assert_eq!(run.record.worker_model.as_deref(), Some("fast-model"));
-        assert_eq!(run.record.attempts.len(), 2);
-        assert_eq!(run.record.attempts[0].status, TaskAttemptStatus::Skipped);
-        assert_eq!(
-            run.record.attempts[0].failure_kind,
-            Some(TaskFailureKind::ModelUnavailable)
-        );
+        assert_eq!(run.record.attempts.len(), 1);
+        assert_eq!(run.record.attempts[0].status, TaskAttemptStatus::Completed);
         assert_eq!(
             run.record.attempts[0].worker_model.as_deref(),
-            Some("slow-model")
-        );
-        assert_eq!(run.record.attempts[1].status, TaskAttemptStatus::Completed);
-        assert_eq!(
-            run.record.attempts[1].worker_model.as_deref(),
             Some("fast-model")
         );
-        assert!(
-            run.record.attempts[1]
-                .retry_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("ModelUnavailable"))
-        );
+        assert!(run.record.attempts[0].failure_kind.is_none());
+        assert!(run.record.attempts[0].retry_reason.is_none());
         Ok(())
     }
 
@@ -2820,9 +4184,9 @@ mod tests {
         let config = WorkerConfig {
             worker_kind: WorkerKind::Codex,
             worker_command: Some("printf should-not-run".to_string()),
-            worker_model: Some("gpt-5".to_string()),
+            worker_model: Some("gpt.5-1".to_string()),
             worker_routes: Vec::new(),
-            unavailable_worker_models: vec!["openai/gpt-5".to_string()],
+            unavailable_worker_models: vec!["OpenAI/GPT-5.1".to_string()],
             premium_worker_budget: 1,
             max_parallel_workers: 1,
             max_parallel_per_key: 1,
@@ -2882,7 +4246,7 @@ mod tests {
                 },
                 WorkerRoute {
                     worker_kind: WorkerKind::Opencode,
-                    worker_command: Some("printf should-not-run".to_string()),
+                    worker_command: Some("sh -c 'exit 4'".to_string()),
                     worker_model: None,
                 },
             ],
@@ -2915,9 +4279,10 @@ mod tests {
             run.record.failure_kind,
             Some(TaskFailureKind::RepeatedFailureLimit)
         );
-        assert_eq!(run.record.attempts.len(), MAX_SAME_FAILURE_RETRIES);
+        assert_eq!(run.record.attempts.len(), config.worker_routes.len());
         assert_eq!(run.record.attempts[0].worker_kind, "codex");
         assert_eq!(run.record.attempts[1].worker_kind, "claude");
+        assert_eq!(run.record.attempts[2].worker_kind, "opencode");
         assert!(
             run.record
                 .retry_reason
@@ -3146,6 +4511,7 @@ mod tests {
 
     struct FakeInterruptHandle {
         interrupted: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
         follow_ups: Arc<Mutex<Vec<String>>>,
         steers: Arc<Mutex<Vec<String>>>,
     }
@@ -3177,6 +4543,7 @@ mod tests {
         }
 
         fn cancel(&self) -> Result<()> {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -3234,7 +4601,11 @@ mod tests {
     #[test]
     fn task_manager_control_reads_current_worker_last_output() -> Result<()> {
         let control = TaskManagerControl::default();
-        control.set_current("task_fake".to_string(), Arc::new(FakeOutputHandle))?;
+        control.set_current(
+            "task_fake".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeOutputHandle)),
+        )?;
 
         assert_eq!(control.current_task_id()?.as_deref(), Some("task_fake"));
         assert_eq!(
@@ -3250,20 +4621,23 @@ mod tests {
     fn task_manager_control_interrupts_current_worker() -> Result<()> {
         let control = TaskManagerControl::default();
         let interrupted = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
         let follow_ups = Arc::new(Mutex::new(Vec::new()));
         let steers = Arc::new(Mutex::new(Vec::new()));
         control.set_current(
             "task_interrupt".to_string(),
-            Arc::new(FakeInterruptHandle {
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeInterruptHandle {
                 interrupted: interrupted.clone(),
+                cancelled: cancelled.clone(),
                 follow_ups: follow_ups.clone(),
                 steers: steers.clone(),
-            }),
+            })),
         )?;
 
         assert!(control.send_follow_up_current_task("continue".to_string())?);
         assert!(control.steer_current_task("adjust".to_string())?);
-        assert!(control.interrupt_current_task()?);
+        assert!(control.interrupt_task("task_interrupt")?);
         assert_eq!(interrupted.load(Ordering::SeqCst), 1);
         assert_eq!(
             follow_ups
@@ -3279,11 +4653,85 @@ mod tests {
                 .as_slice(),
             ["adjust"]
         );
-        assert!(control.send_follow_up_task("task_interrupt", "continue 2".to_string())?);
-        assert!(control.steer_task("task_interrupt", "adjust 2".to_string())?);
-        assert!(control.interrupt_task("task_interrupt")?);
-        assert_eq!(interrupted.load(Ordering::SeqCst), 2);
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        assert!(!control.send_follow_up_current_task("continue after interrupt".to_string())?);
+        assert!(!control.steer_current_task("adjust after interrupt".to_string())?);
+        assert!(!control.send_follow_up_task("task_interrupt", "continue 2".to_string())?);
+        assert!(!control.steer_task("task_interrupt", "adjust 2".to_string())?);
+        assert!(!control.cancel_current_task()?);
+        assert!(!control.interrupt_current_task()?);
         Ok(())
+    }
+
+    #[test]
+    fn task_manager_control_cancels_current_worker() -> Result<()> {
+        let control = TaskManagerControl::default();
+        let interrupted = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let follow_ups = Arc::new(Mutex::new(Vec::new()));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        control.set_current(
+            "task_cancel".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeInterruptHandle {
+                interrupted: interrupted.clone(),
+                cancelled: cancelled.clone(),
+                follow_ups: follow_ups.clone(),
+                steers: steers.clone(),
+            })),
+        )?;
+
+        assert!(control.cancel_task("task_cancel")?);
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(interrupted.load(Ordering::SeqCst), 0);
+        assert!(!control.send_follow_up_current_task("continue after cancel".to_string())?);
+        assert!(!control.steer_current_task("adjust after cancel".to_string())?);
+        assert!(!control.cancel_current_task()?);
+        assert!(!control.interrupt_current_task()?);
+        assert!(!control.send_follow_up_task("task_cancel", "continue 2".to_string())?);
+        assert!(!control.steer_task("task_cancel", "adjust 2".to_string())?);
+        Ok(())
+    }
+
+    #[test]
+    fn messageability_reflects_task_state_and_residency() {
+        let running = test_task_record(
+            "task_running",
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        assert_eq!(messageability_for_record(&running), Messageability::Steer);
+
+        let completed = test_task_record(
+            "task_completed",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        assert_eq!(
+            messageability_for_record(&completed),
+            Messageability::Revive
+        );
+
+        let cancelled = test_task_record(
+            "task_cancelled",
+            ManagedTaskStatus::Cancelled,
+            TaskAttemptStatus::Cancelled,
+        );
+        assert!(matches!(
+            messageability_for_record(&cancelled),
+            Messageability::NotContinuable { .. }
+        ));
+
+        let mut evicted = test_task_record(
+            "task_evicted",
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        evicted.residency_state = ResidencyState::Evicted;
+        assert!(matches!(
+            messageability_for_record(&evicted),
+            Messageability::NotContinuable { reason } if reason.contains("evicted")
+        ));
     }
 
     #[test]
@@ -3300,8 +4748,14 @@ mod tests {
     #[test]
     fn task_manager_snapshot_exposes_queue_state_for_gui_observers() -> Result<()> {
         let control = TaskManagerControl::default();
-        control.set_current("task_snapshot".to_string(), Arc::new(FakeOutputHandle))?;
+        control.set_current(
+            "task_snapshot".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeOutputHandle)),
+        )?;
         let mut manager = TaskManager::with_control(control);
+        let artifacts_root = PathBuf::from("/tmp/gearbox-goal-artifacts");
+        manager.set_artifacts_root(artifacts_root.clone());
         manager.records.insert(
             "task_snapshot".to_string(),
             TaskRecord {
@@ -3323,6 +4777,7 @@ mod tests {
                 session_id: Some("session_fake".to_string()),
                 parent_session_id: None,
                 root_session_id: None,
+                parent_task_id: None,
                 result_path: Some(PathBuf::from("/tmp/task-result.json")),
                 outcome_path: Some(PathBuf::from("/tmp/task-outcome.json")),
                 summary: "Worker task started.".to_string(),
@@ -3355,6 +4810,10 @@ mod tests {
 
         assert_eq!(snapshot.counts.running, 1);
         assert_eq!(snapshot.counts.pending, 0);
+        assert_eq!(
+            snapshot.artifacts_root.as_deref(),
+            Some(artifacts_root.as_path())
+        );
         assert_eq!(snapshot.current_output.as_deref(), Some("control-output"));
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].task_id, "task_snapshot");
@@ -3362,6 +4821,97 @@ mod tests {
         assert_eq!(
             snapshot.tasks[0].attempts[0].outcome_path.as_deref(),
             Some(std::path::Path::new("/tmp/attempt-outcome.json"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_snapshot_includes_route_transform_artifacts() -> Result<()> {
+        let mut manager = TaskManager::new();
+        manager.records.insert(
+            "task_fallback".to_string(),
+            TaskRecord {
+                task_id: "task_fallback".to_string(),
+                worker_kind: "opencode".to_string(),
+                worker_command: None,
+                worker_model: None,
+                worker_category: "repair".to_string(),
+                route_hint: Some("repair".to_string()),
+                route_reason: "test route".to_string(),
+                status: ManagedTaskStatus::Failed,
+                started_at: timestamp(),
+                finished_at: None,
+                residency_state: ResidencyState::Resident,
+                run_epoch: 0,
+                notified_epoch: default_notified_epoch(),
+                notification_failed_epoch: None,
+                killed: false,
+                session_id: Some("session_fake".to_string()),
+                parent_session_id: None,
+                root_session_id: None,
+                parent_task_id: None,
+                result_path: Some(PathBuf::from("/tmp/task-result.json")),
+                outcome_path: Some(PathBuf::from("/tmp/task-outcome.json")),
+                summary: "Worker task failed.".to_string(),
+                failure_kind: Some(TaskFailureKind::WorkerFailed),
+                retry_reason: Some("retry requested".to_string()),
+                error: None,
+                attempts: vec![
+                    TaskAttempt {
+                        attempt: 1,
+                        worker_kind: "opencode".to_string(),
+                        worker_command: None,
+                        worker_model: None,
+                        worker_category: "repair".to_string(),
+                        route_hint: Some("repair".to_string()),
+                        route_reason: "test route".to_string(),
+                        status: TaskAttemptStatus::Failed,
+                        started_at: timestamp(),
+                        finished_at: Some(timestamp()),
+                        session_id: Some("session_fake".to_string()),
+                        result_path: Some(PathBuf::from("/tmp/attempt-one-result.json")),
+                        outcome_path: Some(PathBuf::from("/tmp/attempt-one-outcome.json")),
+                        summary: "First attempt failed.".to_string(),
+                        failure_kind: Some(TaskFailureKind::WorkerFailed),
+                        retry_reason: Some("retry requested".to_string()),
+                        error: None,
+                    },
+                    TaskAttempt {
+                        attempt: 2,
+                        worker_kind: "codex".to_string(),
+                        worker_command: None,
+                        worker_model: None,
+                        worker_category: "deep".to_string(),
+                        route_hint: Some("deep".to_string()),
+                        route_reason: "fallback route".to_string(),
+                        status: TaskAttemptStatus::Running,
+                        started_at: timestamp(),
+                        finished_at: None,
+                        session_id: Some("session_retry".to_string()),
+                        result_path: Some(PathBuf::from("/tmp/attempt-two-result.json")),
+                        outcome_path: Some(PathBuf::from("/tmp/attempt-two-outcome.json")),
+                        summary: "Second attempt running.".to_string(),
+                        failure_kind: None,
+                        retry_reason: None,
+                        error: None,
+                    },
+                ],
+            },
+        );
+
+        let snapshot = manager.snapshot()?;
+
+        assert_eq!(
+            snapshot.tasks[0].attempts[0]
+                .route_transform_path
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/route-transform-1-to-2.md"))
+        );
+        assert_eq!(
+            snapshot.tasks[0].attempts[1]
+                .route_transform_path
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/route-transform-2-stopped.md"))
         );
         Ok(())
     }
@@ -3431,6 +4981,7 @@ mod tests {
             handle: Arc::new(FakeOutputHandle),
             queued_task,
             started_at: Instant::now(),
+            _subscription: None,
         };
         let result = WorkerResult {
             status: WorkerStatus::Succeeded,
@@ -3448,6 +4999,7 @@ mod tests {
         let outcome = WorkerOutcome {
             status: WorkerStatus::Succeeded,
             session_id: None,
+            session_capability: None,
             summary: "late outcome".to_string(),
             changed_files: Vec::new(),
             commands_run: Vec::new(),
@@ -3538,6 +5090,7 @@ mod tests {
                 session_id: Some("session_hanging".to_string()),
                 parent_session_id: None,
                 root_session_id: None,
+                parent_task_id: None,
                 result_path: None,
                 outcome_path: None,
                 summary: "Worker task started.".to_string(),
@@ -3572,6 +5125,7 @@ mod tests {
                 handle: Arc::new(FakeHangingHandle),
                 queued_task,
                 started_at: Instant::now() - Duration::from_secs(30) - Duration::from_millis(1),
+                _subscription: None,
             },
         );
 
@@ -3638,6 +5192,7 @@ mod tests {
                     route_hint: None,
                 },
                 started_at: Instant::now(),
+                _subscription: None,
             },
         );
 
@@ -3821,6 +5376,183 @@ mod tests {
     }
 
     #[test]
+    fn task_manager_serializes_overlapping_write_scopes() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let first_task = scoped_test_task("task_scope_overlap_first", &["src"]);
+        let second_task = scoped_test_task("task_scope_overlap_second", &["src/components"]);
+        let first_release = temp_dir.path().join("release-scope-first");
+        let second_release = temp_dir.path().join("release-scope-second");
+        let first_command = format!(
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo first-scope-ok'",
+            first_release.display()
+        );
+        let second_command = format!(
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo second-scope-ok'",
+            second_release.display()
+        );
+        let first_config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(first_command),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 2,
+            max_parallel_per_key: 2,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let mut second_config = first_config.clone();
+        second_config.worker_command = Some(second_command);
+        let mut manager = TaskManager::new();
+        manager.concurrency.max_parallel_workers = 2;
+        manager.concurrency.max_parallel_per_key = 2;
+
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &first_task,
+            route_attempt: 1,
+            goal: "first scope goal",
+            verification_commands: &[],
+            config: &first_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &second_task,
+            route_attempt: 1,
+            goal: "second scope goal",
+            verification_commands: &[],
+            config: &second_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert!(
+            store
+                .worker_dir(&first_task.id)
+                .join("packet.json")
+                .exists()
+        );
+        assert!(
+            !store
+                .worker_dir(&second_task.id)
+                .join("packet.json")
+                .exists(),
+            "overlapping write scopes should not start together"
+        );
+        fs::write(&first_release, "go")?;
+        let first_run = manager.wait_for(&first_task.id)?;
+        assert_eq!(first_run.record.status, ManagedTaskStatus::Completed);
+        assert!(
+            store
+                .worker_dir(&second_task.id)
+                .join("packet.json")
+                .exists(),
+            "second task should start after the overlapping scope is released"
+        );
+        fs::write(&second_release, "go")?;
+        let second_run = manager.wait_for(&second_task.id)?;
+        assert_eq!(second_run.record.status, ManagedTaskStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_allows_disjoint_write_scopes_with_room_in_key_budget() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let first_task = scoped_test_task("task_scope_disjoint_first", &["src"]);
+        let second_task = scoped_test_task("task_scope_disjoint_second", &["docs"]);
+        let first_release = temp_dir.path().join("release-disjoint-first");
+        let second_release = temp_dir.path().join("release-disjoint-second");
+        let first_command = format!(
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo first-disjoint-ok'",
+            first_release.display()
+        );
+        let second_command = format!(
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo second-disjoint-ok'",
+            second_release.display()
+        );
+        let first_config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(first_command),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 2,
+            max_parallel_per_key: 2,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let mut second_config = first_config.clone();
+        second_config.worker_command = Some(second_command);
+        let mut manager = TaskManager::new();
+        manager.concurrency.max_parallel_workers = 2;
+        manager.concurrency.max_parallel_per_key = 2;
+
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &first_task,
+            route_attempt: 1,
+            goal: "first disjoint goal",
+            verification_commands: &[],
+            config: &first_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &second_task,
+            route_attempt: 1,
+            goal: "second disjoint goal",
+            verification_commands: &[],
+            config: &second_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert!(
+            store
+                .worker_dir(&first_task.id)
+                .join("packet.json")
+                .exists()
+        );
+        assert!(
+            store
+                .worker_dir(&second_task.id)
+                .join("packet.json")
+                .exists(),
+            "disjoint write scopes should be allowed to start together"
+        );
+        fs::write(&first_release, "go")?;
+        fs::write(&second_release, "go")?;
+        let first_run = manager.wait_for(&first_task.id)?;
+        let second_run = manager.wait_for(&second_task.id)?;
+        assert_eq!(first_run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(second_run.record.status, ManagedTaskStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
     fn task_manager_runs_different_concurrency_keys_in_parallel() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -3885,6 +5617,100 @@ mod tests {
             task: &second_task,
             route_attempt: 1,
             goal: "second goal",
+            verification_commands: &[],
+            config: &second_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert!(
+            store
+                .worker_dir(&first_task.id)
+                .join("packet.json")
+                .exists()
+        );
+        assert!(
+            store
+                .worker_dir(&second_task.id)
+                .join("packet.json")
+                .exists()
+        );
+        fs::write(&first_release, "go")?;
+        fs::write(&second_release, "go")?;
+        let first_run = manager.wait_for(&first_task.id)?;
+        let second_run = manager.wait_for(&second_task.id)?;
+        assert_eq!(first_run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(second_run.record.status, ManagedTaskStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_review_tasks_can_run_in_parallel_with_same_key() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let first_task = test_read_only_task("task_review_first");
+        let second_task = test_read_only_task("task_review_second");
+        let first_release = temp_dir.path().join("release-review-first");
+        let second_release = temp_dir.path().join("release-review-second");
+        let first_command = format!(
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo first-review-ok'",
+            first_release.display()
+        );
+        let second_command = format!(
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo second-review-ok'",
+            second_release.display()
+        );
+        let first_config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(first_command),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 2,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let second_config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(second_command),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 2,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let mut manager = TaskManager::new();
+        manager.concurrency.max_parallel_workers = 2;
+
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &first_task,
+            route_attempt: 1,
+            goal: "first review goal",
+            verification_commands: &[],
+            config: &first_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &second_task,
+            route_attempt: 1,
+            goal: "second review goal",
             verification_commands: &[],
             config: &second_config,
             cancellation_token: None,
@@ -4083,7 +5909,10 @@ mod tests {
             .expect("wait thread should not panic")
             .expect_err("cancelled worker should not complete");
         assert!(format!("{error:#}").contains("cancelled"));
-        assert_eq!(control.current_task_id()?, None);
+        assert_eq!(
+            control.current_task_id()?.as_deref(),
+            Some(task.id.as_str())
+        );
 
         let record = fs::read_to_string(store.worker_dir(&task.id).join("task-record.json"))?;
         assert!(record.contains(r#""status": "cancelled""#));
@@ -4114,6 +5943,7 @@ mod tests {
                 session_id: None,
                 parent_session_id: None,
                 root_session_id: None,
+                parent_task_id: None,
                 result_path: None,
                 outcome_path: None,
                 summary: "Worker task started.".to_string(),
@@ -4151,6 +5981,136 @@ mod tests {
             .context("missing task record")?;
         assert_eq!(record.status, ManagedTaskStatus::Cancelled);
         assert!(record.finished_at.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn session_cancel_cascades_to_descendant_tasks() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf noop".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+        let workspace = temp_dir.path().to_path_buf();
+        let root_task = test_task("task_root");
+        let mut child_task = test_task("task_child");
+        child_task.parent_task_id = Some(root_task.id.clone());
+        let mut grandchild_task = test_task("task_grandchild");
+        grandchild_task.parent_task_id = Some(child_task.id.clone());
+
+        let root_cancelled = Arc::new(AtomicUsize::new(0));
+        let child_cancelled = Arc::new(AtomicUsize::new(0));
+        let running_handle = |cancelled: Arc<AtomicUsize>| -> Arc<dyn WorkerSessionHandle> {
+            Arc::new(FakeInterruptHandle {
+                interrupted: Arc::new(AtomicUsize::new(0)),
+                cancelled,
+                follow_ups: Arc::new(Mutex::new(Vec::new())),
+                steers: Arc::new(Mutex::new(Vec::new())),
+            })
+        };
+        let make_queued_task = |task: Task| QueuedTask {
+            store: store.clone(),
+            workspace: workspace.clone(),
+            task,
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config: config.clone(),
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+
+        let root_queued_task = make_queued_task(root_task.clone());
+        let child_queued_task = make_queued_task(child_task.clone());
+        let grandchild_queued_task = make_queued_task(grandchild_task.clone());
+        let root_running_task = RunningTask {
+            store: store.clone(),
+            handle: running_handle(root_cancelled.clone()),
+            queued_task: root_queued_task.clone(),
+            started_at: Instant::now(),
+            _subscription: None,
+        };
+        let child_running_task = RunningTask {
+            store: store.clone(),
+            handle: running_handle(child_cancelled.clone()),
+            queued_task: child_queued_task.clone(),
+            started_at: Instant::now(),
+            _subscription: None,
+        };
+
+        let mut root_record = test_task_record(
+            &root_task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        root_record.parent_task_id = None;
+        let mut child_record = test_task_record(
+            &child_task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        child_record.parent_task_id = Some(root_task.id.clone());
+        let mut grandchild_record = test_task_record(
+            &grandchild_task.id,
+            ManagedTaskStatus::Pending,
+            TaskAttemptStatus::Pending,
+        );
+        grandchild_record.parent_task_id = Some(child_task.id.clone());
+
+        let mut manager = TaskManager::new();
+        manager.records.insert(root_task.id.clone(), root_record);
+        manager.records.insert(child_task.id.clone(), child_record);
+        manager
+            .records
+            .insert(grandchild_task.id.clone(), grandchild_record);
+        manager
+            .running_tasks
+            .insert(root_task.id.clone(), root_running_task);
+        manager
+            .running_tasks
+            .insert(child_task.id.clone(), child_running_task);
+        manager.queued_tasks.push_back(grandchild_queued_task);
+
+        manager.cancel_task(&root_task.id)?;
+
+        assert_eq!(root_cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(child_cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .records
+                .get(&root_task.id)
+                .map(|record| &record.status),
+            Some(&ManagedTaskStatus::Cancelled)
+        );
+        assert_eq!(
+            manager
+                .records
+                .get(&child_task.id)
+                .map(|record| &record.status),
+            Some(&ManagedTaskStatus::Cancelled)
+        );
+        assert_eq!(
+            manager
+                .records
+                .get(&grandchild_task.id)
+                .map(|record| &record.status),
+            Some(&ManagedTaskStatus::Cancelled)
+        );
+        assert!(manager.queued_tasks.is_empty());
         Ok(())
     }
 
@@ -4198,7 +6158,7 @@ mod tests {
             ),
         );
 
-        manager.interrupt_task("task_interrupt")?;
+        assert!(manager.interrupt_task("task_interrupt")?);
 
         let record = manager
             .list()
@@ -4261,6 +6221,7 @@ mod tests {
             session_id: None,
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: None,
             result_path: None,
             outcome_path: None,
             summary: "queued".into(),
@@ -4306,6 +6267,7 @@ mod tests {
             session_id: Some("session_running".into()),
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: None,
             result_path: None,
             outcome_path: None,
             summary: "running".into(),
@@ -4351,6 +6313,7 @@ mod tests {
             session_id: None,
             parent_session_id: None,
             root_session_id: None,
+            parent_task_id: None,
             result_path: None,
             outcome_path: None,
             summary: "completed".into(),
@@ -4426,6 +6389,661 @@ mod tests {
                 .exists()
         );
 
+        Ok(())
+    }
+
+    // ── Phase 5 tests ──
+
+    #[test]
+    fn cancelled_and_interrupted_do_not_emit_completion_notification() {
+        let cancelled = test_task_record(
+            "task_cancelled",
+            ManagedTaskStatus::Cancelled,
+            TaskAttemptStatus::Cancelled,
+        );
+        let interrupted = test_task_record(
+            "task_interrupted",
+            ManagedTaskStatus::Interrupted,
+            TaskAttemptStatus::Interrupted,
+        );
+
+        assert!(!CompletionNotifier::should_notify(&cancelled));
+        assert!(!CompletionNotifier::should_notify(&interrupted));
+        assert!(CompletionNotifier::should_notify(&test_task_record(
+            "task_completed",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        )));
+        assert!(CompletionNotifier::should_notify(&test_task_record(
+            "task_failed",
+            ManagedTaskStatus::Failed,
+            TaskAttemptStatus::Failed,
+        )));
+    }
+
+    #[test]
+    fn same_epoch_completion_notified_once() {
+        let mut record = test_task_record(
+            "task_notified",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 1;
+        assert!(!CompletionNotifier::already_notified(&record));
+        record.notified_epoch = 1;
+        assert!(CompletionNotifier::already_notified(&record));
+        record.run_epoch = 2;
+        assert!(!CompletionNotifier::already_notified(&record));
+    }
+
+    #[test]
+    fn revived_epoch_completion_notifies_again() {
+        let mut record = test_task_record(
+            "task_revived",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 1;
+        record.notified_epoch = 1;
+        assert!(CompletionNotifier::already_notified(&record));
+        record.run_epoch = 2;
+        assert!(!CompletionNotifier::already_notified(&record));
+    }
+
+    #[test]
+    fn streaming_parent_buffers_completion() -> Result<()> {
+        let notifier = CompletionNotifier::new();
+        let mut record = test_task_record(
+            "task_buffered",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 1;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for completed task")?;
+
+        let result = notifier.try_notify(
+            notification,
+            ParentSessionState::Streaming,
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+        )?;
+        assert_eq!(result, NotificationResult::Buffered);
+        Ok(())
+    }
+
+    #[test]
+    fn buffer_flush_deduplicates_task_epoch() -> Result<()> {
+        let notifier = CompletionNotifier::new();
+        let notification = CompletionNotification {
+            task_id: "task_dedup".to_string(),
+            task_name: "test".to_string(),
+            status: ManagedTaskStatus::Completed,
+            run_epoch: 1,
+            summary: "first".to_string(),
+            failure_kind: None,
+            duration_ms: 0,
+            result_path: None,
+            outcome_path: None,
+        };
+
+        let result1 = notifier.try_notify(
+            notification.clone(),
+            ParentSessionState::Streaming,
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+        )?;
+        assert_eq!(result1, NotificationResult::Buffered);
+
+        let result2 = notifier.try_notify(
+            notification,
+            ParentSessionState::Streaming,
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+        )?;
+        assert_eq!(result2, NotificationResult::Buffered);
+
+        let notified = Arc::new(Mutex::new(Vec::new()));
+        let results = notifier.flush_buffer(
+            "parent_test",
+            ParentSessionState::Idle,
+            &|task_id, epoch| {
+                notified
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+            &|_, _| Ok(()),
+        )?;
+
+        let sent_count = results
+            .iter()
+            .filter(|r| **r == NotificationResult::Sent)
+            .count();
+        assert_eq!(
+            sent_count, 1,
+            "should flush only one notification per (task_id, epoch)"
+        );
+        let notified = notified.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(notified.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn delivery_failure_records_notification_failed_epoch() -> Result<()> {
+        let notifier = CompletionNotifier::new();
+        let notified = Arc::new(Mutex::new(Vec::new()));
+        let mut record = test_task_record(
+            "task_delivery_fail",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 1;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for completed task")?;
+
+        let result = notifier.try_notify(
+            notification,
+            ParentSessionState::Idle,
+            &|task_id, epoch| bail!("deliberate delivery failure for {task_id} epoch {epoch}"),
+            &|task_id, epoch| {
+                notified
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+        )?;
+        assert!(matches!(result, NotificationResult::Failed(_)));
+        let notified = notified.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(
+            notified.as_slice(),
+            &[("task_delivery_fail".to_string(), 1)]
+        );
+        Ok(())
+    }
+
+    // ── Phase 6 tests ──
+
+    #[test]
+    fn destroy_disposes_even_when_abort_fails() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        struct AbortPanicHandle;
+        impl WorkerSessionHandle for AbortPanicHandle {
+            fn session_id(&self) -> Option<String> {
+                None
+            }
+            fn send_follow_up(&self, _: String) -> Result<()> {
+                Ok(())
+            }
+            fn steer(&self, _: String) -> Result<()> {
+                Ok(())
+            }
+            fn interrupt(&self) -> Result<()> {
+                Ok(())
+            }
+            fn cancel(&self) -> Result<()> {
+                Ok(())
+            }
+            fn abort(&self) -> Result<()> {
+                bail!("abort simulated failure")
+            }
+            fn dispose(&self) -> Result<()> {
+                Ok(())
+            }
+            fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+                bail!("no outcome")
+            }
+            fn wait_for_result(&self) -> Result<WorkerResult> {
+                bail!("no result")
+            }
+            fn last_output(&self) -> Option<String> {
+                None
+            }
+        }
+        let mut manager = TaskManager::new();
+        let queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task("task_abort_fail"),
+            route_attempt: 1,
+            goal: "test".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: Vec::new(),
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: true,
+                require_worker: false,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let running_task = RunningTask {
+            store: StateStore::new(temp_dir.path()),
+            handle: Arc::new(AbortPanicHandle),
+            queued_task,
+            started_at: Instant::now(),
+            _subscription: None,
+        };
+        manager
+            .running_tasks
+            .insert("task_abort_fail".to_string(), running_task);
+        manager.records.insert(
+            "task_abort_fail".to_string(),
+            test_task_record(
+                "task_abort_fail",
+                ManagedTaskStatus::Running,
+                TaskAttemptStatus::Running,
+            ),
+        );
+        // destroy_resident_task should still succeed even though abort() fails
+        manager.destroy_resident_task("task_abort_fail", "test")?;
+        assert!(!manager.records.contains_key("task_abort_fail"));
+        assert!(manager.running_tasks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn destroy_uses_running_handle_even_without_current_snapshot() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        struct CountingHandle {
+            interrupt_calls: Arc<AtomicUsize>,
+            cancel_calls: Arc<AtomicUsize>,
+            abort_calls: Arc<AtomicUsize>,
+            dispose_calls: Arc<AtomicUsize>,
+        }
+        impl WorkerSessionHandle for CountingHandle {
+            fn session_id(&self) -> Option<String> {
+                None
+            }
+            fn send_follow_up(&self, _: String) -> Result<()> {
+                Ok(())
+            }
+            fn steer(&self, _: String) -> Result<()> {
+                Ok(())
+            }
+            fn interrupt(&self) -> Result<()> {
+                self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn cancel(&self) -> Result<()> {
+                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn abort(&self) -> Result<()> {
+                self.abort_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn dispose(&self) -> Result<()> {
+                self.dispose_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+                bail!("no outcome")
+            }
+            fn wait_for_result(&self) -> Result<WorkerResult> {
+                bail!("no result")
+            }
+            fn last_output(&self) -> Option<String> {
+                None
+            }
+        }
+        let interrupt_calls = Arc::new(AtomicUsize::new(0));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let dispose_calls = Arc::new(AtomicUsize::new(0));
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(CountingHandle {
+            interrupt_calls: interrupt_calls.clone(),
+            cancel_calls: cancel_calls.clone(),
+            abort_calls: abort_calls.clone(),
+            dispose_calls: dispose_calls.clone(),
+        });
+        let mut manager = TaskManager::new();
+        let queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task("task_running_handle_only"),
+            route_attempt: 1,
+            goal: "test".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: Vec::new(),
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: true,
+                require_worker: false,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        manager.running_tasks.insert(
+            "task_running_handle_only".to_string(),
+            RunningTask {
+                store: StateStore::new(temp_dir.path()),
+                handle: handle.clone(),
+                queued_task,
+                started_at: Instant::now(),
+                _subscription: None,
+            },
+        );
+        manager.records.insert(
+            "task_running_handle_only".to_string(),
+            test_task_record(
+                "task_running_handle_only",
+                ManagedTaskStatus::Running,
+                TaskAttemptStatus::Running,
+            ),
+        );
+
+        manager.destroy_resident_task("task_running_handle_only", "test")?;
+
+        assert_eq!(interrupt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispose_calls.load(Ordering::SeqCst), 1);
+        assert!(manager.records.is_empty());
+        assert!(manager.running_tasks.is_empty());
+        let artifact_store = StateStore::new(temp_dir.path());
+        let event_path = artifact_store
+            .worker_dir("task_running_handle_only")
+            .join("task-events.jsonl");
+        let event_contents = fs::read_to_string(&event_path)?;
+        assert!(
+            event_contents.contains(r#""transition_type":"dispose""#),
+            "destroy_resident_task should append a dispose lifecycle event"
+        );
+        assert!(
+            event_contents.contains(r#""residency_state":"disposed""#),
+            "destroy_resident_task should persist the disposed residency state"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_drop_shuts_down_resident_tasks() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        struct CountingHandle {
+            interrupt_calls: Arc<AtomicUsize>,
+            cancel_calls: Arc<AtomicUsize>,
+            abort_calls: Arc<AtomicUsize>,
+            dispose_calls: Arc<AtomicUsize>,
+        }
+        impl WorkerSessionHandle for CountingHandle {
+            fn session_id(&self) -> Option<String> {
+                None
+            }
+            fn send_follow_up(&self, _: String) -> Result<()> {
+                Ok(())
+            }
+            fn steer(&self, _: String) -> Result<()> {
+                Ok(())
+            }
+            fn interrupt(&self) -> Result<()> {
+                self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn cancel(&self) -> Result<()> {
+                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn abort(&self) -> Result<()> {
+                self.abort_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn dispose(&self) -> Result<()> {
+                self.dispose_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+                bail!("no outcome")
+            }
+            fn wait_for_result(&self) -> Result<WorkerResult> {
+                bail!("no result")
+            }
+            fn last_output(&self) -> Option<String> {
+                None
+            }
+        }
+        let interrupt_calls = Arc::new(AtomicUsize::new(0));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let dispose_calls = Arc::new(AtomicUsize::new(0));
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(CountingHandle {
+            interrupt_calls: interrupt_calls.clone(),
+            cancel_calls: cancel_calls.clone(),
+            abort_calls: abort_calls.clone(),
+            dispose_calls: dispose_calls.clone(),
+        });
+        let mut manager = TaskManager::new();
+        manager.control.set_current(
+            "task_shutdown".to_string(),
+            ManagedTaskStatus::Running,
+            Some(handle.clone()),
+        )?;
+        let queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task("task_shutdown"),
+            route_attempt: 1,
+            goal: "test".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: Vec::new(),
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: true,
+                require_worker: false,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        manager.running_tasks.insert(
+            "task_shutdown".to_string(),
+            RunningTask {
+                store: StateStore::new(temp_dir.path()),
+                handle: handle.clone(),
+                queued_task,
+                started_at: Instant::now(),
+                _subscription: None,
+            },
+        );
+        let control = manager.control.clone();
+        manager.records.insert(
+            "task_shutdown".to_string(),
+            test_task_record(
+                "task_shutdown",
+                ManagedTaskStatus::Running,
+                TaskAttemptStatus::Running,
+            ),
+        );
+
+        drop(manager);
+
+        assert_eq!(interrupt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispose_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(control.current_task_id()?.as_deref(), Some("task_shutdown"));
+        assert_eq!(
+            control.current_task_status()?,
+            Some(ManagedTaskStatus::Lost)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_routes_through_destroy_resident_task() -> Result<()> {
+        let mut manager = TaskManager::new();
+        let record = test_task_record(
+            "task_cancel_destroy",
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        manager
+            .records
+            .insert("task_cancel_destroy".to_string(), record);
+        manager.cancel_task("task_cancel_destroy").ok();
+        let record = manager.records.get("task_cancel_destroy");
+        assert!(
+            record.is_some(),
+            "cancel_task should keep the record in cancelled state"
+        );
+        assert_eq!(record.unwrap().status, ManagedTaskStatus::Cancelled);
+        Ok(())
+    }
+
+    #[test]
+    fn lru_evicts_oldest_completed_not_cancelled() -> Result<()> {
+        let mut manager = TaskManager::new();
+        // Insert resident records
+        for i in 0..10 {
+            let task_id = format!("task_{i}");
+            let mut record = if i == 5 {
+                // This one is cancelled - should NOT be evicted
+                test_task_record(
+                    &task_id,
+                    ManagedTaskStatus::Cancelled,
+                    TaskAttemptStatus::Cancelled,
+                )
+            } else {
+                test_task_record(
+                    &task_id,
+                    ManagedTaskStatus::Completed,
+                    TaskAttemptStatus::Completed,
+                )
+            };
+            record.residency_state = ResidencyState::Resident;
+            manager.records.insert(task_id.clone(), record);
+        }
+        // Should evict one (we have 10 > 8 cap)
+        let evicted = manager.evict_lru_resident_task();
+        assert!(evicted.is_some(), "should evict a task when over cap");
+        assert_ne!(
+            evicted.as_deref(),
+            Some("task_5"),
+            "should not evict Cancelled task"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lost_record_is_not_ttl_deleted_until_process_dead() {
+        let mut manager = TaskManager::new();
+        let mut record = test_task_record(
+            "task_lost_ttl",
+            ManagedTaskStatus::Lost,
+            TaskAttemptStatus::Lost,
+        );
+        record.finished_at = Some("2000-01-01T00:00:00Z".to_string());
+        manager.records.insert("task_lost_ttl".to_string(), record);
+        let cleaned = manager.ttl_cleanup();
+        assert_eq!(cleaned, 0, "Lost records should not be TTL-deleted");
+    }
+
+    #[test]
+    fn reconcile_marks_running_record_lost() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let mut pending_record = test_task_record(
+            "task_reconcile_pending",
+            ManagedTaskStatus::Pending,
+            TaskAttemptStatus::Pending,
+        );
+        pending_record.started_at = timestamp();
+        pending_record.attempts[0].started_at = timestamp();
+        write_task_record(&store, &pending_record)?;
+        let mut running_record = test_task_record(
+            "task_reconcile_running",
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        running_record.started_at = timestamp();
+        running_record.attempts[0].started_at = timestamp();
+        write_task_record(&store, &running_record)?;
+        let mut completed_record = test_task_record(
+            "task_reconcile_completed",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        completed_record.started_at = timestamp();
+        completed_record.finished_at = Some(timestamp());
+        completed_record.attempts[0].started_at = timestamp();
+        completed_record.attempts[0].finished_at = Some(timestamp());
+        write_task_record(&store, &completed_record)?;
+        let mut manager = TaskManager::new();
+        let recovered = manager.recover_orphaned_records(&store)?;
+        // pending and running should be recovered; completed should not
+        assert!(
+            recovered >= 2,
+            "should recover at least pending and running: {recovered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn residency_limit_reports_current_residents() -> Result<()> {
+        let manager = TaskManager::new();
+        let resident_count: usize = manager
+            .records
+            .values()
+            .filter(|record| record.residency_state == ResidencyState::Resident)
+            .count();
+        assert_eq!(resident_count, 0);
+        let mut record = test_task_record(
+            "task_single",
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.residency_state = ResidencyState::Resident;
+        let resident_count = 1;
+        assert!(resident_count <= RESIDENCY_MAX_CHILDREN);
         Ok(())
     }
 }

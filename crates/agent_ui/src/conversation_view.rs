@@ -50,6 +50,7 @@ use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
 use lru::LruCache;
 use rope::Point;
 use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore};
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,6 +106,7 @@ use crate::{
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
 const TOKEN_THRESHOLD: u64 = 250;
+const MAX_PENDING_AGENT_NOTIFICATIONS: usize = 8;
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -114,6 +116,12 @@ mod thread_search_bar;
 mod thread_view;
 pub use message_queue::*;
 pub use thread_view::*;
+
+#[derive(Clone)]
+struct PendingAgentNotification {
+    caption: SharedString,
+    icon: IconName,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ThreadFeedback {
@@ -609,6 +617,7 @@ pub struct ConversationView {
     server_state: ServerState,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
+    pending_notifications: VecDeque<PendingAgentNotification>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
@@ -890,6 +899,7 @@ impl ConversationView {
                 cx,
             ),
             notifications: Vec::new(),
+            pending_notifications: VecDeque::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
             loading_status: None,
@@ -1596,6 +1606,7 @@ impl ConversationView {
                         active.sync_generating_indicator(cx);
                     });
                 }
+                self.flush_pending_notifications(window, cx);
             }
             AcpThreadEvent::NewEntry => {
                 let len = thread.read(cx).entries().len();
@@ -1649,11 +1660,17 @@ impl ConversationView {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
-                self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
+                self.notify_with_sound(
+                    "Waiting for tool confirmation",
+                    IconName::Info,
+                    false,
+                    window,
+                    cx,
+                );
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
             AcpThreadEvent::ElicitationRequested(_) if cx.has_flag::<AcpBetaFeatureFlag>() => {
-                self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
+                self.notify_with_sound("Waiting for input", IconName::Info, false, window, cx);
             }
             AcpThreadEvent::ElicitationRequested(_) => {}
             AcpThreadEvent::ElicitationResponded(_) => {}
@@ -1721,10 +1738,12 @@ impl ConversationView {
                             "New message"
                         },
                         IconName::ZedAssistant,
+                        true,
                         window,
                         cx,
                     );
                 }
+                self.flush_pending_notifications(window, cx);
             }
             AcpThreadEvent::Refusal => {
                 let error = ThreadError::Refusal;
@@ -1738,7 +1757,13 @@ impl ConversationView {
                     let model_or_agent_name = self.current_model_name(cx);
                     let notification_message =
                         format!("{} refused to respond to this request", model_or_agent_name);
-                    self.notify_with_sound(&notification_message, IconName::Warning, window, cx);
+                    self.notify_with_sound(
+                        &notification_message,
+                        IconName::Warning,
+                        false,
+                        window,
+                        cx,
+                    );
                 }
             }
             AcpThreadEvent::Error => {
@@ -1759,6 +1784,7 @@ impl ConversationView {
                     self.notify_with_sound(
                         "Agent stopped due to an error",
                         IconName::Warning,
+                        false,
                         window,
                         cx,
                     );
@@ -2794,12 +2820,68 @@ impl ConversationView {
         &mut self,
         caption: impl Into<SharedString>,
         icon: IconName,
+        buffer_when_busy: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.agent_status_visible(window, cx) {
+            return;
+        }
+
+        if buffer_when_busy && self.should_buffer_agent_notification(cx) {
+            self.enqueue_notification(caption.into(), icon);
+            return;
+        }
         #[cfg(feature = "audio")]
         self.play_notification_sound(window, cx);
         self.show_notification(caption, icon, window, cx);
+    }
+
+    fn should_buffer_agent_notification(&self, cx: &Context<Self>) -> bool {
+        let Some(root_thread_view) = self.root_thread_view() else {
+            return false;
+        };
+        let root_thread_view = root_thread_view.read(cx);
+        let root_thread = root_thread_view.thread.read(cx);
+        root_thread.status() != ThreadStatus::Idle
+            || root_thread.is_compacting()
+            || root_thread.is_waiting_for_confirmation()
+            || root_thread.has_in_progress_tool_calls()
+            || !root_thread_view.message_queue.is_empty()
+    }
+
+    fn enqueue_notification(&mut self, caption: SharedString, icon: IconName) {
+        if self.pending_notifications.len() >= MAX_PENDING_AGENT_NOTIFICATIONS {
+            self.pending_notifications.pop_front();
+        }
+        self.pending_notifications
+            .push_back(PendingAgentNotification { caption, icon });
+    }
+
+    fn flush_pending_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notifications.is_empty() && self.agent_status_visible(window, cx) {
+            self.pending_notifications.clear();
+            return;
+        }
+
+        if self.should_buffer_agent_notification(cx) {
+            return;
+        }
+
+        while self.notifications.is_empty() {
+            let Some(notification) = self.pending_notifications.pop_front() else {
+                break;
+            };
+
+            let PendingAgentNotification { caption, icon } = notification;
+            self.show_notification(caption, icon, window, cx);
+
+            if self.notifications.is_empty() {
+                continue;
+            }
+
+            break;
+        }
     }
 
     fn is_visible(&self, multi_workspace: &Entity<MultiWorkspace>, cx: &Context<Self>) -> bool {
@@ -3084,14 +3166,14 @@ impl ConversationView {
 
     pub(crate) fn dismiss_notifications(&mut self, cx: &mut Context<Self>) -> bool {
         let had_notifications = !self.notifications.is_empty();
-        for window in self.notifications.drain(..) {
-            window
+        for notification_window in self.notifications.drain(..) {
+            notification_window
                 .update(cx, |_, window, _| {
                     window.remove_window();
                 })
                 .ok();
 
-            self.notification_subscriptions.remove(&window);
+            self.notification_subscriptions.remove(&notification_window);
         }
         had_notifications
     }
@@ -4081,6 +4163,76 @@ pub(crate) mod tests {
                 .count(),
             0,
             "No notification should fire when a queued message will be auto-sent on Stopped"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_notification_buckets_until_root_thread_is_idle(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let root_thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _cx| view.thread.clone());
+
+        active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "buffered".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+
+        cx.deactivate_window();
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.notify_with_sound("Buffered completion", IconName::Info, true, window, cx);
+        });
+
+        cx.run_until_parked();
+        assert_eq!(
+            cx.windows()
+                .iter()
+                .filter(|window| window.downcast::<AgentNotification>().is_some())
+                .count(),
+            0,
+            "Busy root threads should buffer agent notifications instead of showing them immediately"
+        );
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.handle_thread_event(&root_thread, &AcpThreadEvent::StatusChanged, window, cx);
+        });
+
+        cx.run_until_parked();
+        assert_eq!(
+            cx.windows()
+                .iter()
+                .filter(|window| window.downcast::<AgentNotification>().is_some())
+                .count(),
+            0,
+            "Buffered agent notifications should stay queued while the root thread is still busy"
+        );
+
+        active_thread(&conversation_view, cx).update_in(cx, |thread, _window, _cx| {
+            thread.message_queue.clear();
+        });
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.handle_thread_event(&root_thread, &AcpThreadEvent::StatusChanged, window, cx);
+        });
+
+        cx.run_until_parked();
+        assert!(
+            cx.windows()
+                .iter()
+                .any(|window| window.downcast::<AgentNotification>().is_some()),
+            "Buffered agent notifications should flush once the root thread becomes idle"
         );
     }
 
