@@ -248,6 +248,7 @@ pub fn final_report(
         .map(|task| format!("- `{}`: {:?} / {:?}", task.id, task.kind, task.status))
         .collect::<Vec<_>>()
         .join("\n");
+    let evidence_chain = final_report_evidence(tasks, worker_result);
 
     format!(
         r#"# Final Report
@@ -287,6 +288,10 @@ Status: `{}`
 
 {}
 
+## Evidence Chain
+
+{}
+
 ## Known Limits
 
 - ACP server integration is intentionally deferred until the local CLI runtime is stable.
@@ -303,6 +308,48 @@ Status: `{}`
         verification_summary,
         changed_files,
         scope_summary,
-        task_lines
+        task_lines,
+        evidence_chain
     )
+}
+
+fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String {
+    let worker_evidence = [
+        (
+            "packet",
+            worker_result.packet_path.to_string_lossy().to_string(),
+        ),
+        (
+            "prompt",
+            worker_result.prompt_path.to_string_lossy().to_string(),
+        ),
+        (
+            "result",
+            worker_result.result_path.to_string_lossy().to_string(),
+        ),
+        (
+            "outcome",
+            worker_result.outcome_path.to_string_lossy().to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, path)| format!("- worker_{label}: `{path}`"))
+    .collect::<Vec<_>>();
+
+    let task_evidence = tasks
+        .iter()
+        .filter(|task| !task.outputs.evidence.is_empty())
+        .flat_map(|task| {
+            task.outputs
+                .evidence
+                .iter()
+                .map(move |path| format!("- {} / {:?}: `{path}`", task.id, task.kind))
+        })
+        .collect::<Vec<_>>();
+
+    worker_evidence
+        .into_iter()
+        .chain(task_evidence)
+        .collect::<Vec<_>>()
+        .join("\n")
 }

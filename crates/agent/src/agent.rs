@@ -14,6 +14,11 @@ mod tools;
 
 use context_server::ContextServerId;
 pub use db::*;
+pub use gearbox_agent::task_manager::ManagedTaskStatus as GearManagedTaskStatus;
+pub use gearbox_agent::task_manager::{
+    TaskAttemptSnapshot as GearTaskAttemptSnapshot, TaskManagerSnapshot as GearTaskManagerSnapshot,
+    TaskSnapshot as GearTaskSnapshot,
+};
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
 pub use pattern_extraction::*;
@@ -52,8 +57,17 @@ use gearbox_agent::runtime::{
     Orchestrator, RunOptions,
 };
 use gearbox_agent::state::CoordinatorModel;
+use gearbox_agent::task_manager::{
+    ManagedTaskStatus, SharedTaskManager, TaskAttemptSnapshot, TaskManager, TaskManagerControl,
+    TaskManagerSnapshot, TaskManagerTickLoop, TaskSnapshot,
+};
 use gearbox_agent::tools::CancellationToken;
-use gearbox_agent::workers::{WorkerConfig, WorkerKind, WorkerRoute};
+use gearbox_agent::workers::{
+    NativeWorkerBackend, VerificationContract, WorkerConfig, WorkerKind, WorkerOutcome,
+    WorkerPacket, WorkerRegistry, WorkerResult, WorkerRoute, WorkerSessionHandle,
+    WorkerStartRequest, WorkerStatus, worker_outcome_from_result, worker_prompt,
+    write_result_and_outcome,
+};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
     TaskExt, WeakEntity,
@@ -71,10 +85,11 @@ use prompt_store::{ProjectContext, RULES_FILE_NAMES, RulesFileContext, WorktreeC
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
+use std::collections::VecDeque;
 use std::fs as std_fs;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use util::ResultExt;
 use util::path_list::PathList;
 use util::rel_path::RelPath;
@@ -216,6 +231,9 @@ struct Session {
     acp_thread: Entity<acp_thread::AcpThread>,
     work_dirs: Option<PathList>,
     gear_cancellation_token: Option<CancellationToken>,
+    gear_task_manager_control: Option<TaskManagerControl>,
+    gear_task_manager: Option<SharedTaskManager>,
+    gear_task_manager_tick_loop: Option<TaskManagerTickLoop>,
     project_id: EntityId,
     pending_save: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
@@ -854,6 +872,9 @@ impl NativeAgent {
                 acp_thread: acp_thread.clone(),
                 work_dirs,
                 gear_cancellation_token: None,
+                gear_task_manager_control: None,
+                gear_task_manager: None,
+                gear_task_manager_tick_loop: None,
                 project_id,
                 _subscriptions: subscriptions,
                 pending_save: Task::ready(Ok(())),
@@ -2163,6 +2184,94 @@ impl NativeAgentConnection {
             .map(|session| session.thread.clone())
     }
 
+    pub fn gear_task_manager_snapshot(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<GearTaskManagerSnapshot> {
+        if !self.is_gear() {
+            return None;
+        }
+
+        let task_manager = self
+            .agent
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.gear_task_manager.clone())?;
+        match task_manager.lock() {
+            Ok(task_manager) => match task_manager.snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    log::warn!(
+                        "failed to snapshot Gear task manager for session {session_id}: {error:#}"
+                    );
+                    None
+                }
+            },
+            Err(_) => {
+                log::warn!(
+                    "failed to snapshot Gear task manager for session {session_id}: task manager mutex poisoned"
+                );
+                None
+            }
+        }
+    }
+
+    fn gear_task_manager_control(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<TaskManagerControl> {
+        if !self.is_gear() {
+            return None;
+        }
+
+        self.agent
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.gear_task_manager_control.clone())
+    }
+
+    pub fn interrupt_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+        let Some(control) = self.gear_task_manager_control(session_id, cx) else {
+            return Ok(false);
+        };
+        control.interrupt_current_task()
+    }
+
+    pub fn cancel_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+        let Some(control) = self.gear_task_manager_control(session_id, cx) else {
+            return Ok(false);
+        };
+        control.cancel_current_task()
+    }
+
+    pub fn send_follow_up_gear_task(
+        &self,
+        session_id: &acp::SessionId,
+        prompt: String,
+        cx: &App,
+    ) -> Result<bool> {
+        let Some(control) = self.gear_task_manager_control(session_id, cx) else {
+            return Ok(false);
+        };
+        control.send_follow_up_current_task(prompt)
+    }
+
+    pub fn steer_gear_task(
+        &self,
+        session_id: &acp::SessionId,
+        prompt: String,
+        cx: &App,
+    ) -> Result<bool> {
+        let Some(control) = self.gear_task_manager_control(session_id, cx) else {
+            return Ok(false);
+        };
+        control.steer_current_task(prompt)
+    }
+
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The
     /// agent panel calls this from its three user-interaction trigger
     /// points (input box focus, slash-autocomplete invocation, and
@@ -2379,6 +2488,7 @@ impl NativeAgentConnection {
         let prompt_blocks = params.prompt;
         let request = gear_request_from_prompt(&prompt_blocks);
         let cancellation_token = CancellationToken::new();
+        let task_manager_control = TaskManagerControl::default();
 
         if request.trim().is_empty() {
             return Task::ready(Err(anyhow!("Gear prompt cannot be empty")));
@@ -2430,9 +2540,31 @@ impl NativeAgentConnection {
             });
         }
 
+        let (native_worker_tx, native_worker_rx) =
+            async_channel::unbounded::<GearZedWorkerDispatch>();
+        let running_native_zed_sessions = Arc::new(Mutex::new(HashMap::default()));
+        spawn_gear_zed_worker_dispatcher(
+            self.agent.downgrade(),
+            session_id.clone(),
+            native_worker_rx,
+            running_native_zed_sessions.clone(),
+            cx,
+        );
+
+        let mut task_manager = TaskManager::with_control(task_manager_control.clone());
+        task_manager.set_worker_registry(WorkerRegistry::with_native_backend(Arc::new(
+            GearZedWorkerBackend::new(native_worker_tx),
+        )));
+        let task_manager = task_manager.into_shared();
+        let task_manager_tick_loop =
+            TaskManagerTickLoop::start(task_manager.clone(), std::time::Duration::from_millis(50));
+
         self.agent.update(cx, |agent, _cx| {
             if let Some(session) = agent.sessions.get_mut(&session_id) {
                 session.gear_cancellation_token = Some(cancellation_token.clone());
+                session.gear_task_manager_control = Some(task_manager_control.clone());
+                session.gear_task_manager = Some(task_manager.clone());
+                session.gear_task_manager_tick_loop = Some(task_manager_tick_loop);
             }
         });
 
@@ -2458,25 +2590,28 @@ impl NativeAgentConnection {
             });
 
             let coordinator_review_hook =
-                coordinator_language_model
-                    .as_ref()
-                    .map(|_| -> CoordinatorReviewHook {
-                        let review_tx = review_tx.clone();
-                        Arc::new(move |input: CoordinatorReviewInput| {
-                            let (response_tx, response_rx) = async_channel::bounded(1);
-                            review_tx
-                                .send_blocking(GearCoordinatorReviewJob { input, response_tx })
-                                .context("failed to send Gear coordinator review request")?;
-                            response_rx
-                                .recv_blocking()
-                                .context("failed to receive Gear coordinator review response")?
-                        })
-                    });
+                if gear_provider_review_enabled(coordinator_language_model.as_ref()) {
+                    let review_tx = review_tx.clone();
+                    Some(Arc::new(move |input: CoordinatorReviewInput| {
+                        let (response_tx, response_rx) = async_channel::bounded(1);
+                        review_tx
+                            .send_blocking(GearCoordinatorReviewJob { input, response_tx })
+                            .context("failed to send Gear coordinator review request")?;
+                        response_rx
+                            .recv_blocking()
+                            .context("failed to receive Gear coordinator review response")?
+                    }) as CoordinatorReviewHook)
+                } else {
+                    None
+                };
             drop(review_tx);
 
             let coordinator_brief =
                 generate_gear_coordinator_brief(coordinator_language_model, &request, cx).await;
             let run_cancellation_token = cancellation_token.clone();
+            let run_task_manager_control = task_manager_control.clone();
+            let run_task_manager = task_manager.clone();
+            let run_worker_config = cx.update(|cx| gear_worker_config_from_env(cx));
             let run_task = cx.background_spawn(async move {
                 let event_sink = {
                     let event_tx = event_tx.clone();
@@ -2488,7 +2623,7 @@ impl NativeAgentConnection {
                     request,
                     workspace,
                     verification_commands: gear_verification_commands_from_env(),
-                    worker: gear_worker_config_from_env(),
+                    worker: run_worker_config,
                     allowed_paths: Vec::new(),
                     forbidden_paths: Vec::new(),
                     max_files_changed: gear_max_files_changed_from_env(),
@@ -2499,6 +2634,8 @@ impl NativeAgentConnection {
                     coordinator_model,
                     coordinator_brief,
                     coordinator_review_hook,
+                    task_manager_control: Some(run_task_manager_control),
+                    task_manager: Some(run_task_manager),
                 })?;
                 let final_report = std_fs::read_to_string(&outcome.final_report_path)
                     .with_context(|| {
@@ -2511,13 +2648,23 @@ impl NativeAgentConnection {
             });
 
             let mut events_open = true;
+            let mut last_task_manager_snapshot = None;
             let run_task = run_task.fuse();
             futures::pin_mut!(run_task);
             let run_result = loop {
                 if events_open {
                     futures::select! {
                         message = event_rx.recv().fuse() => match message {
-                            Ok(message) => push_gear_assistant_markdown(&acp_thread, &thread, message, cx),
+                            Ok(message) => {
+                                push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
+                                push_gear_task_manager_snapshot_if_changed(
+                                    &task_manager,
+                                    &mut last_task_manager_snapshot,
+                                    &acp_thread,
+                                    &thread,
+                                    cx,
+                                );
+                            }
                             Err(_) => events_open = false,
                         },
                         result = run_task => break result,
@@ -2528,7 +2675,21 @@ impl NativeAgentConnection {
             };
             while let Ok(message) = event_rx.try_recv() {
                 push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
+                push_gear_task_manager_snapshot_if_changed(
+                    &task_manager,
+                    &mut last_task_manager_snapshot,
+                    &acp_thread,
+                    &thread,
+                    cx,
+                );
             }
+            push_gear_task_manager_snapshot_if_changed(
+                &task_manager,
+                &mut last_task_manager_snapshot,
+                &acp_thread,
+                &thread,
+                cx,
+            );
 
             let response = match run_result {
                 Ok((outcome, final_report)) => {
@@ -2556,6 +2717,8 @@ impl NativeAgentConnection {
                 &agent,
                 &cancellation_session_id,
                 &cancellation_token,
+                &task_manager_control,
+                &task_manager,
                 cx,
             );
             drop(review_task);
@@ -2568,16 +2731,33 @@ fn clear_gear_cancellation_token(
     agent: &Entity<NativeAgent>,
     session_id: &acp::SessionId,
     cancellation_token: &CancellationToken,
+    task_manager_control: &TaskManagerControl,
+    task_manager: &SharedTaskManager,
     cx: &mut AsyncApp,
 ) {
     agent.update(cx, |agent, _cx| {
         if let Some(session) = agent.sessions.get_mut(session_id) {
-            let should_clear = session
+            let should_clear_token = session
                 .gear_cancellation_token
                 .as_ref()
                 .is_some_and(|token| token.is_same(cancellation_token));
-            if should_clear {
+            if should_clear_token {
                 session.gear_cancellation_token = None;
+            }
+            let should_clear_control = session
+                .gear_task_manager_control
+                .as_ref()
+                .is_some_and(|control| control.is_same(task_manager_control));
+            if should_clear_control {
+                session.gear_task_manager_control = None;
+            }
+            let should_clear_manager = session
+                .gear_task_manager
+                .as_ref()
+                .is_some_and(|manager| Arc::ptr_eq(manager, task_manager));
+            if should_clear_manager {
+                session.gear_task_manager_tick_loop = None;
+                session.gear_task_manager = None;
             }
         }
     });
@@ -2620,6 +2800,21 @@ fn gear_coordinator_from_thread(
         name: model.name().0.to_string(),
     });
     (metadata, model)
+}
+
+fn gear_provider_review_enabled(model: Option<&Arc<dyn LanguageModel>>) -> bool {
+    let Some(_) = model else {
+        return false;
+    };
+
+    #[cfg(test)]
+    if let Some(model) = model
+        && model.provider_id().0.as_ref() == "fake"
+    {
+        return false;
+    }
+
+    true
 }
 
 struct GearCoordinatorReviewJob {
@@ -2689,6 +2884,18 @@ async fn generate_gear_coordinator_brief(
     }
 }
 
+fn format_list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 async fn generate_gear_coordinator_review(
     model: Option<Arc<dyn LanguageModel>>,
     input: CoordinatorReviewInput,
@@ -2700,14 +2907,31 @@ async fn generate_gear_coordinator_review(
 
     let review_request = format!(
         r#"Goal id: {goal_id}
+Task id: {task_id}
 Iteration: {iteration}/{max_iterations}
+Budget: {budget_summary}
 
 Original request:
 {request}
 
 Worker:
+- kind: {worker_kind}
+- model: {worker_model}
+- category: {worker_category}
+- route_reason: {route_reason}
+- attempt: {worker_attempt} of {worker_attempt_count}
+- failure_kind: {worker_failure_kind}
+- retry_reason: {worker_retry_reason}
+- fallback_history:
+{worker_fallback_summary}
 - status: {worker_status}
 - summary: {worker_summary}
+- outcome: {worker_outcome_summary}
+- commands_run:
+{worker_commands_run}
+- known_failures:
+{worker_known_failures}
+- outcome_path: {worker_outcome_path}
 
 Verification passed: {verification_passed}
 Verification:
@@ -2723,13 +2947,30 @@ Return exactly these fields:
 GOAL_SATISFIED: yes|no|unknown
 SUMMARY: one concise sentence
 REPAIR_REQUEST: one concise instruction for the next worker, or none
+ROUTE_HINT: quick|repair|deep|review|explore|librarian|visual|zed-native|custom|needs_user|none
+STOP_REASON: complete|limited|blocked|needs_user|none
 "#,
         goal_id = input.goal_id,
+        task_id = input.task_id,
         iteration = input.iteration,
         max_iterations = input.max_iterations,
+        budget_summary = input.budget_summary,
         request = input.request,
+        worker_kind = input.worker_kind,
+        worker_model = input.worker_model.as_deref().unwrap_or("none"),
+        worker_category = input.worker_category,
+        route_reason = input.route_reason,
+        worker_attempt = input.worker_attempt,
+        worker_attempt_count = input.worker_attempt_count,
+        worker_failure_kind = input.worker_failure_kind.as_deref().unwrap_or("none"),
+        worker_retry_reason = input.worker_retry_reason.as_deref().unwrap_or("none"),
+        worker_fallback_summary = input.worker_fallback_summary,
         worker_status = input.worker_status,
         worker_summary = input.worker_summary,
+        worker_outcome_summary = input.worker_outcome_summary,
+        worker_commands_run = format_list_or_none(&input.worker_commands_run),
+        worker_known_failures = format_list_or_none(&input.worker_known_failures),
+        worker_outcome_path = input.worker_outcome_path.as_deref().unwrap_or("none"),
         verification_passed = input.verification_passed,
         verification_summary = input.verification_summary,
         scope_summary = input.scope_summary,
@@ -2743,7 +2984,7 @@ REPAIR_REQUEST: one concise instruction for the next worker, or none
             LanguageModelRequestMessage {
                 role: Role::System,
                 content: vec![
-                    "You are Gear's coordinator review hook. Review whether the goal is actually satisfied after this iteration. Do not write code. Be conservative: if deterministic verification failed, do not mark the goal satisfied. Keep the response structured exactly as requested.".into(),
+                    "You are Gear's coordinator review hook. Review whether the goal is actually satisfied after this iteration. Do not write code. Be conservative: if deterministic verification failed, do not mark the goal satisfied. Use ROUTE_HINT=review when Gear should schedule an independent review worker before declaring completion. Keep the response structured exactly as requested.".into(),
                 ],
                 cache: false,
                 reasoning_details: None,
@@ -2793,6 +3034,8 @@ fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
     let mut goal_satisfied = None;
     let mut summary = None;
     let mut repair_request = None;
+    let mut route_hint = None;
+    let mut stop_reason = None;
 
     for line in raw_response.lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -2812,6 +3055,12 @@ fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
             "repair_request" if !value.is_empty() && !value.eq_ignore_ascii_case("none") => {
                 repair_request = Some(value.to_string());
             }
+            "route_hint" if !value.is_empty() && !value.eq_ignore_ascii_case("none") => {
+                route_hint = Some(value.to_string());
+            }
+            "stop_reason" if !value.is_empty() && !value.eq_ignore_ascii_case("none") => {
+                stop_reason = Some(value.to_string());
+            }
             _ => {}
         }
     }
@@ -2820,6 +3069,8 @@ fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
         goal_satisfied,
         summary: summary.unwrap_or_else(|| raw_response.lines().next().unwrap_or("").to_string()),
         repair_request,
+        route_hint,
+        stop_reason,
         raw_response: raw_response.to_string(),
     })
 }
@@ -2923,20 +3174,40 @@ fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) 
     Ok(worktree.read(cx).abs_path().to_path_buf())
 }
 
-fn gear_worker_config_from_env() -> WorkerConfig {
+fn gear_worker_config_from_env(cx: &App) -> WorkerConfig {
+    let worker = trimmed_env_value("GEARBOX_GEAR_WORKER");
+    let worker_kind = worker
+        .as_deref()
+        .and_then(WorkerKind::parse)
+        .unwrap_or_default();
+    let explicit_worker_command = trimmed_env_value("GEARBOX_GEAR_WORKER_COMMAND");
+    let legacy_opencode_command = trimmed_env_value("GEARBOX_OPENCODE_COMMAND");
+    let per_kind_worker_command = gear_worker_command_for_kind(worker_kind);
     let mut config = gear_worker_config_from_values(
-        trimmed_env_value("GEARBOX_GEAR_WORKER").as_deref(),
-        trimmed_env_value("GEARBOX_GEAR_WORKER_COMMAND").as_deref(),
-        trimmed_env_value("GEARBOX_OPENCODE_COMMAND").as_deref(),
+        worker.as_deref(),
+        explicit_worker_command
+            .as_deref()
+            .or(per_kind_worker_command.as_deref()),
+        legacy_opencode_command.as_deref(),
+        trimmed_env_value("GEARBOX_GEAR_WORKER_MODEL").as_deref(),
+        gear_unavailable_worker_models_from_env(),
+        gear_usize_from_env("GEARBOX_GEAR_PREMIUM_WORKER_BUDGET", 1),
+        gear_parallel_limit_from_env("GEARBOX_GEAR_MAX_PARALLEL_WORKERS"),
+        gear_parallel_limit_from_env("GEARBOX_GEAR_MAX_PARALLEL_PER_KEY"),
+        gear_usize_from_env("GEARBOX_GEAR_STALE_TASK_TIMEOUT_SECS", 30),
     );
-    config.worker_routes =
-        gear_worker_routes_from_env(config.worker_kind, config.worker_command.as_deref());
+    config.worker_routes = gear_worker_routes_from_env(
+        config.worker_kind,
+        config.worker_command.as_deref(),
+        config.worker_model.as_deref(),
+    );
     if !config.worker_routes.is_empty() {
         config.require_worker = config
             .worker_routes
             .iter()
             .any(|route| route.worker_command.is_some());
     }
+    gear_apply_provider_model_availability(&mut config, gear_available_provider_models(cx));
     config
 }
 
@@ -2944,6 +3215,12 @@ fn gear_worker_config_from_values(
     worker: Option<&str>,
     worker_command: Option<&str>,
     opencode_command: Option<&str>,
+    worker_model: Option<&str>,
+    unavailable_worker_models: Vec<String>,
+    premium_worker_budget: usize,
+    max_parallel_workers: usize,
+    max_parallel_per_key: usize,
+    stale_task_timeout_secs: usize,
 ) -> WorkerConfig {
     let worker_kind = match worker {
         Some(worker) => WorkerKind::parse(worker).unwrap_or_else(|| {
@@ -2955,21 +3232,41 @@ fn gear_worker_config_from_values(
     let worker_command = worker_command
         .or(opencode_command)
         .map(str::to_string)
-        .filter(|command| !command.is_empty());
+        .filter(|command| !command.is_empty())
+        .or_else(|| worker_kind.default_command(worker_model));
     let require_worker = worker_command.is_some();
 
     WorkerConfig {
         worker_kind,
         worker_command,
+        worker_model: worker_model.map(ToString::to_string),
         worker_routes: Vec::new(),
+        unavailable_worker_models,
+        premium_worker_budget,
+        max_parallel_workers: max_parallel_workers.max(1),
+        max_parallel_per_key: max_parallel_per_key.max(1),
+        stale_task_timeout_secs: stale_task_timeout_secs.max(1),
         skip_worker: false,
         require_worker,
     }
 }
 
+fn gear_parallel_limit_from_env(env_name: &str) -> usize {
+    trimmed_env_value(env_name)
+        .and_then(|value| match value.parse::<usize>() {
+            Ok(limit) => Some(limit.max(1)),
+            Err(error) => {
+                log::warn!("Ignoring invalid {env_name} value `{value}`: {error}");
+                None
+            }
+        })
+        .unwrap_or(1)
+}
+
 fn gear_worker_routes_from_env(
     default_worker_kind: WorkerKind,
     default_worker_command: Option<&str>,
+    default_worker_model: Option<&str>,
 ) -> Vec<WorkerRoute> {
     let Some(sequence) = trimmed_env_value("GEARBOX_GEAR_WORKER_SEQUENCE") else {
         return Vec::new();
@@ -2982,32 +3279,133 @@ fn gear_worker_routes_from_env(
             if worker.is_empty() {
                 return None;
             }
+            let (worker, worker_model) = worker
+                .split_once(':')
+                .map(|(worker, worker_model)| {
+                    (
+                        worker.trim(),
+                        Some(worker_model.trim().to_string()).filter(|model| !model.is_empty()),
+                    )
+                })
+                .unwrap_or((worker, None));
             let Some(worker_kind) = WorkerKind::parse(worker) else {
                 log::warn!("Ignoring unknown GEARBOX_GEAR_WORKER_SEQUENCE value `{worker}`");
                 return None;
             };
-            let worker_command = gear_worker_command_for_kind(worker_kind).or_else(|| {
+            let worker_command = gear_worker_command_for_kind(worker_kind)
+                .or_else(|| {
+                    (worker_kind == default_worker_kind)
+                        .then(|| default_worker_command.map(ToString::to_string))
+                        .flatten()
+                })
+                .or_else(|| worker_kind.default_command(worker_model.as_deref()));
+            let worker_model = worker_model.or_else(|| {
                 (worker_kind == default_worker_kind)
-                    .then(|| default_worker_command.map(ToString::to_string))
+                    .then(|| default_worker_model.map(ToString::to_string))
                     .flatten()
             });
             Some(WorkerRoute {
                 worker_kind,
                 worker_command,
+                worker_model,
             })
         })
         .collect()
 }
 
+fn gear_unavailable_worker_models_from_env() -> Vec<String> {
+    trimmed_env_value("GEARBOX_GEAR_UNAVAILABLE_WORKER_MODELS")
+        .map(|models| {
+            models
+                .split([',', '\n'])
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn gear_worker_command_for_kind(worker_kind: WorkerKind) -> Option<String> {
     let env_name = match worker_kind {
-        WorkerKind::Opencode => "GEARBOX_GEAR_OPENCODE_COMMAND",
+        WorkerKind::Opencode | WorkerKind::OpencodeSession => "GEARBOX_GEAR_OPENCODE_COMMAND",
         WorkerKind::Codex => "GEARBOX_GEAR_CODEX_COMMAND",
         WorkerKind::Claude => "GEARBOX_GEAR_CLAUDE_COMMAND",
         WorkerKind::ZedAgent => "GEARBOX_GEAR_ZED_AGENT_COMMAND",
         WorkerKind::Custom => "GEARBOX_GEAR_CUSTOM_COMMAND",
     };
     trimmed_env_value(env_name)
+}
+
+fn gear_available_provider_models(cx: &App) -> Vec<(String, String)> {
+    LanguageModelRegistry::read_global(cx)
+        .available_models(cx)
+        .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()))
+        .collect()
+}
+
+fn gear_apply_provider_model_availability(
+    config: &mut WorkerConfig,
+    available_models: impl IntoIterator<Item = (String, String)>,
+) {
+    let available_models = available_models
+        .into_iter()
+        .map(|(provider_id, model_id)| {
+            (
+                provider_id.trim().to_ascii_lowercase(),
+                model_id.trim().to_ascii_lowercase(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut unavailable_models = config.unavailable_worker_models.clone();
+    gear_mark_unavailable_worker_model(
+        &mut unavailable_models,
+        config.worker_kind,
+        config.worker_model.as_deref(),
+        &available_models,
+    );
+    for route in &config.worker_routes {
+        gear_mark_unavailable_worker_model(
+            &mut unavailable_models,
+            route.worker_kind,
+            route.worker_model.as_deref(),
+            &available_models,
+        );
+    }
+    config.unavailable_worker_models = unavailable_models;
+}
+
+fn gear_mark_unavailable_worker_model(
+    unavailable_models: &mut Vec<String>,
+    worker_kind: WorkerKind,
+    worker_model: Option<&str>,
+    available_models: &std::collections::HashSet<(String, String)>,
+) {
+    let Some(provider_id) = worker_kind.provider_id_hint() else {
+        return;
+    };
+    let Some(worker_model) = worker_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+    let qualified_model = format!("{provider_id}/{worker_model}");
+    let normalized_qualified_model = (
+        provider_id.to_ascii_lowercase(),
+        worker_model.to_ascii_lowercase(),
+    );
+    if available_models.contains(&normalized_qualified_model) {
+        return;
+    }
+    if unavailable_models
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(&qualified_model))
+    {
+        return;
+    }
+    unavailable_models.push(qualified_model);
 }
 
 fn trimmed_env_value(name: &str) -> Option<String> {
@@ -3072,6 +3470,179 @@ fn gear_event_status_markdown(event: &gearbox_agent::state::Event) -> String {
     } else {
         format!("Gear:{task} {}{path}\n\n", event.message)
     }
+}
+
+fn push_gear_task_manager_snapshot_if_changed(
+    task_manager: &SharedTaskManager,
+    last_snapshot: &mut Option<String>,
+    acp_thread: &Entity<AcpThread>,
+    thread: &Entity<Thread>,
+    cx: &mut AsyncApp,
+) {
+    match gear_task_manager_snapshot_markdown(task_manager) {
+        Ok(Some(snapshot)) if last_snapshot.as_ref() != Some(&snapshot) => {
+            push_gear_assistant_markdown(acp_thread, thread, snapshot.clone(), cx);
+            *last_snapshot = Some(snapshot);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!("failed to render Gear task manager snapshot: {error:#}");
+        }
+    }
+}
+
+fn gear_task_manager_snapshot_markdown(task_manager: &SharedTaskManager) -> Result<Option<String>> {
+    let snapshot = task_manager
+        .lock()
+        .map_err(|_| anyhow!("task manager mutex poisoned"))?
+        .snapshot()?;
+    gear_task_manager_snapshot_to_markdown(&snapshot)
+}
+
+fn gear_task_manager_snapshot_to_markdown(
+    snapshot: &TaskManagerSnapshot,
+) -> Result<Option<String>> {
+    if snapshot.tasks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut message = format!(
+        "Gear task manager: pending {}, running {}, completed {}, failed {}, cancelled {}, interrupted {}, lost {}, skipped {}\n\n",
+        snapshot.counts.pending,
+        snapshot.counts.running,
+        snapshot.counts.completed,
+        snapshot.counts.failed,
+        snapshot.counts.cancelled,
+        snapshot.counts.interrupted,
+        snapshot.counts.lost,
+        snapshot.counts.skipped,
+    );
+    for record in snapshot.tasks.iter().take(6) {
+        let artifacts = gear_task_artifact_links(record);
+        let worker =
+            gear_worker_snapshot_label(&record.worker_kind, record.worker_model.as_deref());
+        message.push_str(&format!(
+            "- `{}` {} via `{}` / `{}`; attempts: {}; {}{}\n",
+            record.task_id,
+            gear_managed_task_status_label(&record.status),
+            worker,
+            record.worker_category,
+            record.attempts.len(),
+            record.summary,
+            artifacts
+        ));
+        for attempt in record.attempts.iter().rev().take(2).rev() {
+            let worker =
+                gear_worker_snapshot_label(&attempt.worker_kind, attempt.worker_model.as_deref());
+            message.push_str(&format!(
+                "  - attempt {} {} via `{}` / `{}`{}{}\n",
+                attempt.attempt,
+                gear_task_attempt_status_label(&attempt.status),
+                worker,
+                attempt.worker_category,
+                gear_task_attempt_artifact_links(attempt),
+                gear_task_attempt_error_text(attempt),
+            ));
+        }
+    }
+    if snapshot.tasks.len() > 6 {
+        message.push_str(&format!("- ... {} more tasks\n", snapshot.tasks.len() - 6));
+    }
+
+    if let Some(output) = snapshot.current_output.as_deref() {
+        let output = gear_truncate_text(output.trim(), 1200);
+        if !output.is_empty() {
+            message.push_str("\nCurrent worker output:\n\n```text\n");
+            message.push_str(&output);
+            message.push_str("\n```\n");
+        }
+    }
+    message.push('\n');
+    Ok(Some(message))
+}
+
+fn gear_worker_snapshot_label(worker_kind: &str, worker_model: Option<&str>) -> String {
+    worker_model
+        .map(|worker_model| format!("{worker_kind}:{worker_model}"))
+        .unwrap_or_else(|| worker_kind.to_string())
+}
+
+fn gear_managed_task_status_label(status: &ManagedTaskStatus) -> &'static str {
+    match status {
+        ManagedTaskStatus::Pending => "pending",
+        ManagedTaskStatus::Running => "running",
+        ManagedTaskStatus::Completed => "completed",
+        ManagedTaskStatus::Failed => "failed",
+        ManagedTaskStatus::Cancelled => "cancelled",
+        ManagedTaskStatus::Interrupted => "interrupted",
+        ManagedTaskStatus::Lost => "lost",
+        ManagedTaskStatus::Skipped => "skipped",
+    }
+}
+
+fn gear_task_attempt_status_label(
+    status: &gearbox_agent::task_manager::TaskAttemptStatus,
+) -> &'static str {
+    match status {
+        gearbox_agent::task_manager::TaskAttemptStatus::Pending => "pending",
+        gearbox_agent::task_manager::TaskAttemptStatus::Running => "running",
+        gearbox_agent::task_manager::TaskAttemptStatus::Completed => "completed",
+        gearbox_agent::task_manager::TaskAttemptStatus::Failed => "failed",
+        gearbox_agent::task_manager::TaskAttemptStatus::Cancelled => "cancelled",
+        gearbox_agent::task_manager::TaskAttemptStatus::Interrupted => "interrupted",
+        gearbox_agent::task_manager::TaskAttemptStatus::Lost => "lost",
+        gearbox_agent::task_manager::TaskAttemptStatus::Skipped => "skipped",
+    }
+}
+
+fn gear_task_artifact_links(record: &TaskSnapshot) -> String {
+    let mut links = Vec::new();
+    if let Some(path) = record.result_path.as_ref() {
+        links.push(format!("[result]({})", path.display()));
+    }
+    if let Some(path) = record.outcome_path.as_ref() {
+        links.push(format!("[outcome]({})", path.display()));
+    }
+    if links.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", links.join(", "))
+    }
+}
+
+fn gear_task_attempt_artifact_links(attempt: &TaskAttemptSnapshot) -> String {
+    let mut links = Vec::new();
+    if let Some(path) = attempt.result_path.as_ref() {
+        links.push(format!("[result]({})", path.display()));
+    }
+    if let Some(path) = attempt.outcome_path.as_ref() {
+        links.push(format!("[outcome]({})", path.display()));
+    }
+    if links.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", links.join(", "))
+    }
+}
+
+fn gear_task_attempt_error_text(attempt: &TaskAttemptSnapshot) -> String {
+    let Some(error) = attempt.error.as_deref() else {
+        return String::new();
+    };
+    let error = gear_truncate_text(error, 160).replace('\n', " ");
+    format!("; error: {error}")
+}
+
+fn gear_truncate_text(text: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    for (index, character) in text.chars().enumerate() {
+        if index >= max_chars {
+            truncated.push_str("\n... truncated ...");
+            return truncated;
+        }
+        truncated.push(character);
+    }
+    truncated
 }
 
 fn gear_response_markdown(
@@ -3484,6 +4055,11 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         log::info!("Cancelling on session: {}", session_id);
         self.agent.update(cx, |agent, cx| {
             if let Some(session) = agent.sessions.get(session_id) {
+                if let Some(task_manager_control) = session.gear_task_manager_control.as_ref()
+                    && let Err(error) = task_manager_control.cancel_current_task()
+                {
+                    log::warn!("failed to cancel current Gear task: {error:#}");
+                }
                 if let Some(cancellation_token) = session.gear_cancellation_token.as_ref() {
                     cancellation_token.cancel();
                 }
@@ -3858,6 +4434,555 @@ pub struct NativeThreadEnvironment {
     agent: WeakEntity<NativeAgent>,
     thread: WeakEntity<Thread>,
     acp_thread: WeakEntity<AcpThread>,
+}
+
+struct GearZedWorkerBackend {
+    request_tx: async_channel::Sender<GearZedWorkerDispatch>,
+}
+
+#[derive(Default)]
+struct GearZedWorkerState {
+    session_id: Option<acp::SessionId>,
+    result: Option<std::result::Result<WorkerResult, String>>,
+    last_output: Option<String>,
+    pending_interactions: VecDeque<GearZedInteraction>,
+    interaction_count: usize,
+}
+
+struct GearZedWorkerSessionHandle {
+    task_id: String,
+    request_tx: async_channel::Sender<GearZedWorkerDispatch>,
+    state: Arc<(Mutex<GearZedWorkerState>, Condvar)>,
+    cancellation_token: CancellationToken,
+}
+
+struct GearZedWorkerJob {
+    store: gearbox_agent::state::StateStore,
+    task_id: String,
+    prompt: String,
+    packet_path: PathBuf,
+    prompt_path: PathBuf,
+    cancellation_token: CancellationToken,
+    state: Arc<(Mutex<GearZedWorkerState>, Condvar)>,
+}
+
+enum GearZedWorkerDispatch {
+    Run(GearZedWorkerJob),
+    Cancel { task_id: String },
+    SetEndTurnAtBoundary { task_id: String, enabled: bool },
+}
+
+#[derive(Clone)]
+struct GearZedInteraction {
+    kind: GearZedInteractionKind,
+    prompt: String,
+}
+
+#[derive(Clone, Copy)]
+enum GearZedInteractionKind {
+    FollowUp,
+    Steer,
+}
+
+impl GearZedInteractionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FollowUp => "follow-up",
+            Self::Steer => "steer",
+        }
+    }
+}
+
+impl GearZedWorkerBackend {
+    fn new(request_tx: async_channel::Sender<GearZedWorkerDispatch>) -> Self {
+        Self { request_tx }
+    }
+}
+
+impl NativeWorkerBackend for GearZedWorkerBackend {
+    fn start_zed_agent(
+        &self,
+        request: WorkerStartRequest<'_>,
+    ) -> Result<Arc<dyn WorkerSessionHandle>> {
+        let route = request
+            .config
+            .selected_route_for_hint(request.route_attempt, request.route_hint);
+        let packet = WorkerPacket {
+            task_id: request.task.id.clone(),
+            worker: route.worker_kind.as_str().to_string(),
+            worker_model: route.worker_model.map(ToString::to_string),
+            goal: request.goal.to_string(),
+            coordinator_model: request.coordinator_model.cloned(),
+            coordinator_brief: request.coordinator_brief.map(ToString::to_string),
+            scope: request.task.scope.clone(),
+            inputs: request.task.inputs.clone(),
+            constraints: vec![
+                "Stay inside the allowed paths when they are provided.".to_string(),
+                "Prefer the package manager already used by the project.".to_string(),
+                "Read the provided spec and plan artifacts before changing code.".to_string(),
+                "Leave runnable local instructions in the final output.".to_string(),
+            ],
+            required_outputs: vec![
+                "summary".to_string(),
+                "changed_files".to_string(),
+                "commands_run".to_string(),
+                "known_failures".to_string(),
+                "next_steps".to_string(),
+            ],
+            verification: VerificationContract {
+                preferred_commands: request.verification_commands.to_vec(),
+                must_not_skip: vec!["typecheck".to_string()],
+            },
+            stop_conditions: vec![
+                "Requires a paid external service.".to_string(),
+                "Requires a user-provided API key.".to_string(),
+                "The same verification fails twice.".to_string(),
+            ],
+        };
+        let packet_json =
+            serde_json::to_string_pretty(&packet).context("failed to serialize worker packet")?;
+        let packet_path = request.store.write_worker_file(
+            &request.task.id,
+            "packet.json",
+            &format!("{packet_json}\n"),
+        )?;
+        let prompt = worker_prompt(&packet)?;
+        let prompt_path =
+            request
+                .store
+                .write_worker_file(&request.task.id, "prompt.md", &prompt)?;
+
+        let cancellation_token = request
+            .cancellation_token
+            .clone()
+            .unwrap_or_else(CancellationToken::new);
+        let state = Arc::new((Mutex::new(GearZedWorkerState::default()), Condvar::new()));
+        self.request_tx
+            .send_blocking(GearZedWorkerDispatch::Run(GearZedWorkerJob {
+                store: request.store.clone(),
+                task_id: request.task.id.clone(),
+                prompt,
+                packet_path,
+                prompt_path,
+                cancellation_token: cancellation_token.clone(),
+                state: state.clone(),
+            }))
+            .context("failed to queue native zed worker job")?;
+
+        Ok(Arc::new(GearZedWorkerSessionHandle {
+            task_id: request.task.id.clone(),
+            request_tx: self.request_tx.clone(),
+            state,
+            cancellation_token,
+        }))
+    }
+}
+
+impl WorkerSessionHandle for GearZedWorkerSessionHandle {
+    fn session_id(&self) -> Option<String> {
+        self.state
+            .0
+            .lock()
+            .ok()
+            .and_then(|state| state.session_id.as_ref().map(ToString::to_string))
+    }
+
+    fn send_follow_up(&self, prompt: String) -> Result<()> {
+        self.enqueue_interaction(GearZedInteractionKind::FollowUp, prompt)
+    }
+
+    fn steer(&self, prompt: String) -> Result<()> {
+        self.enqueue_interaction(GearZedInteractionKind::Steer, prompt)?;
+        self.request_tx
+            .send_blocking(GearZedWorkerDispatch::SetEndTurnAtBoundary {
+                task_id: self.task_id.clone(),
+                enabled: true,
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn interrupt(&self) -> Result<()> {
+        self.cancel()
+    }
+
+    fn cancel(&self) -> Result<()> {
+        self.cancellation_token.cancel();
+        self.request_tx
+            .send_blocking(GearZedWorkerDispatch::Cancel {
+                task_id: self.task_id.clone(),
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+        Ok(worker_outcome_from_result(&self.wait_for_result()?))
+    }
+
+    fn wait_for_result(&self) -> Result<WorkerResult> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("zed worker state poisoned");
+        loop {
+            if let Some(result) = state.result.clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            state = wake.wait(state).expect("zed worker state poisoned");
+        }
+    }
+
+    fn last_output(&self) -> Option<String> {
+        self.state
+            .0
+            .lock()
+            .ok()
+            .and_then(|state| state.last_output.clone())
+    }
+}
+
+impl GearZedWorkerSessionHandle {
+    fn enqueue_interaction(&self, kind: GearZedInteractionKind, prompt: String) -> Result<()> {
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().expect("zed worker state poisoned");
+        state.result = None;
+        state
+            .pending_interactions
+            .push_back(GearZedInteraction { kind, prompt });
+        Ok(())
+    }
+}
+
+fn spawn_gear_zed_worker_dispatcher(
+    agent: WeakEntity<NativeAgent>,
+    parent_session_id: acp::SessionId,
+    native_worker_rx: async_channel::Receiver<GearZedWorkerDispatch>,
+    running_native_zed_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>>,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        while let Ok(dispatch) = native_worker_rx.recv().await {
+            match dispatch {
+                GearZedWorkerDispatch::Run(job) => {
+                    let agent = agent.clone();
+                    let parent_session_id = parent_session_id.clone();
+                    let running_native_zed_sessions = running_native_zed_sessions.clone();
+                    let state = job.state.clone();
+                    cx.spawn(async move |cx| {
+                        let result = run_native_zed_worker(
+                            agent,
+                            parent_session_id,
+                            job,
+                            running_native_zed_sessions,
+                            cx,
+                        )
+                        .await;
+                        let (lock, wake) = &*state;
+                        let mut state = lock.lock().expect("zed worker state poisoned");
+                        state.result = Some(result.map_err(|error| format!("{error:#}")));
+                        wake.notify_all();
+                    })
+                    .detach();
+                }
+                GearZedWorkerDispatch::Cancel { task_id } => {
+                    let Some(worker_session_id) = running_native_zed_sessions
+                        .lock()
+                        .expect("running native zed sessions poisoned")
+                        .get(&task_id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(worker_thread) = agent
+                        .read_with(cx, |agent, _| {
+                            agent
+                                .sessions
+                                .get(&worker_session_id)
+                                .map(|session| session.thread.clone())
+                        })
+                        .ok()
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    let _ = worker_thread
+                        .update(cx, |thread, cx| thread.cancel(cx))
+                        .await;
+                }
+                GearZedWorkerDispatch::SetEndTurnAtBoundary { task_id, enabled } => {
+                    let Some(worker_session_id) = running_native_zed_sessions
+                        .lock()
+                        .expect("running native zed sessions poisoned")
+                        .get(&task_id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(worker_thread) = agent
+                        .read_with(cx, |agent, _| {
+                            agent
+                                .sessions
+                                .get(&worker_session_id)
+                                .map(|session| session.thread.clone())
+                        })
+                        .ok()
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    worker_thread.update(cx, |thread, _cx| {
+                        thread.set_end_turn_at_next_boundary(enabled);
+                    });
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+async fn run_native_zed_worker(
+    agent: WeakEntity<NativeAgent>,
+    parent_session_id: acp::SessionId,
+    job: GearZedWorkerJob,
+    running_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>>,
+    cx: &mut AsyncApp,
+) -> Result<WorkerResult> {
+    let (parent_thread, subagent_thread, acp_thread, worker_session_id) =
+        agent.update(cx, |agent, cx| -> Result<_> {
+            let parent_session = agent
+                .sessions
+                .get(&parent_session_id)
+                .context("parent Gear session not found for native zed worker")?;
+            let parent_thread = parent_session.thread.clone();
+            let current_depth = parent_thread.read(cx).depth();
+            if current_depth >= MAX_SUBAGENT_DEPTH {
+                anyhow::bail!("Maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached");
+            }
+
+            let subagent_thread = cx.new(|cx| {
+                let mut thread = Thread::new_subagent(&parent_thread, cx);
+                thread.set_title(format!("Gear Worker {}", job.task_id).into(), cx);
+                thread
+            });
+            let worker_session_id = subagent_thread.read(cx).id().clone();
+            let acp_thread = agent.register_session(
+                subagent_thread.clone(),
+                parent_session.project_id,
+                1,
+                None,
+                ZED_AGENT_ID.clone(),
+                "zed".into(),
+                cx,
+            );
+            parent_thread.update(cx, |thread, _cx| {
+                thread.register_running_subagent(subagent_thread.downgrade())
+            });
+            Ok((
+                parent_thread,
+                subagent_thread,
+                acp_thread,
+                worker_session_id,
+            ))
+        })??;
+
+    {
+        let (lock, _) = &*job.state;
+        let mut state = lock.lock().expect("zed worker state poisoned");
+        state.session_id = Some(worker_session_id.clone());
+    }
+    running_sessions
+        .lock()
+        .expect("running native zed sessions poisoned")
+        .insert(job.task_id.clone(), worker_session_id.clone());
+
+    let run_result = async {
+        let mut next_prompt = job.prompt.clone();
+        let mut next_prompt_path = job.prompt_path.clone();
+        loop {
+            if job.cancellation_token.is_cancelled() {
+                anyhow::bail!("native zed worker cancelled before prompt started");
+            }
+
+            let response = acp_thread
+                .update(cx, |acp_thread, cx| {
+                    acp_thread.send(vec![next_prompt.clone().into()], cx)
+                })
+                .await?;
+            let assistant_text = subagent_thread.read_with(cx, |thread, _cx| {
+                thread
+                    .last_message()
+                    .and_then(|message| {
+                        let content = message
+                            .as_agent_message()?
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                AgentMessageContent::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .join("\n\n");
+                        (!content.is_empty()).then_some(content)
+                    })
+                    .unwrap_or_default()
+            });
+            let next_interaction = {
+                let (lock, _) = &*job.state;
+                let mut state = lock.lock().expect("zed worker state poisoned");
+                state.last_output = Some(assistant_text.clone());
+                state.pending_interactions.pop_front().map(|interaction| {
+                    state.interaction_count += 1;
+                    (interaction, state.interaction_count)
+                })
+            };
+
+            if let Some((interaction, interaction_index)) = next_interaction {
+                next_prompt = interaction.prompt.clone();
+                next_prompt_path = job.store.write_worker_file(
+                    &job.task_id,
+                    &format!("{}-{}.md", interaction.kind.as_str(), interaction_index),
+                    &format!(
+                        "# Gear native zed worker {}\n\n{}\n",
+                        interaction.kind.as_str(),
+                        interaction.prompt.trim()
+                    ),
+                )?;
+                if matches!(interaction.kind, GearZedInteractionKind::Steer) {
+                    subagent_thread.update(cx, |thread, _cx| {
+                        thread.set_end_turn_at_next_boundary(false);
+                    });
+                }
+                continue;
+            }
+
+            break match response {
+                Some(response) if response.stop_reason == acp::StopReason::EndTurn => {
+                    build_native_zed_worker_result(
+                        &job.store,
+                        &job.task_id,
+                        job.packet_path,
+                        next_prompt_path,
+                        assistant_text,
+                        WorkerStatus::Succeeded,
+                        None,
+                    )
+                }
+                Some(response) if response.stop_reason == acp::StopReason::Cancelled => {
+                    build_native_zed_worker_result(
+                        &job.store,
+                        &job.task_id,
+                        job.packet_path,
+                        next_prompt_path,
+                        assistant_text,
+                        WorkerStatus::Failed,
+                        Some("cancelled".to_string()),
+                    )
+                }
+                Some(response) => {
+                    let failure = match response.stop_reason {
+                        acp::StopReason::MaxTokens => {
+                            "native zed worker reached the maximum number of tokens".to_string()
+                        }
+                        acp::StopReason::MaxTurnRequests => {
+                            "native zed worker reached the maximum number of turn requests"
+                                .to_string()
+                        }
+                        acp::StopReason::Refusal => {
+                            "native zed worker refused to process the prompt".to_string()
+                        }
+                        _ => format!("native zed worker stopped: {:?}", response.stop_reason),
+                    };
+                    build_native_zed_worker_result(
+                        &job.store,
+                        &job.task_id,
+                        job.packet_path,
+                        next_prompt_path,
+                        assistant_text,
+                        WorkerStatus::Failed,
+                        Some(failure),
+                    )
+                }
+                None => build_native_zed_worker_result(
+                    &job.store,
+                    &job.task_id,
+                    job.packet_path,
+                    next_prompt_path,
+                    String::new(),
+                    WorkerStatus::Failed,
+                    Some("native zed worker returned no response".to_string()),
+                ),
+            };
+        }
+    }
+    .await;
+
+    parent_thread.update(cx, |thread, cx| {
+        thread.unregister_running_subagent(&worker_session_id, cx)
+    });
+    running_sessions
+        .lock()
+        .expect("running native zed sessions poisoned")
+        .remove(&job.task_id);
+    if let Ok(close_task) =
+        agent.update(cx, |agent, cx| agent.close_session(&worker_session_id, cx))
+    {
+        close_task.await?;
+    }
+
+    run_result
+}
+
+fn build_native_zed_worker_result(
+    store: &gearbox_agent::state::StateStore,
+    task_id: &str,
+    packet_path: PathBuf,
+    prompt_path: PathBuf,
+    assistant_text: String,
+    status: WorkerStatus,
+    failure: Option<String>,
+) -> Result<WorkerResult> {
+    let summary = assistant_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| failure.clone())
+        .unwrap_or_else(|| "native zed worker completed without output".to_string());
+    let last_message_path = if assistant_text.trim().is_empty() && failure.is_none() {
+        None
+    } else {
+        let body = native_zed_worker_message_body(&assistant_text, failure.as_deref());
+        Some(store.write_worker_file(task_id, "last-message.md", &body)?)
+    };
+    let result = WorkerResult {
+        status,
+        command: Some("zed-agent-native".to_string()),
+        exit_code: None,
+        summary,
+        packet_path,
+        prompt_path,
+        stdout_path: None,
+        stderr_path: None,
+        last_message_path,
+        result_path: store.worker_dir(task_id).join("result.json"),
+        outcome_path: store.worker_dir(task_id).join("outcome.json"),
+    };
+    write_result_and_outcome(store, task_id, &result)?;
+    Ok(result)
+}
+
+fn native_zed_worker_message_body(assistant_text: &str, failure: Option<&str>) -> String {
+    let mut body = String::new();
+    if !assistant_text.trim().is_empty() {
+        body.push_str(assistant_text.trim());
+        body.push('\n');
+    }
+    if let Some(failure) = failure {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("## Known Failures\n");
+        body.push_str(&format!("- {failure}\n"));
+    }
+    body
 }
 
 impl NativeThreadEnvironment {
@@ -4578,16 +5703,37 @@ mod internal_tests {
             Some("claude-code"),
             Some("gear worker"),
             Some("legacy opencode"),
+            Some("claude-sonnet"),
+            vec!["old-model".to_string()],
+            2,
+            3,
+            2,
+            30,
         );
 
         assert_eq!(config.worker_kind, WorkerKind::Claude);
         assert_eq!(config.worker_command.as_deref(), Some("gear worker"));
+        assert_eq!(config.worker_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(config.unavailable_worker_models, vec!["old-model"]);
+        assert_eq!(config.premium_worker_budget, 2);
+        assert_eq!(config.max_parallel_workers, 3);
+        assert_eq!(config.max_parallel_per_key, 2);
         assert!(config.require_worker);
     }
 
     #[test]
     fn gear_worker_config_falls_back_to_legacy_opencode_command() {
-        let config = gear_worker_config_from_values(None, None, Some("opencode run"));
+        let config = gear_worker_config_from_values(
+            None,
+            None,
+            Some("opencode run"),
+            None,
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        );
 
         assert_eq!(config.worker_kind, WorkerKind::Opencode);
         assert_eq!(config.worker_command.as_deref(), Some("opencode run"));
@@ -4596,11 +5742,121 @@ mod internal_tests {
 
     #[test]
     fn gear_worker_config_warns_and_uses_default_for_unknown_worker() {
-        let config = gear_worker_config_from_values(Some("unknown-worker"), None, None);
+        let config = gear_worker_config_from_values(
+            Some("unknown-worker"),
+            None,
+            None,
+            None,
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        );
 
         assert_eq!(config.worker_kind, WorkerKind::Opencode);
         assert_eq!(config.worker_command, None);
         assert!(!config.require_worker);
+    }
+
+    #[test]
+    fn gear_worker_config_uses_kind_specific_command_for_non_opencode_worker() {
+        let config = gear_worker_config_from_values(
+            Some("codex"),
+            Some("codex exec"),
+            Some("legacy opencode"),
+            None,
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        );
+
+        assert_eq!(config.worker_kind, WorkerKind::Codex);
+        assert_eq!(config.worker_command.as_deref(), Some("codex exec"));
+        assert!(config.require_worker);
+    }
+
+    #[test]
+    fn gear_worker_config_uses_default_codex_command_when_unspecified() {
+        let config = gear_worker_config_from_values(
+            Some("codex"),
+            None,
+            None,
+            Some("gpt-5"),
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        );
+
+        assert_eq!(config.worker_kind, WorkerKind::Codex);
+        assert!(
+            config
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| command.contains("codex exec"))
+        );
+        assert!(
+            config
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| command.contains("-m 'gpt-5'"))
+        );
+        assert!(config.require_worker);
+    }
+
+    #[test]
+    fn gear_apply_provider_model_availability_marks_missing_qualified_models() {
+        let mut config = gear_worker_config_from_values(
+            Some("codex"),
+            Some("codex exec"),
+            None,
+            Some("gpt-5"),
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        );
+        config.worker_routes = vec![
+            WorkerRoute {
+                worker_kind: WorkerKind::Claude,
+                worker_command: Some("claude -p".to_string()),
+                worker_model: Some("claude-3-7-sonnet".to_string()),
+            },
+            WorkerRoute {
+                worker_kind: WorkerKind::Codex,
+                worker_command: Some("codex exec".to_string()),
+                worker_model: Some("gpt-4.1".to_string()),
+            },
+        ];
+
+        gear_apply_provider_model_availability(
+            &mut config,
+            vec![
+                ("openai".to_string(), "gpt-4.1".to_string()),
+                ("anthropic".to_string(), "claude-3-5-sonnet".to_string()),
+            ],
+        );
+
+        assert!(
+            config
+                .unavailable_worker_models
+                .contains(&"openai/gpt-5".to_string())
+        );
+        assert!(
+            config
+                .unavailable_worker_models
+                .contains(&"anthropic/claude-3-7-sonnet".to_string())
+        );
+        assert!(
+            !config
+                .unavailable_worker_models
+                .contains(&"openai/gpt-4.1".to_string())
+        );
     }
 
     #[test]
@@ -4613,7 +5869,7 @@ mod internal_tests {
     #[test]
     fn parses_gear_coordinator_review_fields() {
         let review = parse_gear_coordinator_review(
-            "GOAL_SATISFIED: no\nSUMMARY: Needs another repair pass.\nREPAIR_REQUEST: Fix the failing build.",
+            "GOAL_SATISFIED: no\nSUMMARY: Needs another repair pass.\nREPAIR_REQUEST: Fix the failing build.\nROUTE_HINT: repair\nSTOP_REASON: none",
         )
         .expect("review should parse");
 
@@ -4623,6 +5879,8 @@ mod internal_tests {
             review.repair_request.as_deref(),
             Some("Fix the failing build.")
         );
+        assert_eq!(review.route_hint.as_deref(), Some("repair"));
+        assert_eq!(review.stop_reason, None);
     }
 
     async fn setup_native_agent_session(
@@ -4833,25 +6091,6 @@ mod internal_tests {
             "Build a compact notes MVP, verify artifacts, and keep the scope small.",
         );
         fake_model.end_last_completion_stream();
-        wait_for_fake_completion(fake_model, cx).await;
-        fake_model.send_last_completion_stream_text_chunk(
-            "GOAL_SATISFIED: yes\nSUMMARY: The generated artifacts satisfy the MVP goal.\nREPAIR_REQUEST: none",
-        );
-        fake_model.end_last_completion_stream();
-        wait_for_fake_completion(fake_model, cx).await;
-        fake_model.send_last_completion_stream_text_chunk(
-            "GOAL_SATISFIED: unknown\nSUMMARY: The run reached its verification limit.\nREPAIR_REQUEST: none",
-        );
-        fake_model.end_last_completion_stream();
-        for _ in 0..5 {
-            if !wait_for_optional_fake_completion(fake_model, cx, 20).await {
-                break;
-            }
-            fake_model.send_last_completion_stream_text_chunk(
-                "GOAL_SATISFIED: unknown\nSUMMARY: Continue using deterministic verification.\nREPAIR_REQUEST: none",
-            );
-            fake_model.end_last_completion_stream();
-        }
         prompt_task.await.unwrap();
         cx.run_until_parked();
 
@@ -4875,6 +6114,164 @@ mod internal_tests {
             .find(|content| content.contains("Build a tiny notes app MVP"))
             .expect("Gear should persist the original request in the goal ledger");
         assert!(goal.contains("\"request\""));
+    }
+
+    #[gpui::test]
+    async fn test_native_zed_worker_reuses_session_for_follow_up_and_steer(
+        cx: &mut TestAppContext,
+    ) {
+        use gearbox_agent::state::{
+            Scope, StateStore, Task as GearTask, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+        };
+
+        init_test(cx);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("README.md"),
+            "# Native Gear worker test\n",
+        )
+        .unwrap();
+        let store = StateStore::new(workspace.path());
+        store.initialize().unwrap();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection::gear(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[workspace.path()]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let parent_session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let model = cx.update(|cx| {
+            LanguageModelRegistry::read_global(cx)
+                .default_model()
+                .map(|default_model| default_model.model)
+                .expect("default test model should be available")
+        });
+        let fake_model = model.as_fake();
+
+        let (native_worker_tx, native_worker_rx) =
+            async_channel::unbounded::<GearZedWorkerDispatch>();
+        cx.update(|cx| {
+            spawn_gear_zed_worker_dispatcher(
+                agent.downgrade(),
+                parent_session_id,
+                native_worker_rx,
+                Arc::new(Mutex::new(HashMap::default())),
+                cx,
+            );
+        });
+        let backend = GearZedWorkerBackend::new(native_worker_tx);
+        let task = GearTask {
+            id: "task_native_zed_follow_up".to_string(),
+            goal_id: "goal_native_zed_follow_up".to_string(),
+            title: "native zed follow up".to_string(),
+            kind: TaskKind::Edit,
+            status: TaskStatus::Pending,
+            assigned_worker: Some("zed_agent".to_string()),
+            attempt: 1,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: TaskInputs::default(),
+            outputs: TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+        };
+        let handle = backend
+            .start_zed_agent(WorkerStartRequest {
+                store: &store,
+                workspace: workspace.path(),
+                task: &task,
+                route_attempt: 0,
+                goal: "Use a native Zed worker and then refine the result.",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            })
+            .unwrap();
+
+        wait_for_fake_completion(fake_model, cx).await;
+        let first_session_id = handle
+            .session_id()
+            .expect("native zed worker should expose its session id after first prompt starts");
+        handle
+            .send_follow_up(
+                "Refine the worker result without opening a new worker task.".to_string(),
+            )
+            .unwrap();
+        fake_model.send_last_completion_stream_text_chunk("first worker response");
+        fake_model.end_last_completion_stream();
+
+        wait_for_fake_completion(fake_model, cx).await;
+        assert_eq!(
+            handle.session_id().as_deref(),
+            Some(first_session_id.as_str())
+        );
+        handle
+            .steer("Steer the same worker session into a final review pass.".to_string())
+            .unwrap();
+        fake_model.send_last_completion_stream_text_chunk("second worker response");
+        fake_model.end_last_completion_stream();
+
+        wait_for_fake_completion(fake_model, cx).await;
+        assert_eq!(
+            handle.session_id().as_deref(),
+            Some(first_session_id.as_str())
+        );
+
+        let result_waiter = std::thread::spawn({
+            let handle = handle.clone();
+            move || handle.wait_for_result()
+        });
+        fake_model.send_last_completion_stream_text_chunk("third worker response");
+        fake_model.end_last_completion_stream();
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if result_waiter.is_finished() {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(result_waiter.is_finished());
+        let result = result_waiter.join().unwrap().unwrap();
+
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        assert_eq!(result.summary, "third worker response");
+        assert_eq!(result.prompt_path.file_name().unwrap(), "steer-2.md");
+        assert!(store.worker_dir(&task.id).join("follow-up-1.md").exists());
+        assert!(store.worker_dir(&task.id).join("steer-2.md").exists());
+        let last_message = std::fs::read_to_string(
+            result
+                .last_message_path
+                .expect("native zed worker should persist the final assistant message"),
+        )
+        .unwrap();
+        assert!(last_message.contains("third worker response"));
     }
 
     #[gpui::test]

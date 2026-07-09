@@ -593,6 +593,9 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
+    pub gear_task_manager_expanded: bool,
+    gear_task_manager_filter: GearTaskManagerFilter,
+    gear_task_manager_show_all: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -655,6 +658,13 @@ pub struct TurnFields {
     pub turn_generation: usize,
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GearTaskManagerFilter {
+    All,
+    Active,
+    Attention,
 }
 
 /// How a tool call is rendered relative to its surroundings.
@@ -1000,6 +1010,9 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
+            gear_task_manager_expanded: true,
+            gear_task_manager_filter: GearTaskManagerFilter::All,
+            gear_task_manager_show_all: false,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -1808,6 +1821,10 @@ impl ThreadView {
             return;
         }
 
+        if self.try_send_gear_follow_up(message_editor.clone(), false, window, cx) {
+            return;
+        }
+
         self.stop_current_and_send_new_message(message_editor, window, cx);
     }
 
@@ -1954,10 +1971,172 @@ impl ThreadView {
         );
     }
 
+    fn is_gear_thread(&self) -> bool {
+        self.agent_id.as_ref() == agent::GEAR_AGENT_ID.as_ref()
+    }
+
+    fn gear_follow_up_prompt(contents: &[acp::ContentBlock]) -> Option<String> {
+        let prompt = contents
+            .iter()
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(text_content) => Some(text_content.text.trim().to_string()),
+                acp::ContentBlock::ResourceLink(resource_link) => {
+                    Some(format!("@{}", resource_link.name))
+                }
+                _ => None,
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!prompt.is_empty()).then_some(prompt)
+    }
+
+    fn try_dispatch_gear_control_message(
+        &mut self,
+        contents: &[acp::ContentBlock],
+        tracked_buffers: &[Entity<Buffer>],
+        steer: bool,
+        message_editor: Option<&Entity<MessageEditor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        if !self.is_gear_thread() || self.thread.read(cx).status() == ThreadStatus::Idle {
+            return Ok(false);
+        }
+
+        let Some(prompt) = Self::gear_follow_up_prompt(contents) else {
+            return Ok(false);
+        };
+        let Some(connection) = self.as_native_connection(cx) else {
+            return Ok(false);
+        };
+
+        let dispatched = if steer {
+            connection.steer_gear_task(&self.session_id, prompt, cx)?
+        } else {
+            connection.send_follow_up_gear_task(&self.session_id, prompt, cx)?
+        };
+        if !dispatched {
+            return Ok(false);
+        }
+
+        self.thread_error.take();
+        self.thread_feedback.clear();
+        self.editing_message.take();
+        self.message_queue.resume();
+
+        if self.should_be_following {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.follow(CollaboratorId::Agent, window, cx);
+                })
+                .ok();
+        }
+
+        if let Some(native_thread) = self.as_native_thread(cx) {
+            native_thread.update(cx, |thread, cx| {
+                thread.action_log().update(cx, |action_log, cx| {
+                    for buffer in tracked_buffers.iter().cloned() {
+                        action_log.buffer_read(buffer, cx);
+                    }
+                });
+            });
+        }
+
+        if let Some(message_editor) = message_editor {
+            message_editor.update(cx, |message_editor, cx| {
+                message_editor.clear(window, cx);
+            });
+            self.set_editor_is_expanded(false, cx);
+        }
+
+        self.sync_generating_indicator(cx);
+        cx.notify();
+        Ok(true)
+    }
+
+    fn try_send_gear_follow_up(
+        &mut self,
+        message_editor: Entity<MessageEditor>,
+        steer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_gear_thread() || self.thread.read(cx).status() == ThreadStatus::Idle {
+            return false;
+        }
+
+        let contents = self.resolve_message_contents(&message_editor, cx);
+        let thread = self.thread.clone();
+        let workspace = self.workspace.clone();
+        let should_be_following = self.should_be_following;
+
+        let contents_task = cx.spawn_in(window, async move |this, cx| {
+            let (contents, tracked_buffers) = contents.await?;
+            if contents.is_empty() {
+                return Ok(None);
+            }
+
+            let handled = this.update_in(cx, |this, window, cx| {
+                this.try_dispatch_gear_control_message(
+                    &contents,
+                    &tracked_buffers,
+                    steer,
+                    Some(&message_editor),
+                    window,
+                    cx,
+                )
+            })??;
+            if handled {
+                return Ok(None);
+            }
+
+            let cancelled = this.update(cx, |_, cx| {
+                thread.update(cx, |thread, cx| thread.cancel(cx))
+            })?;
+            cancelled.await;
+
+            if should_be_following {
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.follow(CollaboratorId::Agent, window, cx);
+                    })
+                    .ok();
+            }
+
+            let _ = cx.update(|window, cx| {
+                message_editor.update(cx, |message_editor, cx| {
+                    message_editor.clear(window, cx);
+                });
+            });
+
+            Ok(Some((contents, tracked_buffers)))
+        });
+
+        self.send_content(contents_task, false, window, cx);
+        true
+    }
+
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
+        if self.is_gear_thread() {
+            if let Some(connection) = self.as_native_connection(cx) {
+                match connection.interrupt_gear_task(&self.session_id, cx) {
+                    Ok(true) => {
+                        self.sync_generating_indicator(cx);
+                        cx.notify();
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.handle_thread_error(error, cx);
+                        return;
+                    }
+                }
+            }
+        }
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         self.sync_generating_indicator(cx);
         cx.notify();
@@ -2231,6 +2410,23 @@ impl ThreadView {
     ) {
         let is_generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
         if let Some(entry) = self.message_queue.send_now(id, is_generating) {
+            if is_generating {
+                match self.try_dispatch_gear_control_message(
+                    &entry.content,
+                    &entry.tracked_buffers,
+                    entry.steer,
+                    None,
+                    window,
+                    cx,
+                ) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.handle_thread_error(error, cx);
+                        return;
+                    }
+                }
+            }
             self.dispatch_queued_entry(entry, window, cx);
         }
     }
@@ -3034,6 +3230,11 @@ impl ThreadView {
         editor_bg_color.blend(active_color.opacity(0.3))
     }
 
+    fn gear_task_manager_snapshot(&self, cx: &App) -> Option<agent::GearTaskManagerSnapshot> {
+        self.as_native_connection(cx)?
+            .gear_task_manager_snapshot(&self.session_id, cx)
+    }
+
     pub fn render_activity_bar(
         &self,
         window: &mut Window,
@@ -3045,6 +3246,7 @@ impl ThreadView {
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
+        let gear_task_manager_snapshot = self.gear_task_manager_snapshot(cx);
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
@@ -3055,6 +3257,7 @@ impl ThreadView {
             && plan.is_empty()
             && queue_is_empty
             && !has_awaiting_permission
+            && gear_task_manager_snapshot.is_none()
         {
             return None;
         }
@@ -3069,6 +3272,7 @@ impl ThreadView {
         let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
+        let gear_task_manager_expanded = self.gear_task_manager_expanded;
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         // Drop shadows have no opaque surface to blend into on a transparent
@@ -3101,6 +3305,22 @@ impl ThreadView {
                     .when_some(awaiting_permission, |this, element| this.child(element))
                     .when(
                         has_awaiting_permission
+                            && (!plan.is_empty()
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty
+                                || gear_task_manager_snapshot.is_some()),
+                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                    )
+                    .when_some(gear_task_manager_snapshot.as_ref(), |this, snapshot| {
+                        this.child(self.render_gear_task_manager_summary(snapshot, window, cx))
+                            .when(gear_task_manager_expanded, |parent| {
+                                parent.child(
+                                    self.render_gear_task_manager_entries(snapshot, window, cx),
+                                )
+                            })
+                    })
+                    .when(
+                        gear_task_manager_snapshot.is_some()
                             && (!plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty),
                         |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                     )
@@ -3629,6 +3849,503 @@ impl ThreadView {
                     })),
             )
             .into_any_element()
+    }
+
+    fn render_gear_task_manager_summary(
+        &self,
+        snapshot: &agent::GearTaskManagerSnapshot,
+        _window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let dot_divider = || {
+            Label::new("•")
+                .size(LabelSize::XSmall)
+                .color(Color::Disabled)
+        };
+        let counts = &snapshot.counts;
+        let summary = format!(
+            "{} running, {} pending, {} completed, {} failed",
+            counts.running, counts.pending, counts.completed, counts.failed
+        );
+        let current_output = snapshot.current_output.clone();
+        let active_count = snapshot
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    agent::GearManagedTaskStatus::Pending | agent::GearManagedTaskStatus::Running
+                )
+            })
+            .count();
+        let attention_count = snapshot
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    agent::GearManagedTaskStatus::Failed | agent::GearManagedTaskStatus::Cancelled
+                )
+            })
+            .count();
+
+        h_flex()
+            .p_1()
+            .w_full()
+            .gap_1()
+            .justify_between()
+            .when(self.gear_task_manager_expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(
+                h_flex()
+                    .id("gear_task_manager_summary")
+                    .gap_1()
+                    .child(Disclosure::new(
+                        "gear_task_manager_disclosure",
+                        self.gear_task_manager_expanded,
+                    ))
+                    .child(
+                        Label::new("Gear Tasks")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(dot_divider())
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.gear_task_manager_expanded = !this.gear_task_manager_expanded;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("gear-task-manager-view-output", "View Output")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(current_output.as_deref().map_or(true, str::is_empty))
+                            .on_click({
+                                let workspace = self.workspace.clone();
+                                move |_, window, cx| {
+                                    let Some(output) = current_output.clone() else {
+                                        return;
+                                    };
+                                    let Some(workspace) = workspace.upgrade() else {
+                                        return;
+                                    };
+                                    open_markdown_in_workspace(
+                                        "Gear Worker Output".to_string(),
+                                        format!("```text\n{output}\n```"),
+                                        workspace,
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("gear-task-manager-interrupt", "Interrupt")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(counts.running == 0)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(connection) = this.as_native_connection(cx) {
+                                    match connection.interrupt_gear_task(&this.session_id, cx) {
+                                        Ok(_) => cx.notify(),
+                                        Err(error) => this.handle_thread_error(error, cx),
+                                    }
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("gear-task-manager-cancel", "Cancel Task")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(counts.running == 0 && counts.pending == 0)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(connection) = this.as_native_connection(cx) {
+                                    match connection.cancel_gear_task(&this.session_id, cx) {
+                                        Ok(_) => cx.notify(),
+                                        Err(error) => this.handle_thread_error(error, cx),
+                                    }
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(
+                            "gear-task-manager-filter-all",
+                            format!("All {}", snapshot.tasks.len()),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .disabled(self.gear_task_manager_filter == GearTaskManagerFilter::All)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gear_task_manager_filter = GearTaskManagerFilter::All;
+                            this.gear_task_manager_show_all = false;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(
+                            "gear-task-manager-filter-active",
+                            format!("Active {active_count}"),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .disabled(self.gear_task_manager_filter == GearTaskManagerFilter::Active)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gear_task_manager_filter = GearTaskManagerFilter::Active;
+                            this.gear_task_manager_show_all = false;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(
+                            "gear-task-manager-filter-attention",
+                            format!("Attention {attention_count}"),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .disabled(self.gear_task_manager_filter == GearTaskManagerFilter::Attention)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gear_task_manager_filter = GearTaskManagerFilter::Attention;
+                            this.gear_task_manager_show_all = false;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Label::new(snapshot.tasks.len().to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_gear_task_manager_entries(
+        &self,
+        snapshot: &agent::GearTaskManagerSnapshot,
+        _window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let dot_divider = || {
+            Label::new("•")
+                .size(LabelSize::XSmall)
+                .color(Color::Disabled)
+        };
+        let mut tasks = snapshot.tasks.iter().collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            Self::gear_task_sort_rank(&left.status)
+                .cmp(&Self::gear_task_sort_rank(&right.status))
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        let tasks = tasks
+            .into_iter()
+            .filter(|task| Self::gear_task_matches_filter(task, self.gear_task_manager_filter))
+            .collect::<Vec<_>>();
+        let total_filtered_tasks = tasks.len();
+        let display_limit = if self.gear_task_manager_show_all {
+            total_filtered_tasks
+        } else {
+            6
+        };
+        let tasks = tasks.into_iter().take(display_limit).collect::<Vec<_>>();
+        let output_lines = snapshot
+            .current_output
+            .as_deref()
+            .map(|output| {
+                output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .take(8)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|lines| !lines.is_empty());
+
+        v_flex()
+            .id("gear_task_manager_entries")
+            .max_h_56()
+            .overflow_y_scroll()
+            .children(tasks.into_iter().enumerate().map(|(index, task)| {
+                v_flex()
+                    .p_2()
+                    .gap_1()
+                    .when(index > 0, |this| {
+                        this.border_t_1().border_color(cx.theme().colors().border)
+                    })
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(task.task_id.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Default),
+                                    )
+                                    .child(dot_divider())
+                                    .child(
+                                        Label::new(format!(
+                                            "{} / {}",
+                                            Self::gear_snapshot_status_label(&format!(
+                                                "{:?}",
+                                                task.status
+                                            )),
+                                            task.worker_category
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                    .child(dot_divider())
+                                    .child(
+                                        Label::new(Self::gear_worker_label(
+                                            &task.worker_kind,
+                                            task.worker_model.as_deref(),
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    ),
+                            )
+                            .child(self.render_gear_artifact_buttons(
+                                &format!("gear-task-{}", task.task_id),
+                                task.result_path.as_ref(),
+                                task.outcome_path.as_ref(),
+                                cx,
+                            )),
+                    )
+                    .child(
+                        Label::new(task.summary.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .children(task.attempts.iter().rev().take(2).rev().map(|attempt| {
+                        v_flex()
+                            .pl_3()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Label::new(format!("Attempt {}", attempt.attempt))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(dot_divider())
+                                            .child(
+                                                Label::new(Self::gear_snapshot_status_label(
+                                                    &format!("{:?}", attempt.status),
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                            .child(dot_divider())
+                                            .child(
+                                                Label::new(Self::gear_worker_label(
+                                                    &attempt.worker_kind,
+                                                    attempt.worker_model.as_deref(),
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            ),
+                                    )
+                                    .child(self.render_gear_artifact_buttons(
+                                        &format!(
+                                            "gear-task-{}-attempt-{}",
+                                            task.task_id, attempt.attempt
+                                        ),
+                                        attempt.result_path.as_ref(),
+                                        attempt.outcome_path.as_ref(),
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                Label::new(attempt.summary.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .when_some(attempt.error.as_ref(), |this, error| {
+                                this.child(
+                                    Label::new(error.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error),
+                                )
+                            })
+                    }))
+            }))
+            .when_some(output_lines, |this, output_lines| {
+                this.child(
+                    v_flex()
+                        .p_2()
+                        .gap_0p5()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    Label::new("Current Worker Output")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Button::new(
+                                        "gear-task-manager-view-output-inline",
+                                        "Open Full Output",
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click({
+                                        let workspace = self.workspace.clone();
+                                        let output =
+                                            snapshot.current_output.clone().unwrap_or_default();
+                                        move |_, window, cx| {
+                                            let Some(workspace) = workspace.upgrade() else {
+                                                return;
+                                            };
+                                            open_markdown_in_workspace(
+                                                "Gear Worker Output".to_string(),
+                                                format!("```text\n{output}\n```"),
+                                                workspace,
+                                                window,
+                                                cx,
+                                            )
+                                            .detach_and_log_err(cx);
+                                        }
+                                    }),
+                                ),
+                        )
+                        .children(output_lines.into_iter().map(|line| {
+                            Label::new(line).size(LabelSize::XSmall).color(Color::Muted)
+                        })),
+                )
+            })
+            .when(total_filtered_tasks > 6, |this| {
+                let button_label = if self.gear_task_manager_show_all {
+                    "Show Less"
+                } else {
+                    "Show More"
+                };
+                this.child(
+                    h_flex()
+                        .p_2()
+                        .justify_center()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Button::new("gear-task-manager-show-more", button_label)
+                                .label_size(LabelSize::XSmall)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.gear_task_manager_show_all =
+                                        !this.gear_task_manager_show_all;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+    }
+
+    fn render_gear_artifact_buttons(
+        &self,
+        id_prefix: &str,
+        result_path: Option<&std::path::PathBuf>,
+        outcome_path: Option<&std::path::PathBuf>,
+        _cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+
+        h_flex()
+            .gap_1()
+            .children(result_path.into_iter().map({
+                let workspace = workspace.clone();
+                move |path| {
+                    let workspace = workspace.clone();
+                    let path = path.clone();
+                    Button::new(format!("{id_prefix}-result"), "Result")
+                        .label_size(LabelSize::XSmall)
+                        .on_click(move |_, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path.clone(),
+                                        OpenOptions {
+                                            focus: Some(true),
+                                            ..Default::default()
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            });
+                        })
+                }
+            }))
+            .children(outcome_path.into_iter().map(move |path| {
+                let workspace = workspace.clone();
+                let path = path.clone();
+                Button::new(format!("{id_prefix}-outcome"), "Outcome")
+                    .label_size(LabelSize::XSmall)
+                    .on_click(move |_, window, cx| {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .open_abs_path(
+                                    path.clone(),
+                                    OpenOptions {
+                                        focus: Some(true),
+                                        ..Default::default()
+                                    },
+                                    window,
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                        });
+                    })
+            }))
+    }
+
+    fn gear_worker_label(worker_kind: &str, worker_model: Option<&str>) -> String {
+        worker_model
+            .map(|worker_model| format!("{worker_kind}:{worker_model}"))
+            .unwrap_or_else(|| worker_kind.to_string())
+    }
+
+    fn gear_task_sort_rank(status: &agent::GearManagedTaskStatus) -> usize {
+        match status {
+            agent::GearManagedTaskStatus::Running => 0,
+            agent::GearManagedTaskStatus::Pending => 1,
+            agent::GearManagedTaskStatus::Failed => 2,
+            agent::GearManagedTaskStatus::Cancelled => 3,
+            agent::GearManagedTaskStatus::Skipped => 4,
+            agent::GearManagedTaskStatus::Completed => 5,
+        }
+    }
+
+    fn gear_task_matches_filter(
+        task: &agent::GearTaskSnapshot,
+        filter: GearTaskManagerFilter,
+    ) -> bool {
+        match filter {
+            GearTaskManagerFilter::All => true,
+            GearTaskManagerFilter::Active => matches!(
+                task.status,
+                agent::GearManagedTaskStatus::Pending | agent::GearManagedTaskStatus::Running
+            ),
+            GearTaskManagerFilter::Attention => matches!(
+                task.status,
+                agent::GearManagedTaskStatus::Failed | agent::GearManagedTaskStatus::Cancelled
+            ),
+        }
+    }
+
+    fn gear_snapshot_status_label(status: &str) -> String {
+        status.to_ascii_lowercase().replace('_', " ")
     }
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
