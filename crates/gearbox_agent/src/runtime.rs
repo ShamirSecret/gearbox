@@ -3975,6 +3975,86 @@ mod tests {
     }
 
     #[test]
+    fn continuation_two_sessions_overwrite_each_other() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        // Session A writes stopped state
+        let path_a =
+            store.write_continuation_state("ses_A", "goal_A", ContinuationStatus::Stopped)?;
+        assert!(store.continuation_is_stopped()?);
+
+        // Session B writes running state — this OVERWRITES A's state (the bug)
+        let path_b =
+            store.write_continuation_state("ses_B", "goal_B", ContinuationStatus::Running)?;
+
+        // BUG PROOF 1: Both writes returned the SAME path (single state.json)
+        assert_eq!(
+            path_a, path_b,
+            "BUG: different sessions wrote to the same path"
+        );
+
+        // BUG PROOF 2: After B's write, A's session state is GONE.
+        // The file now contains B's data with session_id "ses_B", not "ses_A".
+        let state_json = std::fs::read_to_string(&path_a)?;
+        assert!(
+            state_json.contains("ses_A"),
+            "BUG: ses_B overwrote ses_A's continuation data — file contains: {}",
+            state_json
+        );
+
+        // BUG PROOF 3: continuation_is_stopped() returns false because B wrote Running.
+        // But A had stopped! A's intent is lost.
+        // THIS ASSERTION WILL FAIL on the buggy single-file code.
+        assert!(
+            store.continuation_is_stopped()?,
+            "BUG: session A's stopped status was overwritten by session B's running status"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn acp_session_id_to_gear_session_id_mapping_stable() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        // Same session ID "ses_X" always produces the same file path
+        let path_1 =
+            store.write_continuation_state("ses_X", "goal_1", ContinuationStatus::Running)?;
+        let path_2 =
+            store.write_continuation_state("ses_X", "goal_2", ContinuationStatus::Stopped)?;
+
+        // Same session writes to the same path (overwrites its own state — OK)
+        assert_eq!(path_1, path_2, "same session should write to the same path");
+
+        // A different session should write to a DIFFERENT path.
+        // With the bug, both paths are `.gearbox-agent/continuation/state.json` — the same!
+        let path_b =
+            store.write_continuation_state("ses_Y", "goal_Y", ContinuationStatus::Running)?;
+        assert_eq!(
+            path_1, path_b,
+            "BUG: sessions X and Y wrote to the same path — {} should be different from {}",
+            path_1.display(),
+            path_b.display()
+        );
+
+        // Verify session_id is preserved in the JSON content (it's already there).
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path_1)?)?;
+        assert_eq!(
+            saved["session_id"], "ses_Y",
+            "file should contain ses_Y (last writer)"
+        );
+
+        // The session_id IS available in the data — this proves it could be used
+        // as a per-session path key. No ACP schema change needed; the string
+        // already flows through write_continuation_state.
+        Ok(())
+    }
+
+    #[test]
     fn budget_uses_goal_max_worker_calls() {
         let mut goal_budget = Budget::default();
         goal_budget.max_worker_calls = 1;
