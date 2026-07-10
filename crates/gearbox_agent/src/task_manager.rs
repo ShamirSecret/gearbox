@@ -64,35 +64,46 @@ pub enum Messageability {
     NotContinuable { reason: String },
 }
 
+/// Context attached to task command outcomes for self-description.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeContext {
+    /// The task ID this outcome relates to.
+    pub task_id: Option<String>,
+    /// The run epoch within the task's lifecycle.
+    pub run_epoch: Option<usize>,
+    /// Position in the queue when Queued, or None if not queued or unavailable.
+    pub queue_position: Option<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActionOutcome {
     /// Task was cancelled/interrupted
-    Cancelled,
+    Cancelled(OutcomeContext),
     /// Task was interrupted without being cancelled
-    Interrupted,
+    Interrupted(OutcomeContext),
     /// Task completed and outcome cannot be changed
-    NotContinuable,
+    NotContinuable(OutcomeContext),
     /// No matching task found
-    Noop,
+    Noop(OutcomeContext),
     /// The caller is outside the task's session scope.
-    ScopeDenied { reason: String },
+    ScopeDenied { reason: String, context: OutcomeContext },
 }
 
 impl ActionOutcome {
     pub fn is_interrupt_applied(&self) -> bool {
-        matches!(self, Self::Interrupted)
+        matches!(self, Self::Interrupted(_))
     }
 
     pub fn is_cancel_applied(&self) -> bool {
-        matches!(self, Self::Cancelled)
+        matches!(self, Self::Cancelled(_))
     }
 
     pub fn reason(&self) -> Option<String> {
         match self {
-            Self::NotContinuable => Some("task is not continuable".to_string()),
-            Self::ScopeDenied { reason } => Some(reason.clone()),
-            Self::Noop => Some("no managed task is active".to_string()),
-            Self::Cancelled | Self::Interrupted => None,
+            Self::NotContinuable(_) => Some("task is not continuable".to_string()),
+            Self::ScopeDenied { reason, .. } => Some(reason.clone()),
+            Self::Noop(_) => Some("no managed task is active".to_string()),
+            Self::Cancelled(_) | Self::Interrupted(_) => None,
         }
     }
 }
@@ -129,32 +140,32 @@ pub enum TranscriptEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
     /// Message sent to running worker
-    Sent,
+    Sent(OutcomeContext),
     /// Task queued because worker is pending
-    Queued,
+    Queued(OutcomeContext),
     /// Worker completed/failed and will be revived
-    Revive,
+    Revive(OutcomeContext),
     /// Worker is in terminal state
-    NotContinuable,
+    NotContinuable(OutcomeContext),
     /// No task found
-    Noop,
+    Noop(OutcomeContext),
     /// The caller is outside the task's session scope.
-    ScopeDenied { reason: String },
+    ScopeDenied { reason: String, context: OutcomeContext },
     /// The requested task does not exist.
-    NotFound { reason: String },
+    NotFound { reason: String, context: OutcomeContext },
 }
 
 impl SendOutcome {
     pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Sent | Self::Queued | Self::Revive)
+        matches!(self, Self::Sent(_) | Self::Queued(_) | Self::Revive(_))
     }
 
     pub fn reason(&self) -> Option<String> {
         match self {
-            Self::NotContinuable => Some("task is not continuable".to_string()),
-            Self::ScopeDenied { reason } | Self::NotFound { reason } => Some(reason.clone()),
-            Self::Noop => Some("no managed task is active".to_string()),
-            Self::Sent | Self::Queued | Self::Revive => None,
+            Self::NotContinuable(_) => Some("task is not continuable".to_string()),
+            Self::ScopeDenied { reason, .. } | Self::NotFound { reason, .. } => Some(reason.clone()),
+            Self::Noop(_) => Some("no managed task is active".to_string()),
+            Self::Sent(_) | Self::Queued(_) | Self::Revive(_) => None,
         }
     }
 }
@@ -162,32 +173,32 @@ impl SendOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SteerOutcome {
     /// Steer instruction sent
-    Steered,
+    Steered(OutcomeContext),
     /// Worker will be revived with steer
-    Revive,
+    Revive(OutcomeContext),
     /// Queued for pending worker
-    Queued,
+    Queued(OutcomeContext),
     /// Terminal state
-    NotContinuable,
+    NotContinuable(OutcomeContext),
     /// No task found
-    Noop,
+    Noop(OutcomeContext),
     /// The caller is outside the task's session scope.
-    ScopeDenied { reason: String },
+    ScopeDenied { reason: String, context: OutcomeContext },
     /// The requested task does not exist.
-    NotFound { reason: String },
+    NotFound { reason: String, context: OutcomeContext },
 }
 
 impl SteerOutcome {
     pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Steered | Self::Queued | Self::Revive)
+        matches!(self, Self::Steered(_) | Self::Queued(_) | Self::Revive(_))
     }
 
     pub fn reason(&self) -> Option<String> {
         match self {
-            Self::NotContinuable => Some("task is not continuable".to_string()),
-            Self::ScopeDenied { reason } | Self::NotFound { reason } => Some(reason.clone()),
-            Self::Noop => Some("no managed task is active".to_string()),
-            Self::Steered | Self::Queued | Self::Revive => None,
+            Self::NotContinuable(_) => Some("task is not continuable".to_string()),
+            Self::ScopeDenied { reason, .. } | Self::NotFound { reason, .. } => Some(reason.clone()),
+            Self::Noop(_) => Some("no managed task is active".to_string()),
+            Self::Steered(_) | Self::Queued(_) | Self::Revive(_) => None,
         }
     }
 }
@@ -897,25 +908,28 @@ impl TaskManagerControl {
 
     pub fn send_follow_up_current_task(&self, prompt: String) -> Result<SendOutcome> {
         let Some(task_id) = self.current_task_id()? else {
-            return Ok(SendOutcome::Noop);
+            return Ok(SendOutcome::Noop(OutcomeContext::default()));
         };
         self.send_follow_up_task(&task_id, prompt)
     }
 
     pub fn steer_current_task(&self, prompt: String) -> Result<SteerOutcome> {
         let Some(task_id) = self.current_task_id()? else {
-            return Ok(SteerOutcome::Noop);
+            return Ok(SteerOutcome::Noop(OutcomeContext::default()));
         };
         self.steer_task(&task_id, prompt)
     }
 
     pub fn cancel_current_task(&self) -> Result<ActionOutcome> {
         let Some(current_task) = self.current_task_snapshot()? else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
 
         if current_task.status != ManagedTaskStatus::Running {
-            return Ok(ActionOutcome::NotContinuable);
+            return Ok(ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(current_task.task_id.clone()),
+                ..OutcomeContext::default()
+            }));
         }
 
         self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
@@ -924,16 +938,22 @@ impl TaskManagerControl {
             .as_ref()
             .context("running task missing handle")?
             .cancel()?;
-        Ok(ActionOutcome::Cancelled)
+        Ok(ActionOutcome::Cancelled(OutcomeContext {
+            task_id: Some(current_task.task_id.clone()),
+            ..OutcomeContext::default()
+        }))
     }
 
     pub fn interrupt_current_task(&self) -> Result<ActionOutcome> {
         let Some(current_task) = self.current_task_snapshot()? else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
 
         if current_task.status != ManagedTaskStatus::Running {
-            return Ok(ActionOutcome::NotContinuable);
+            return Ok(ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(current_task.task_id.clone()),
+                ..OutcomeContext::default()
+            }));
         }
 
         self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
@@ -942,19 +962,31 @@ impl TaskManagerControl {
             .as_ref()
             .context("running task missing handle")?
             .interrupt()?;
-        Ok(ActionOutcome::Interrupted)
+        Ok(ActionOutcome::Interrupted(OutcomeContext {
+            task_id: Some(current_task.task_id.clone()),
+            ..OutcomeContext::default()
+        }))
     }
 
     pub fn cancel_task(&self, task_id: &str) -> Result<ActionOutcome> {
         let Some(current_task) = self.current_task_snapshot()? else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
         if current_task.task_id != task_id {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         }
 
         if current_task.status != ManagedTaskStatus::Running {
-            return Ok(ActionOutcome::NotContinuable);
+            return Ok(ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(current_task.task_id.clone()),
+                ..OutcomeContext::default()
+            }));
         }
 
         self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
@@ -963,19 +995,31 @@ impl TaskManagerControl {
             .as_ref()
             .context("running task missing handle")?
             .cancel()?;
-        Ok(ActionOutcome::Cancelled)
+        Ok(ActionOutcome::Cancelled(OutcomeContext {
+            task_id: Some(current_task.task_id.clone()),
+            ..OutcomeContext::default()
+        }))
     }
 
     pub fn interrupt_task(&self, task_id: &str) -> Result<ActionOutcome> {
         let Some(current_task) = self.current_task_snapshot()? else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
         if current_task.task_id != task_id {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         }
 
         if current_task.status != ManagedTaskStatus::Running {
-            return Ok(ActionOutcome::NotContinuable);
+            return Ok(ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(current_task.task_id.clone()),
+                ..OutcomeContext::default()
+            }));
         }
 
         self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
@@ -984,25 +1028,37 @@ impl TaskManagerControl {
             .as_ref()
             .context("running task missing handle")?
             .interrupt()?;
-        Ok(ActionOutcome::Interrupted)
+        Ok(ActionOutcome::Interrupted(OutcomeContext {
+            task_id: Some(current_task.task_id.clone()),
+            ..OutcomeContext::default()
+        }))
     }
-
     pub fn send_follow_up_task(&self, task_id: &str, prompt: String) -> Result<SendOutcome> {
         let current_task_guard = self
             .current_task
             .lock()
             .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
         let Some(current_task) = current_task_guard.as_ref() else {
-            return Ok(SendOutcome::Noop);
+            return Ok(SendOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
         if current_task.task_id != task_id {
-            return Ok(SendOutcome::Noop);
+            return Ok(SendOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         }
 
+        let current_task_id = current_task.task_id.clone();
         match current_task.status {
             ManagedTaskStatus::Pending => {
                 self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt, None)?;
-                Ok(SendOutcome::Queued)
+                Ok(SendOutcome::Queued(OutcomeContext {
+                    task_id: Some(current_task_id),
+                    ..OutcomeContext::default()
+                }))
             }
             ManagedTaskStatus::Running => {
                 let handle = current_task
@@ -1012,9 +1068,15 @@ impl TaskManagerControl {
                     .clone();
                 drop(current_task_guard);
                 handle.send_follow_up(prompt)?;
-                Ok(SendOutcome::Sent)
+                Ok(SendOutcome::Sent(OutcomeContext {
+                    task_id: Some(current_task_id),
+                    ..OutcomeContext::default()
+                }))
             }
-            _ => Ok(SendOutcome::NotContinuable),
+            _ => Ok(SendOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(current_task_id),
+                ..OutcomeContext::default()
+            })),
         }
     }
 
@@ -1024,16 +1086,26 @@ impl TaskManagerControl {
             .lock()
             .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
         let Some(current_task) = current_task_guard.as_ref() else {
-            return Ok(SteerOutcome::Noop);
+            return Ok(SteerOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
         if current_task.task_id != task_id {
-            return Ok(SteerOutcome::Noop);
+            return Ok(SteerOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         }
 
+        let current_task_id = current_task.task_id.clone();
         match current_task.status {
             ManagedTaskStatus::Pending => {
                 self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt, None)?;
-                Ok(SteerOutcome::Queued)
+                Ok(SteerOutcome::Queued(OutcomeContext {
+                    task_id: Some(current_task_id),
+                    ..OutcomeContext::default()
+                }))
             }
             ManagedTaskStatus::Running => {
                 let handle = current_task
@@ -1043,9 +1115,16 @@ impl TaskManagerControl {
                     .clone();
                 drop(current_task_guard);
                 handle.steer(prompt)?;
-                Ok(SteerOutcome::Steered)
+                Ok(SteerOutcome::Steered(OutcomeContext {
+                    task_id: Some(current_task_id),
+                    ..OutcomeContext::default()
+                }))
             }
-            _ => Ok(SteerOutcome::NotContinuable),
+            _ => Ok(SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(current_task_id),
+                ..OutcomeContext::default()
+            })),
+
         }
     }
 
@@ -2248,6 +2327,7 @@ impl TaskManager {
         let Some(record) = self.records.get_mut(task_id) else {
             bail!("unknown managed task: {task_id}");
         };
+        let run_epoch = record.run_epoch;
         let transition = transition_task_record(
             record,
             TaskTransition::Cancel {
@@ -2256,10 +2336,15 @@ impl TaskManager {
                 error: None,
             },
         );
+        let ctx = OutcomeContext {
+            task_id: Some(task_id.to_string()),
+            run_epoch: Some(run_epoch as usize),
+            queue_position: None,
+        };
         let outcome = if transition.applied {
-            ActionOutcome::Cancelled
+            ActionOutcome::Cancelled(ctx)
         } else {
-            ActionOutcome::NotContinuable
+            ActionOutcome::NotContinuable(ctx)
         };
         let store = self
             .running_tasks
@@ -2312,19 +2397,29 @@ impl TaskManager {
         context: &TaskCommandContext,
     ) -> Result<ActionOutcome> {
         let Some(record) = self.records.get(task_id).cloned() else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
         if !task_scope_allows(&record, context) {
             let reason = scope_denied_reason(&record, context);
             self.record_task_command_event(task_id, "cancel", context, false, Some(reason.clone()));
-            return Ok(ActionOutcome::ScopeDenied { reason });
+            return Ok(ActionOutcome::ScopeDenied {
+                reason,
+                context: OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(record.run_epoch as usize),
+                    ..OutcomeContext::default()
+                },
+            });
         }
         let outcome = self.cancel_task_with_outcome(task_id)?;
         self.record_task_command_event(
             task_id,
             "cancel",
             context,
-            matches!(&outcome, ActionOutcome::Cancelled),
+            matches!(&outcome, ActionOutcome::Cancelled(_)),
             outcome.reason(),
         );
         Ok(outcome)
@@ -2337,6 +2432,7 @@ impl TaskManager {
         let Some(record) = self.records.get_mut(task_id) else {
             bail!("unknown managed task: {task_id}");
         };
+        let run_epoch = record.run_epoch;
         let transition = transition_task_record(
             record,
             TaskTransition::Interrupt {
@@ -2345,10 +2441,15 @@ impl TaskManager {
                 error: None,
             },
         );
+        let ctx = OutcomeContext {
+            task_id: Some(task_id.to_string()),
+            run_epoch: Some(run_epoch as usize),
+            queue_position: None,
+        };
         let outcome = if transition.applied {
-            ActionOutcome::Interrupted
+            ActionOutcome::Interrupted(ctx)
         } else {
-            ActionOutcome::NotContinuable
+            ActionOutcome::NotContinuable(ctx)
         };
         let store = self
             .running_tasks
@@ -2407,7 +2508,10 @@ impl TaskManager {
         context: &TaskCommandContext,
     ) -> Result<ActionOutcome> {
         let Some(record) = self.records.get(task_id).cloned() else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
         if !task_scope_allows(&record, context) {
             let reason = scope_denied_reason(&record, context);
@@ -2418,14 +2522,21 @@ impl TaskManager {
                 false,
                 Some(reason.clone()),
             );
-            return Ok(ActionOutcome::ScopeDenied { reason });
+            return Ok(ActionOutcome::ScopeDenied {
+                reason,
+                context: OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(record.run_epoch as usize),
+                    ..OutcomeContext::default()
+                },
+            });
         }
         let outcome = self.interrupt_task(task_id)?;
         self.record_task_command_event(
             task_id,
             "interrupt",
             context,
-            matches!(&outcome, ActionOutcome::Interrupted),
+            matches!(&outcome, ActionOutcome::Interrupted(_)),
             outcome.reason(),
         );
         Ok(outcome)
@@ -2584,8 +2695,12 @@ impl TaskManager {
         caller_session_id: Option<String>,
     ) -> Result<SendOutcome> {
         let Some(record) = self.records.get(task_id) else {
-            return Ok(SendOutcome::Noop);
+            return Ok(SendOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
+        let run_epoch = record.run_epoch;
 
         if record.status == ManagedTaskStatus::Pending {
             self.control.queue_pending_message(
@@ -2594,17 +2709,29 @@ impl TaskManager {
                 prompt,
                 caller_session_id,
             )?;
-            return Ok(SendOutcome::Queued);
+            return Ok(SendOutcome::Queued(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(run_epoch as usize),
+                queue_position: None,
+            }));
         }
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
             running_task.handle.send_follow_up(prompt)?;
-            return Ok(SendOutcome::Sent);
+            return Ok(SendOutcome::Sent(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(run_epoch as usize),
+                queue_position: None,
+            }));
         }
 
         if messageability_for_record(record) == Messageability::Revive {
             if self.revive_task(task_id, prompt.clone(), QueuedMessageKind::FollowUp)? {
-                return Ok(SendOutcome::Revive);
+                return Ok(SendOutcome::Revive(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(run_epoch as usize),
+                    queue_position: None,
+                }));
             }
             if self.resident_tasks.contains_key(task_id) {
                 self.pending_revives.push_back(PendingRevive {
@@ -2613,12 +2740,24 @@ impl TaskManager {
                     kind: QueuedMessageKind::FollowUp,
                     caller_session_id,
                 });
-                return Ok(SendOutcome::Queued);
+                return Ok(SendOutcome::Queued(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(run_epoch as usize),
+                    queue_position: None,
+                }));
             }
-            return Ok(SendOutcome::NotContinuable);
+            return Ok(SendOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(run_epoch as usize),
+                queue_position: None,
+            }));
         }
 
-        Ok(SendOutcome::NotContinuable)
+        Ok(SendOutcome::NotContinuable(OutcomeContext {
+            task_id: Some(task_id.to_string()),
+            run_epoch: Some(run_epoch as usize),
+            queue_position: None,
+        }))
     }
 
     pub fn send_follow_up_task_with_context(
@@ -2630,6 +2769,10 @@ impl TaskManager {
         let Some(record) = self.records.get(task_id).cloned() else {
             return Ok(SendOutcome::NotFound {
                 reason: format!("managed task `{task_id}` was not found"),
+                context: OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    ..OutcomeContext::default()
+                },
             });
         };
         if !task_scope_allows(&record, context) {
@@ -2641,7 +2784,14 @@ impl TaskManager {
                 false,
                 Some(reason.clone()),
             );
-            return Ok(SendOutcome::ScopeDenied { reason });
+            return Ok(SendOutcome::ScopeDenied {
+                reason,
+                context: OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(record.run_epoch as usize),
+                    ..OutcomeContext::default()
+                },
+            });
         }
         let outcome =
             self.send_follow_up_task_inner(task_id, prompt, context.caller_session_id.clone())?;
@@ -2666,8 +2816,12 @@ impl TaskManager {
         caller_session_id: Option<String>,
     ) -> Result<SteerOutcome> {
         let Some(record) = self.records.get(task_id) else {
-            return Ok(SteerOutcome::Noop);
+            return Ok(SteerOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
         };
+        let run_epoch = record.run_epoch;
 
         if record.status == ManagedTaskStatus::Pending {
             self.control.queue_pending_message(
@@ -2676,17 +2830,29 @@ impl TaskManager {
                 prompt,
                 caller_session_id,
             )?;
-            return Ok(SteerOutcome::Queued);
+            return Ok(SteerOutcome::Queued(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(run_epoch as usize),
+                queue_position: None,
+            }));
         }
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
             running_task.handle.steer(prompt)?;
-            return Ok(SteerOutcome::Steered);
+            return Ok(SteerOutcome::Steered(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(run_epoch as usize),
+                queue_position: None,
+            }));
         }
 
         if messageability_for_record(record) == Messageability::Revive {
             if self.revive_task(task_id, prompt.clone(), QueuedMessageKind::Steer)? {
-                return Ok(SteerOutcome::Revive);
+                return Ok(SteerOutcome::Revive(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(run_epoch as usize),
+                    queue_position: None,
+                }));
             }
             if self.resident_tasks.contains_key(task_id) {
                 self.pending_revives.push_back(PendingRevive {
@@ -2695,12 +2861,24 @@ impl TaskManager {
                     kind: QueuedMessageKind::Steer,
                     caller_session_id,
                 });
-                return Ok(SteerOutcome::Queued);
+                return Ok(SteerOutcome::Queued(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(run_epoch as usize),
+                    queue_position: None,
+                }));
             }
-            return Ok(SteerOutcome::NotContinuable);
+            return Ok(SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(run_epoch as usize),
+                queue_position: None,
+            }));
         }
 
-        Ok(SteerOutcome::NotContinuable)
+        Ok(SteerOutcome::NotContinuable(OutcomeContext {
+            task_id: Some(task_id.to_string()),
+            run_epoch: Some(run_epoch as usize),
+            queue_position: None,
+        }))
     }
 
     pub fn steer_task_with_context(
@@ -2712,12 +2890,23 @@ impl TaskManager {
         let Some(record) = self.records.get(task_id).cloned() else {
             return Ok(SteerOutcome::NotFound {
                 reason: format!("managed task `{task_id}` was not found"),
+                context: OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    ..OutcomeContext::default()
+                },
             });
         };
         if !task_scope_allows(&record, context) {
             let reason = scope_denied_reason(&record, context);
             self.record_task_command_event(task_id, "steer", context, false, Some(reason.clone()));
-            return Ok(SteerOutcome::ScopeDenied { reason });
+            return Ok(SteerOutcome::ScopeDenied {
+                reason,
+                context: OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(record.run_epoch as usize),
+                    ..OutcomeContext::default()
+                },
+            });
         }
         let outcome = self.steer_task_inner(task_id, prompt, context.caller_session_id.clone())?;
         self.record_task_command_event(
@@ -5602,15 +5791,24 @@ mod tests {
 
         assert_eq!(
             control.send_follow_up_current_task("continue".to_string())?,
-            SendOutcome::Sent
+            SendOutcome::Sent(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.steer_current_task("adjust".to_string())?,
-            SteerOutcome::Steered
+            SteerOutcome::Steered(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.interrupt_task("task_interrupt")?,
-            ActionOutcome::Interrupted
+            ActionOutcome::Interrupted(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(interrupted.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -5630,27 +5828,45 @@ mod tests {
         assert_eq!(cancelled.load(Ordering::SeqCst), 0);
         assert_eq!(
             control.send_follow_up_current_task("continue after interrupt".to_string())?,
-            SendOutcome::NotContinuable
+            SendOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.steer_current_task("adjust after interrupt".to_string())?,
-            SteerOutcome::NotContinuable
+            SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.send_follow_up_task("task_interrupt", "continue 2".to_string())?,
-            SendOutcome::NotContinuable
+            SendOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.steer_task("task_interrupt", "adjust 2".to_string())?,
-            SteerOutcome::NotContinuable
+            SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.cancel_current_task()?,
-            ActionOutcome::NotContinuable
+            ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.interrupt_current_task()?,
-            ActionOutcome::NotContinuable
+            ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         Ok(())
     }
@@ -5674,33 +5890,54 @@ mod tests {
 
         assert_eq!(
             control.cancel_task("task_cancel")?,
-            ActionOutcome::Cancelled
+            ActionOutcome::Cancelled(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(cancelled.load(Ordering::SeqCst), 1);
         assert_eq!(interrupted.load(Ordering::SeqCst), 0);
         assert_eq!(
             control.send_follow_up_current_task("continue after cancel".to_string())?,
-            SendOutcome::NotContinuable
+            SendOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.steer_current_task("adjust after cancel".to_string())?,
-            SteerOutcome::NotContinuable
+            SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.cancel_current_task()?,
-            ActionOutcome::NotContinuable
+            ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.interrupt_current_task()?,
-            ActionOutcome::NotContinuable
+            ActionOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.send_follow_up_task("task_cancel", "continue 2".to_string())?,
-            SendOutcome::NotContinuable
+            SendOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.steer_task("task_cancel", "adjust 2".to_string())?,
-            SteerOutcome::NotContinuable
+            SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancel".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         Ok(())
     }
@@ -6925,7 +7162,13 @@ mod tests {
             control.current_task_id()?.as_deref(),
             Some(task.id.as_str())
         );
-        assert_eq!(control.cancel_current_task()?, ActionOutcome::Cancelled);
+        assert_eq!(
+            control.cancel_current_task()?,
+            ActionOutcome::Cancelled(OutcomeContext {
+                task_id: Some(task.id.clone()),
+                ..OutcomeContext::default()
+            })
+        );
 
         let error = waiter
             .join()
@@ -7195,7 +7438,11 @@ mod tests {
 
         assert_eq!(
             manager.interrupt_task("task_interrupt")?,
-            ActionOutcome::Interrupted
+            ActionOutcome::Interrupted(OutcomeContext {
+                task_id: Some("task_interrupt".to_string()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
         );
 
         let record = manager
@@ -8556,7 +8803,13 @@ mod tests {
             })),
         )?;
 
-        assert_eq!(control.cancel_current_task()?, ActionOutcome::Cancelled);
+        assert_eq!(
+            control.cancel_current_task()?,
+            ActionOutcome::Cancelled(OutcomeContext {
+                task_id: Some("task_running".to_string()),
+                ..OutcomeContext::default()
+            })
+        );
         assert_eq!(
             control.current_task_status()?,
             Some(ManagedTaskStatus::Cancelled)
@@ -8575,11 +8828,17 @@ mod tests {
 
         assert_eq!(
             control.steer_current_task("steer after cancel".to_string())?,
-            SteerOutcome::NotContinuable
+            SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancelled".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.steer_task("task_cancelled", "steer after cancel 2".to_string())?,
-            SteerOutcome::NotContinuable
+            SteerOutcome::NotContinuable(OutcomeContext {
+                task_id: Some("task_cancelled".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         Ok(())
     }
@@ -8646,7 +8905,11 @@ mod tests {
 
         assert_eq!(
             manager.send_follow_up_task(&task_id, "continue".to_string())?,
-            SendOutcome::Revive
+            SendOutcome::Revive(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(4),
+                ..OutcomeContext::default()
+            })
         );
         let record = manager
             .records
@@ -8695,7 +8958,11 @@ mod tests {
 
         assert_eq!(
             manager.steer_task(&steer_id, "adjust".to_string())?,
-            SteerOutcome::Revive
+            SteerOutcome::Revive(OutcomeContext {
+                task_id: Some(steer_id.clone()),
+                run_epoch: Some(2),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             manager
@@ -8876,11 +9143,19 @@ mod tests {
 
         assert_eq!(
             manager.send_follow_up_task(&task_id, "wait for slot".to_string())?,
-            SendOutcome::Queued
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             manager.send_follow_up_task(&task_id, "second queued message".to_string())?,
-            SendOutcome::Queued
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(manager.pending_revives.len(), 2);
 
@@ -8933,7 +9208,14 @@ mod tests {
                 all_scope: false,
             },
         )?;
-        assert_eq!(queued, SendOutcome::Queued);
+        assert_eq!(
+            queued,
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some("task_scoped".to_string()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
+        );
         let messages = manager.control.take_pending_messages("task_scoped")?;
         assert_eq!(messages.len(), 1);
         assert_eq!(
@@ -8972,7 +9254,14 @@ mod tests {
                 all_scope: true,
             },
         )?;
-        assert_eq!(outcome, SendOutcome::Queued);
+        assert_eq!(
+            outcome,
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some("task_all_scope".to_string()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
+        );
         let messages = manager.control.take_pending_messages("task_all_scope")?;
         assert_eq!(messages.len(), 1);
         assert_eq!(
@@ -9023,7 +9312,14 @@ mod tests {
             },
         )?;
 
-        assert_eq!(outcome, SendOutcome::Queued);
+        assert_eq!(
+            outcome,
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
+        );
         let messages = manager.control.take_pending_messages(task_id)?;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message, "accepted despite audit failure");
@@ -9067,11 +9363,17 @@ mod tests {
 
         assert_eq!(
             control.send_follow_up_current_task("follow up".to_string())?,
-            SendOutcome::Queued
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some("task_pending".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.send_follow_up_task("task_pending", "follow up 2".to_string())?,
-            SendOutcome::Queued
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some("task_pending".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         Ok(())
     }
@@ -9079,15 +9381,15 @@ mod tests {
     #[test]
     fn cancel_on_no_task_returns_noop() -> Result<()> {
         let control = TaskManagerControl::default();
-        assert_eq!(control.cancel_current_task()?, ActionOutcome::Noop);
-        assert_eq!(control.interrupt_current_task()?, ActionOutcome::Noop);
+        assert_eq!(control.cancel_current_task()?, ActionOutcome::Noop(OutcomeContext::default()));
+        assert_eq!(control.interrupt_current_task()?, ActionOutcome::Noop(OutcomeContext::default()));
         assert_eq!(
             control.send_follow_up_current_task("any".to_string())?,
-            SendOutcome::Noop
+            SendOutcome::Noop(OutcomeContext::default())
         );
         assert_eq!(
             control.steer_current_task("any".to_string())?,
-            SteerOutcome::Noop
+            SteerOutcome::Noop(OutcomeContext::default())
         );
         Ok(())
     }
@@ -9110,7 +9412,10 @@ mod tests {
 
         assert_eq!(
             control.steer_current_task("adjust".to_string())?,
-            SteerOutcome::Steered
+            SteerOutcome::Steered(OutcomeContext {
+                task_id: Some("task_running".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             sent_steers
@@ -9140,7 +9445,10 @@ mod tests {
 
         assert_eq!(
             control.send_follow_up_current_task("continue".to_string())?,
-            SendOutcome::Sent
+            SendOutcome::Sent(OutcomeContext {
+                task_id: Some("task_running".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             sent_follow_ups
@@ -9168,14 +9476,67 @@ mod tests {
 
         assert_eq!(
             control.steer_task("task_b", "steer".to_string())?,
-            SteerOutcome::Noop
+            SteerOutcome::Noop(OutcomeContext {
+                task_id: Some("task_b".to_string()),
+                ..OutcomeContext::default()
+            })
         );
         assert_eq!(
             control.send_follow_up_task("task_b", "follow up".to_string())?,
-            SendOutcome::Noop
+            SendOutcome::Noop(OutcomeContext {
+                task_id: Some("task_b".to_string()),
+                ..OutcomeContext::default()
+            })
         );
-        assert_eq!(control.cancel_task("task_b")?, ActionOutcome::Noop);
-        assert_eq!(control.interrupt_task("task_b")?, ActionOutcome::Noop);
+        assert_eq!(
+            control.cancel_task("task_b")?,
+            ActionOutcome::Noop(OutcomeContext {
+                task_id: Some("task_b".to_string()),
+                ..OutcomeContext::default()
+            })
+        );
+        assert_eq!(
+            control.interrupt_task("task_b")?,
+            ActionOutcome::Noop(OutcomeContext {
+                task_id: Some("task_b".to_string()),
+                ..OutcomeContext::default()
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_outcome_contains_task_id_and_epoch() -> Result<()> {
+        let ctx = OutcomeContext {
+            task_id: Some("task_001".to_string()),
+            run_epoch: Some(3),
+            queue_position: None,
+        };
+        let outcome = SendOutcome::Sent(ctx.clone());
+        match &outcome {
+            SendOutcome::Sent(c) => {
+                assert_eq!(c.task_id.as_deref(), Some("task_001"));
+                assert_eq!(c.run_epoch, Some(3));
+            }
+            _ => panic!("expected Sent"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_queued_outcome_has_position() -> Result<()> {
+        let ctx = OutcomeContext {
+            task_id: Some("task_002".to_string()),
+            run_epoch: Some(1),
+            queue_position: Some(5),
+        };
+        let outcome = SendOutcome::Queued(ctx.clone());
+        match &outcome {
+            SendOutcome::Queued(c) => {
+                assert_eq!(c.queue_position, Some(5));
+            }
+            _ => panic!("expected Queued"),
+        }
         Ok(())
     }
 }

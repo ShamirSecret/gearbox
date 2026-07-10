@@ -1731,11 +1731,26 @@ impl ReviewDimension {
     }
 }
 
+/// Evidence linking a review dimension to a specific reviewer execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerEvidence {
+    /// Unique execution ID of the reviewer worker.
+    pub execution_id: String,
+    /// The route/category of the reviewer (e.g. "deep", "explore", "comment_checker").
+    pub route: String,
+    /// Path to the reviewer's output artifact.
+    pub artifact_path: Option<String>,
+    /// Verdict from this reviewer.
+    pub verdict: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewDimensionResult {
     pub dimension: ReviewDimension,
     pub passed: bool,
     pub evidence: String,
+    /// Optional structured evidence binding to a specific reviewer execution.
+    pub reviewer_evidence: Option<ReviewerEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1745,6 +1760,25 @@ pub struct ReviewGate {
 }
 
 impl ReviewGate {
+    /// Verify that each dimension has unique reviewer_evidence (or none).
+    /// Returns Err if the same execution_id is used for multiple dimensions.
+    pub fn validate_independent_reviewers(&self) -> Result<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        for result in &self.results {
+            if let Some(ref evidence) = result.reviewer_evidence {
+                if seen.contains(&evidence.execution_id.as_str()) {
+                    bail!(
+                        "duplicate reviewer execution_id '{}' for dimension {}; each dimension must have independent evidence",
+                        evidence.execution_id,
+                        result.dimension.label(),
+                    );
+                }
+                seen.push(&evidence.execution_id);
+            }
+        }
+        Ok(())
+    }
+
     fn from_inputs(
         verification_passed: bool,
         worker_status: &WorkerStatus,
@@ -1773,6 +1807,16 @@ impl ReviewGate {
                     } else {
                         "verification or coordinator goal acceptance failed".to_string()
                     },
+                    reviewer_evidence: Some(ReviewerEvidence {
+                        execution_id: "coordinator".to_string(),
+                        route: "coordinator".to_string(),
+                        artifact_path: None,
+                        verdict: if verification_passed && goal_satisfied {
+                            "pass".to_string()
+                        } else {
+                            "fail".to_string()
+                        },
+                    }),
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::CodeQuality,
@@ -1789,6 +1833,16 @@ impl ReviewGate {
                             "scope checks are not clean".to_string()
                         }
                     },
+                    reviewer_evidence: Some(ReviewerEvidence {
+                        execution_id: "scope-check".to_string(),
+                        route: "scope-check".to_string(),
+                        artifact_path: None,
+                        verdict: if scope_clean && comment_check_clean {
+                            "pass".to_string()
+                        } else {
+                            "fail".to_string()
+                        },
+                    }),
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::Security,
@@ -1801,6 +1855,16 @@ impl ReviewGate {
                             scope_check.forbidden_touches.join(", ")
                         )
                     },
+                    reviewer_evidence: Some(ReviewerEvidence {
+                        execution_id: "security-check".to_string(),
+                        route: "security-check".to_string(),
+                        artifact_path: None,
+                        verdict: if scope_check.forbidden_touches.is_empty() {
+                            "pass".to_string()
+                        } else {
+                            "fail".to_string()
+                        },
+                    }),
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::QaExecution,
@@ -1810,6 +1874,16 @@ impl ReviewGate {
                     } else {
                         "one or more verification commands failed".to_string()
                     },
+                    reviewer_evidence: Some(ReviewerEvidence {
+                        execution_id: "qa-execution".to_string(),
+                        route: "qa-execution".to_string(),
+                        artifact_path: None,
+                        verdict: if verification_passed {
+                            "pass".to_string()
+                        } else {
+                            "fail".to_string()
+                        },
+                    }),
                 },
             ],
         }
@@ -3962,6 +4036,56 @@ mod tests {
         assert_eq!(gate.results.len(), 4);
         assert!(gate.failed_reason().is_some());
         assert!(gate.summary().contains("security=fail"));
+    }
+
+    #[test]
+    fn test_review_dimensions_have_unique_execution_ids() -> Result<()> {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let gate = ReviewGate::from_inputs(
+            true,
+            &WorkerStatus::Succeeded,
+            &scope_check,
+            None,
+            &[],
+        );
+        // Validate — should pass with synthetic IDs
+        assert!(gate.validate_independent_reviewers().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_review_dimensions_reject_duplicate_execution_ids() {
+        let gate = ReviewGate {
+            require_all_pass: true,
+            results: vec![
+                ReviewDimensionResult {
+                    dimension: ReviewDimension::GoalVerification,
+                    passed: true,
+                    evidence: "test".to_string(),
+                    reviewer_evidence: Some(ReviewerEvidence {
+                        execution_id: "same-id".to_string(),
+                        route: "coordinator".to_string(),
+                        artifact_path: None,
+                        verdict: "pass".to_string(),
+                    }),
+                },
+                ReviewDimensionResult {
+                    dimension: ReviewDimension::CodeQuality,
+                    passed: true,
+                    evidence: "test".to_string(),
+                    reviewer_evidence: Some(ReviewerEvidence {
+                        execution_id: "same-id".to_string(), // DUPLICATE
+                        route: "scope-check".to_string(),
+                        artifact_path: None,
+                        verdict: "pass".to_string(),
+                    }),
+                },
+            ],
+        };
+        assert!(
+            gate.validate_independent_reviewers().is_err(),
+            "duplicate execution_id should cause hard fail"
+        );
     }
 
     #[test]

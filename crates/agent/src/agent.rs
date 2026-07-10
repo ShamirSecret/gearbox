@@ -59,7 +59,7 @@ use gearbox_agent::runtime::{
 };
 use gearbox_agent::state::{ContinuationStatus, CoordinatorModel, EventKind, StateStore, event};
 use gearbox_agent::task_manager::{
-    ActionOutcome, ManagedTaskStatus, SendOutcome, SharedTaskManager, SteerOutcome,
+    ActionOutcome, ManagedTaskStatus, OutcomeContext, SendOutcome, SharedTaskManager, SteerOutcome,
     TaskAttemptSnapshot, TaskCommandContext, TaskManager, TaskManagerControl, TaskManagerSnapshot,
     TaskManagerTickLoop, TaskSnapshot,
 };
@@ -2258,13 +2258,16 @@ impl NativeAgentConnection {
         cx: &App,
     ) -> Result<ActionOutcome> {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
         let Some(task_id) = control.current_task_id()? else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                ..OutcomeContext::default()
+            }));
         };
         task_manager
             .lock()
@@ -2280,13 +2283,16 @@ impl NativeAgentConnection {
 
     pub fn cancel_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<ActionOutcome> {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
         let Some(task_id) = control.current_task_id()? else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-            return Ok(ActionOutcome::Noop);
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                ..OutcomeContext::default()
+            }));
         };
         task_manager
             .lock()
@@ -2390,13 +2396,13 @@ impl NativeAgentConnection {
         cx: &App,
     ) -> Result<SendOutcome> {
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-            return Ok(SendOutcome::Noop);
+            return Ok(SendOutcome::Noop(OutcomeContext::default()));
         };
         let Some(task_id) = self
             .gear_task_manager_control(session_id, cx)
             .and_then(|control| control.current_task_id().ok().flatten())
         else {
-            return Ok(SendOutcome::Noop);
+            return Ok(SendOutcome::Noop(OutcomeContext::default()));
         };
         task_manager
             .lock()
@@ -2418,13 +2424,13 @@ impl NativeAgentConnection {
         cx: &App,
     ) -> Result<SteerOutcome> {
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-            return Ok(SteerOutcome::Noop);
+            return Ok(SteerOutcome::Noop(OutcomeContext::default()));
         };
         let Some(task_id) = self
             .gear_task_manager_control(session_id, cx)
             .and_then(|control| control.current_task_id().ok().flatten())
         else {
-            return Ok(SteerOutcome::Noop);
+            return Ok(SteerOutcome::Noop(OutcomeContext::default()));
         };
         task_manager
             .lock()
