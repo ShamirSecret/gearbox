@@ -1641,7 +1641,7 @@ fn start_command_backed_worker(
         skip_worker: config.skip_worker,
         command: route.worker_command.map(ToString::to_string),
         model_variant: packet.variant_applied.clone(),
-        tool_policy: packet.tools.clone(),
+        tool_policy: packet.tools,
         packet_path,
         prompt_path,
         subscriptions: Arc::new(WorkerSessionSubscriptions::default()),
@@ -5301,9 +5301,7 @@ mod tests {
         };
         let config = WorkerConfig {
             worker_kind: WorkerKind::Opencode,
-            worker_command: Some(
-                "sh -c 'echo \"$GEARBOX_WORKER_TOOL_POLICY\"'".to_string(),
-            ),
+            worker_command: Some("sh -c 'echo \"$GEARBOX_WORKER_TOOL_POLICY\"'".to_string()),
             worker_model: None,
             worker_routes: Vec::new(),
             unavailable_worker_models: Vec::new(),

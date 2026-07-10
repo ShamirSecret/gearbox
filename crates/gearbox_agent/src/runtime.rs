@@ -1807,62 +1807,54 @@ impl ReviewGate {
             .iter()
             .any(|signal| signal.starts_with("comment_check:"));
         // Use real attempt data when available; fall back to synthetic with proper labels.
-        let goal_verification_evidence = reviewer_evidence_from_attempt(
-            ReviewDimension::GoalVerification,
-            task_attempts,
-        )
-        .unwrap_or_else(|| ReviewerEvidence {
-            execution_id: "coordinator".to_string(),
-            route: "coordinator".to_string(),
-            artifact_path: None,
-            verdict: if verification_passed && goal_satisfied {
-                "pass".to_string()
-            } else {
-                "fail".to_string()
-            },
-        });
-        let code_quality_evidence = reviewer_evidence_from_attempt(
-            ReviewDimension::CodeQuality,
-            task_attempts,
-        )
-        .unwrap_or_else(|| ReviewerEvidence {
-            execution_id: "scope-check".to_string(),
-            route: "scope-check".to_string(),
-            artifact_path: None,
-            verdict: if scope_clean && comment_check_clean {
-                "pass".to_string()
-            } else {
-                "fail".to_string()
-            },
-        });
-        let security_evidence = reviewer_evidence_from_attempt(
-            ReviewDimension::Security,
-            task_attempts,
-        )
-        .unwrap_or_else(|| ReviewerEvidence {
-            execution_id: "security-check".to_string(),
-            route: "security-check".to_string(),
-            artifact_path: None,
-            verdict: if scope_check.forbidden_touches.is_empty() {
-                "pass".to_string()
-            } else {
-                "fail".to_string()
-            },
-        });
-        let qa_execution_evidence = reviewer_evidence_from_attempt(
-            ReviewDimension::QaExecution,
-            task_attempts,
-        )
-        .unwrap_or_else(|| ReviewerEvidence {
-            execution_id: "verification".to_string(),
-            route: "verification".to_string(),
-            artifact_path: None,
-            verdict: if verification_passed {
-                "pass".to_string()
-            } else {
-                "fail".to_string()
-            },
-        });
+        let goal_verification_evidence =
+            reviewer_evidence_from_attempt(ReviewDimension::GoalVerification, task_attempts)
+                .unwrap_or_else(|| ReviewerEvidence {
+                    execution_id: "coordinator".to_string(),
+                    route: "coordinator".to_string(),
+                    artifact_path: None,
+                    verdict: if verification_passed && goal_satisfied {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                });
+        let code_quality_evidence =
+            reviewer_evidence_from_attempt(ReviewDimension::CodeQuality, task_attempts)
+                .unwrap_or_else(|| ReviewerEvidence {
+                    execution_id: "scope-check".to_string(),
+                    route: "scope-check".to_string(),
+                    artifact_path: None,
+                    verdict: if scope_clean && comment_check_clean {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                });
+        let security_evidence =
+            reviewer_evidence_from_attempt(ReviewDimension::Security, task_attempts)
+                .unwrap_or_else(|| ReviewerEvidence {
+                    execution_id: "security-check".to_string(),
+                    route: "security-check".to_string(),
+                    artifact_path: None,
+                    verdict: if scope_check.forbidden_touches.is_empty() {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                });
+        let qa_execution_evidence =
+            reviewer_evidence_from_attempt(ReviewDimension::QaExecution, task_attempts)
+                .unwrap_or_else(|| ReviewerEvidence {
+                    execution_id: "verification".to_string(),
+                    route: "verification".to_string(),
+                    artifact_path: None,
+                    verdict: if verification_passed {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                });
         Self {
             require_all_pass: review_required,
             results: vec![
@@ -4101,7 +4093,8 @@ mod tests {
     #[test]
     fn test_review_dimensions_have_unique_execution_ids() -> Result<()> {
         let scope_check = crate::tools::ScopeCheck::default();
-        let gate = ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope_check, None, &[], &[]);
+        let gate =
+            ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope_check, None, &[], &[]);
         // Validate — should pass with synthetic IDs
         assert!(gate.validate_independent_reviewers().is_ok());
         Ok(())
@@ -4243,10 +4236,16 @@ mod tests {
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
 
-        let path_a =
-            store.write_continuation_state("acp-session-A", "goal_A", ContinuationStatus::Running)?;
-        let path_b =
-            store.write_continuation_state("acp-session-B", "goal_B", ContinuationStatus::Stopped)?;
+        let path_a = store.write_continuation_state(
+            "acp-session-A",
+            "goal_A",
+            ContinuationStatus::Running,
+        )?;
+        let path_b = store.write_continuation_state(
+            "acp-session-B",
+            "goal_B",
+            ContinuationStatus::Stopped,
+        )?;
 
         assert_ne!(path_a, path_b);
         assert!(store.continuation_is_stopped_for_session("acp-session-B")?);
