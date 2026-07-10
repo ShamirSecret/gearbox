@@ -55,6 +55,7 @@ use std::{
 use util::path;
 
 mod test_tools;
+mod gearbox_e2e_tests;
 use test_tools::*;
 
 pub(crate) fn init_test(cx: &mut TestAppContext) {
