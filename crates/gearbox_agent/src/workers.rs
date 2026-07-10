@@ -10,7 +10,7 @@ use std::sync::{
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{write_json, CoordinatorModel, Scope, StateStore, Task, TaskInputs};
+use crate::state::{CoordinatorModel, Scope, StateStore, Task, TaskInputs, write_json};
 use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation};
 
 #[derive(Clone, Debug)]
@@ -980,9 +980,7 @@ impl ProviderAdapter {
     /// Return the final applied variant value.
     /// This is "none" when no variant was requested, or the variant value itself.
     pub fn variant_applied(&self) -> String {
-        self.variant
-            .clone()
-            .unwrap_or_else(|| "none".to_string())
+        self.variant.clone().unwrap_or_else(|| "none".to_string())
     }
 
     pub fn check_tool_allowed(&self, _tool_name: &str) -> Result<bool, ToolDenied> {
@@ -1383,7 +1381,10 @@ impl WorkerRegistry {
             .store
             .worker_dir(&request.task.id)
             .join("variant-applied.json");
-        let variant_applied = adapter.variant.clone().unwrap_or_else(|| "none".to_string());
+        let variant_applied = adapter
+            .variant
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
         let _ = write_json(
             &variant_info_path,
             &serde_json::json!({
@@ -3232,12 +3233,16 @@ mod tests {
 
         // Supported variant → returns params
         let adapter = ProviderAdapter::new(Some("pro".to_string()), policy.clone(), category);
-        let params = adapter.model_params()?.expect("pro variant should be supported");
+        let params = adapter
+            .model_params()?
+            .expect("pro variant should be supported");
         assert_eq!(params.variant, Some("pro".to_string()));
 
         // Different supported variant
-        let adapter = ProviderAdapter::new(Some("fast".to_string()), policy.clone(), category);
-        let params = adapter.model_params()?.expect("fast variant should be supported");
+        let adapter = ProviderAdapter::new(Some("fast".to_string()), policy, category);
+        let params = adapter
+            .model_params()?
+            .expect("fast variant should be supported");
         assert_eq!(params.variant, Some("fast".to_string()));
 
         Ok(())
@@ -3249,11 +3254,7 @@ mod tests {
         let category = WorkerCategory::Deep;
 
         // Unknown variant → unsupported error
-        let adapter = ProviderAdapter::new(
-            Some("nonexistent-v99".to_string()),
-            policy,
-            category,
-        );
+        let adapter = ProviderAdapter::new(Some("nonexistent-v99".to_string()), policy, category);
         let result = adapter.model_params();
         assert!(result.is_err(), "nonexistent variant should be rejected");
         let err = result.unwrap_err();
@@ -3290,11 +3291,8 @@ mod tests {
         assert_eq!(adapter.variant.as_deref(), Some("pro"));
 
         // Scenario 2: no variant → applied is "none"
-        let adapter = ProviderAdapter::new(
-            None,
-            WorkerToolPolicy::default(),
-            WorkerCategory::Quick,
-        );
+        let adapter =
+            ProviderAdapter::new(None, WorkerToolPolicy::default(), WorkerCategory::Quick);
         assert_eq!(adapter.variant_applied(), "none");
 
         // Scenario 3: variant supported produces params
@@ -3302,7 +3300,9 @@ mod tests {
             Some("premium".to_string()),
             WorkerToolPolicy::default(),
             WorkerCategory::Quick,
-        ).model_params()?.expect("premium should be supported");
+        )
+        .model_params()?
+        .expect("premium should be supported");
         assert!(params.capabilities.contains(&"tools".to_string()));
 
         Ok(())

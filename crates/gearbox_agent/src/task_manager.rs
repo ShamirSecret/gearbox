@@ -86,7 +86,10 @@ pub enum ActionOutcome {
     /// No matching task found
     Noop(OutcomeContext),
     /// The caller is outside the task's session scope.
-    ScopeDenied { reason: String, context: OutcomeContext },
+    ScopeDenied {
+        reason: String,
+        context: OutcomeContext,
+    },
 }
 
 impl ActionOutcome {
@@ -150,9 +153,15 @@ pub enum SendOutcome {
     /// No task found
     Noop(OutcomeContext),
     /// The caller is outside the task's session scope.
-    ScopeDenied { reason: String, context: OutcomeContext },
+    ScopeDenied {
+        reason: String,
+        context: OutcomeContext,
+    },
     /// The requested task does not exist.
-    NotFound { reason: String, context: OutcomeContext },
+    NotFound {
+        reason: String,
+        context: OutcomeContext,
+    },
 }
 
 impl SendOutcome {
@@ -163,7 +172,9 @@ impl SendOutcome {
     pub fn reason(&self) -> Option<String> {
         match self {
             Self::NotContinuable(_) => Some("task is not continuable".to_string()),
-            Self::ScopeDenied { reason, .. } | Self::NotFound { reason, .. } => Some(reason.clone()),
+            Self::ScopeDenied { reason, .. } | Self::NotFound { reason, .. } => {
+                Some(reason.clone())
+            }
             Self::Noop(_) => Some("no managed task is active".to_string()),
             Self::Sent(_) | Self::Queued(_) | Self::Revive(_) => None,
         }
@@ -183,9 +194,15 @@ pub enum SteerOutcome {
     /// No task found
     Noop(OutcomeContext),
     /// The caller is outside the task's session scope.
-    ScopeDenied { reason: String, context: OutcomeContext },
+    ScopeDenied {
+        reason: String,
+        context: OutcomeContext,
+    },
     /// The requested task does not exist.
-    NotFound { reason: String, context: OutcomeContext },
+    NotFound {
+        reason: String,
+        context: OutcomeContext,
+    },
 }
 
 impl SteerOutcome {
@@ -196,7 +213,9 @@ impl SteerOutcome {
     pub fn reason(&self) -> Option<String> {
         match self {
             Self::NotContinuable(_) => Some("task is not continuable".to_string()),
-            Self::ScopeDenied { reason, .. } | Self::NotFound { reason, .. } => Some(reason.clone()),
+            Self::ScopeDenied { reason, .. } | Self::NotFound { reason, .. } => {
+                Some(reason.clone())
+            }
             Self::Noop(_) => Some("no managed task is active".to_string()),
             Self::Steered(_) | Self::Queued(_) | Self::Revive(_) => None,
         }
@@ -924,22 +943,23 @@ impl TaskManagerControl {
         let Some(current_task) = self.current_task_snapshot()? else {
             return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
+        let task_id = current_task.task_id.clone();
 
         if current_task.status != ManagedTaskStatus::Running {
             return Ok(ActionOutcome::NotContinuable(OutcomeContext {
-                task_id: Some(current_task.task_id.clone()),
+                task_id: Some(task_id),
                 ..OutcomeContext::default()
             }));
         }
 
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
+        self.update_current_status(&task_id, ManagedTaskStatus::Cancelled)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .cancel()?;
         Ok(ActionOutcome::Cancelled(OutcomeContext {
-            task_id: Some(current_task.task_id.clone()),
+            task_id: Some(task_id),
             ..OutcomeContext::default()
         }))
     }
@@ -948,22 +968,23 @@ impl TaskManagerControl {
         let Some(current_task) = self.current_task_snapshot()? else {
             return Ok(ActionOutcome::Noop(OutcomeContext::default()));
         };
+        let task_id = current_task.task_id.clone();
 
         if current_task.status != ManagedTaskStatus::Running {
             return Ok(ActionOutcome::NotContinuable(OutcomeContext {
-                task_id: Some(current_task.task_id.clone()),
+                task_id: Some(task_id),
                 ..OutcomeContext::default()
             }));
         }
 
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
+        self.update_current_status(&task_id, ManagedTaskStatus::Interrupted)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .interrupt()?;
         Ok(ActionOutcome::Interrupted(OutcomeContext {
-            task_id: Some(current_task.task_id.clone()),
+            task_id: Some(task_id),
             ..OutcomeContext::default()
         }))
     }
@@ -982,21 +1003,23 @@ impl TaskManagerControl {
             }));
         }
 
+        let current_task_id = current_task.task_id.clone();
+
         if current_task.status != ManagedTaskStatus::Running {
             return Ok(ActionOutcome::NotContinuable(OutcomeContext {
-                task_id: Some(current_task.task_id.clone()),
+                task_id: Some(current_task_id),
                 ..OutcomeContext::default()
             }));
         }
 
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
+        self.update_current_status(&current_task_id, ManagedTaskStatus::Cancelled)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .cancel()?;
         Ok(ActionOutcome::Cancelled(OutcomeContext {
-            task_id: Some(current_task.task_id.clone()),
+            task_id: Some(current_task_id),
             ..OutcomeContext::default()
         }))
     }
@@ -1015,21 +1038,23 @@ impl TaskManagerControl {
             }));
         }
 
+        let current_task_id = current_task.task_id.clone();
+
         if current_task.status != ManagedTaskStatus::Running {
             return Ok(ActionOutcome::NotContinuable(OutcomeContext {
-                task_id: Some(current_task.task_id.clone()),
+                task_id: Some(current_task_id),
                 ..OutcomeContext::default()
             }));
         }
 
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
+        self.update_current_status(&current_task_id, ManagedTaskStatus::Interrupted)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .interrupt()?;
         Ok(ActionOutcome::Interrupted(OutcomeContext {
-            task_id: Some(current_task.task_id.clone()),
+            task_id: Some(current_task_id),
             ..OutcomeContext::default()
         }))
     }
@@ -1124,7 +1149,6 @@ impl TaskManagerControl {
                 task_id: Some(current_task_id),
                 ..OutcomeContext::default()
             })),
-
         }
     }
 
@@ -9381,8 +9405,14 @@ mod tests {
     #[test]
     fn cancel_on_no_task_returns_noop() -> Result<()> {
         let control = TaskManagerControl::default();
-        assert_eq!(control.cancel_current_task()?, ActionOutcome::Noop(OutcomeContext::default()));
-        assert_eq!(control.interrupt_current_task()?, ActionOutcome::Noop(OutcomeContext::default()));
+        assert_eq!(
+            control.cancel_current_task()?,
+            ActionOutcome::Noop(OutcomeContext::default())
+        );
+        assert_eq!(
+            control.interrupt_current_task()?,
+            ActionOutcome::Noop(OutcomeContext::default())
+        );
         assert_eq!(
             control.send_follow_up_current_task("any".to_string())?,
             SendOutcome::Noop(OutcomeContext::default())
@@ -9512,7 +9542,7 @@ mod tests {
             run_epoch: Some(3),
             queue_position: None,
         };
-        let outcome = SendOutcome::Sent(ctx.clone());
+        let outcome = SendOutcome::Sent(ctx);
         match &outcome {
             SendOutcome::Sent(c) => {
                 assert_eq!(c.task_id.as_deref(), Some("task_001"));
@@ -9530,7 +9560,7 @@ mod tests {
             run_epoch: Some(1),
             queue_position: Some(5),
         };
-        let outcome = SendOutcome::Queued(ctx.clone());
+        let outcome = SendOutcome::Queued(ctx);
         match &outcome {
             SendOutcome::Queued(c) => {
                 assert_eq!(c.queue_position, Some(5));

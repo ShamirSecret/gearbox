@@ -4041,13 +4041,7 @@ mod tests {
     #[test]
     fn test_review_dimensions_have_unique_execution_ids() -> Result<()> {
         let scope_check = crate::tools::ScopeCheck::default();
-        let gate = ReviewGate::from_inputs(
-            true,
-            &WorkerStatus::Succeeded,
-            &scope_check,
-            None,
-            &[],
-        );
+        let gate = ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope_check, None, &[]);
         // Validate — should pass with synthetic IDs
         assert!(gate.validate_independent_reviewers().is_ok());
         Ok(())
@@ -4116,25 +4110,37 @@ mod tests {
             store.write_continuation_state("ses_B", "goal_B", ContinuationStatus::Running)?;
 
         // VERIFICATION: Different sessions now have DIFFERENT paths
-        assert_ne!(path_a, path_b, "FIX: different sessions should write to different paths");
+        assert_ne!(
+            path_a, path_b,
+            "FIX: different sessions should write to different paths"
+        );
 
         // VERIFICATION: A's state is preserved (file still contains ses_A)
         let state_json_a = std::fs::read_to_string(&path_a)?;
-        assert!(state_json_a.contains("ses_A"), "FIX: ses_A's data should still be present");
+        assert!(
+            state_json_a.contains("ses_A"),
+            "FIX: ses_A's data should still be present"
+        );
 
         // VERIFICATION: A's stopped status is preserved
-        assert!(store.continuation_is_stopped_for_session("ses_A")?,
-            "FIX: ses_A should still be stopped");
+        assert!(
+            store.continuation_is_stopped_for_session("ses_A")?,
+            "FIX: ses_A should still be stopped"
+        );
 
         // VERIFICATION: B is running
-        assert!(!store.continuation_is_stopped_for_session("ses_B")?,
-            "FIX: ses_B should be running");
+        assert!(
+            !store.continuation_is_stopped_for_session("ses_B")?,
+            "FIX: ses_B should be running"
+        );
 
         // VERIFICATION: Clearing A does not affect B
         store.clear_continuation_stop_for_session("ses_A")?;
         assert!(!store.continuation_is_stopped_for_session("ses_A")?);
-        assert!(!store.continuation_is_stopped_for_session("ses_B")?,
-            "FIX: clearing ses_A should not affect ses_B's running state");
+        assert!(
+            !store.continuation_is_stopped_for_session("ses_B")?,
+            "FIX: clearing ses_A should not affect ses_B's running state"
+        );
 
         Ok(())
     }
@@ -4157,11 +4163,17 @@ mod tests {
         // DIFFERENT sessions now write to DIFFERENT paths
         let path_b =
             store.write_continuation_state("ses_Y", "goal_Y", ContinuationStatus::Running)?;
-        assert_ne!(path_1, path_b, "FIX: different sessions should write to different paths");
+        assert_ne!(
+            path_1, path_b,
+            "FIX: different sessions should write to different paths"
+        );
 
         // ses_X's file still contains ses_X (not overwritten by ses_Y)
         let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path_1)?)?;
-        assert_eq!(saved["session_id"], "ses_X", "ses_X's file should still contain ses_X");
+        assert_eq!(
+            saved["session_id"], "ses_X",
+            "ses_X's file should still contain ses_X"
+        );
         Ok(())
     }
 
