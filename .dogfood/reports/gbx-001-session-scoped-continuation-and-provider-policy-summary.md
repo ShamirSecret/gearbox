@@ -1,7 +1,7 @@
-# GXB-001 Result Summary
+# GBX-001 Result Summary
 
 **Plan:** Session-Scoped Continuation & Provider Policy Repair
-**Status:** Complete
+**Status:** Partially complete; follow-up required
 **Created:** 2026-07-10
 **Completed:** 2026-07-10
 
@@ -9,25 +9,23 @@
 
 | WO | Status | Commits |
 |---|---|---|
-| WO-001: Root Cause Repro | ✅ PASS | `1978e2073a` — gbx-001-001-root-cause-repro |
-| WO-002: Session-Scoped Continuation | ✅ PASS | `344692f7b8` — gbx-001-002-session-scoped-continuation |
-| WO-003: Provider Policy Dispatch | ✅ PASS | `2bd6e71159` — gbx-001-003-provider-policy-dispatch |
-| WO-004: Outcome & Review Evidence | ✅ PASS | `35c5f2a0ea`, `5a2460c3c6` — gbx-001-004-outcome-review-evidence + clippy fixes |
-| WO-005: Final Review | ✅ PASS | `5a2460c3c6` (fmt/clippy fixes) |
+| WO-001: Root Cause Repro | Partial | `1978e2073a` — evidence was limited to StateStore tests |
+| WO-002: Session-Scoped Continuation | Repaired after review | ACP session ID now reaches `RunOptions`; legacy singleton APIs removed |
+| WO-003: Provider Policy Dispatch | Partial | command dispatch receives variant/policy environment; no provider capability contract |
+| WO-004: Outcome & Review Evidence | Partial | typed outcomes exist; reviewer evidence remains synthetic |
+| WO-005: Final Review | Invalidated | original final review accepted known unmet acceptance criteria |
 
 ## Validation Commands
 
 | Command | Result |
 |---|---|
-| `cargo fmt --all -- --check` | ✅ PASS |
-| `cargo test -p gearbox_agent -- --nocapture` | ✅ 191/191 passed |
-| `./script/clippy -p gearbox_agent` | ✅ PASS |
-| `cargo check -p gearbox_agent -p agent -p agent_ui` | ✅ PASS |
-| `git diff --check` | ✅ PASS |
+| Original five commands | Passed on 2026-07-10, but did not exercise the missing runtime contracts |
 
 ## Remaining Risks
 
-1. **ProviderAdapter is a best-effort gate**: The adapter validates known variant names but doesn't yet connect to every provider's capability contract. If a new provider is added with different variant names, the `model_params()` match arms need updating.
-2. **Deprecated methods still exist**: `continuation_state_path()`, `read_continuation_state()`, `continuation_is_stopped()`, `clear_continuation_stop()` are kept as deprecated for backward compatibility but should be removed after a migration window.
-3. **Review evidence binding uses synthetic IDs**: The `ReviewerEvidence.execution_id` is currently populated with dimension-based synthetic IDs rather than real reviewer worker execution IDs. Full integration with independent reviewer workers is future work.
-4. **Tool policy enforcement is structural**: `check_tool_allowed()` returns `Ok(true)` by default. Full regex-based tool denial matching (as in `agent/src/tool_permissions.rs`) is not yet wired into the adapter — this is a foundation for future enforcement.
+1. **Continuation mapping is repaired but needs GUI integration coverage**: the runtime now receives the ACP session ID and the singleton APIs are removed; add a GPUI Stop/Restart A/B test before closing the follow-up.
+2. **Provider capability contract is still missing**: command workers now receive `GEARBOX_WORKER_MODEL_VARIANT` and `GEARBOX_WORKER_TOOL_POLICY`, while native Zed variant dispatch fails closed until a real provider-selection API is wired.
+3. **Review evidence remains synthetic**: `ReviewerEvidence.execution_id` is not a reviewer worker execution ID and its artifact path is empty.
+4. **Tool policy remains boundary-limited**: the adapter now rejects a denied required category capability before worker dispatch, but it cannot yet intercept individual tools inside external command workers.
+
+The remaining provider and independent-review work is tracked by `GBX-002`.

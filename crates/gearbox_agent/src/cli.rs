@@ -131,6 +131,7 @@ pub fn run() -> Result<()> {
                 coordinator_review_hook: None,
                 task_manager_control: None,
                 task_manager: None,
+                session_id: None,
                 continuation: false,
             })?;
 

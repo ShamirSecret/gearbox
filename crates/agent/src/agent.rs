@@ -2822,6 +2822,7 @@ impl NativeAgentConnection {
                     coordinator_review_hook,
                     task_manager_control: Some(run_task_manager_control),
                     task_manager: Some(run_task_manager),
+                    session_id: Some(continuation_session_id),
                     continuation: true,
                 })?;
                 let final_report = std_fs::read_to_string(&outcome.final_report_path)

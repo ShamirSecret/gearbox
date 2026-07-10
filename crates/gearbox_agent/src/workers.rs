@@ -984,10 +984,49 @@ impl ProviderAdapter {
     }
 
     pub fn check_tool_allowed(&self, _tool_name: &str) -> Result<bool, ToolDenied> {
-        // Check WorkerToolPolicy against tool_name
-        // The policy has allow/deny/confirm lists.
-        // For now, use a simple heuristic: if the tool matches denied patterns, reject.
-        Ok(true) // base behavior: allow all (delegates to existing tool permissions)
+        let (tool_name, allowed) = match _tool_name {
+            "write" | "edit" | "terminal" => ("write", self.tool_policy.can_write),
+            "review" => ("review", self.tool_policy.can_review),
+            "explore" | "read" | "search" => ("explore", self.tool_policy.can_explore),
+            "question" => ("question", self.tool_policy.question),
+            "gear" | "recursive_gear_task" => (
+                "recursive_gear_task",
+                self.tool_policy.allow_recursive_gear_tasks,
+            ),
+            other => {
+                return Err(ToolDenied {
+                    tool_name: other.to_string(),
+                    policy: self.tool_policy.clone(),
+                    reason: format!("tool `{other}` has no Gear dispatch policy"),
+                });
+            }
+        };
+
+        if allowed {
+            Ok(true)
+        } else {
+            Err(ToolDenied {
+                tool_name: tool_name.to_string(),
+                policy: self.tool_policy.clone(),
+                reason: format!(
+                    "tool `{tool_name}` is denied by the {:?} worker policy",
+                    self.category
+                ),
+            })
+        }
+    }
+
+    fn required_tool_for_category(&self) -> &'static str {
+        match self.category {
+            WorkerCategory::Review => "review",
+            WorkerCategory::Explore | WorkerCategory::Librarian => "explore",
+            WorkerCategory::Quick
+            | WorkerCategory::Deep
+            | WorkerCategory::Repair
+            | WorkerCategory::Visual
+            | WorkerCategory::ZedNative
+            | WorkerCategory::Custom => "write",
+        }
     }
 }
 
@@ -1376,6 +1415,19 @@ impl WorkerRegistry {
             bail!("{}", unsupported);
         }
 
+        adapter
+            .check_tool_allowed(adapter.required_tool_for_category())
+            .map_err(|denied| anyhow::anyhow!(denied))?;
+
+        if worker_kind == WorkerKind::ZedAgent
+            && self.native_backend.is_some()
+            && adapter.variant.is_some()
+        {
+            bail!(
+                "native Zed worker does not expose a provider variant contract; refusing variant dispatch"
+            );
+        }
+
         // Store the applied variant info in an artifact.
         let variant_info_path = request
             .store
@@ -1526,12 +1578,16 @@ fn start_command_backed_worker(
     let (category_resolution, category_resolution_result) =
         category_resolution_for_route(config, route_attempt, route_hint, &route);
     let worker_name = route.worker_kind.as_str();
+    let adapter = ProviderAdapter::new(route.variant.clone(), route.tools.clone(), route.category);
+    let model_params = adapter
+        .model_params()
+        .map_err(|error| anyhow::anyhow!(error))?;
     let packet = WorkerPacket {
         task_id: task.id.clone(),
         worker: worker_name.to_string(),
         worker_model: route.worker_model.map(ToString::to_string),
         variant: route.variant.clone(),
-        variant_applied: route.variant.clone(),
+        variant_applied: model_params.and_then(|params| params.variant),
         prompt_append: route.prompt_append.clone(),
         tools: route.tools.clone(),
         category_resolution,
@@ -1584,6 +1640,8 @@ fn start_command_backed_worker(
         worker_name: worker_name.to_string(),
         skip_worker: config.skip_worker,
         command: route.worker_command.map(ToString::to_string),
+        model_variant: packet.variant_applied.clone(),
+        tool_policy: packet.tools.clone(),
         packet_path,
         prompt_path,
         subscriptions: Arc::new(WorkerSessionSubscriptions::default()),
@@ -1609,6 +1667,8 @@ struct CommandWorkerSessionHandle {
     worker_name: String,
     skip_worker: bool,
     command: Option<String>,
+    model_variant: Option<String>,
+    tool_policy: WorkerToolPolicy,
     packet_path: PathBuf,
     prompt_path: PathBuf,
     subscriptions: Arc<WorkerSessionSubscriptions>,
@@ -1767,6 +1827,17 @@ impl CommandWorkerSessionHandle {
         env.insert(
             "GEARBOX_WORKER_LAST_MESSAGE".to_string(),
             last_message_path.to_string_lossy().to_string(),
+        );
+        if let Some(model_variant) = &self.model_variant {
+            env.insert(
+                "GEARBOX_WORKER_MODEL_VARIANT".to_string(),
+                model_variant.clone(),
+            );
+        }
+        env.insert(
+            "GEARBOX_WORKER_TOOL_POLICY".to_string(),
+            serde_json::to_string(&self.tool_policy)
+                .context("failed to serialize worker tool policy for dispatch")?,
         );
 
         let output = run_shell_command_with_env_and_cancellation(
@@ -3266,13 +3337,20 @@ mod tests {
 
     #[test]
     fn test_disallowed_tool_does_not_reach_executor() -> Result<()> {
-        // The adapter is the gate: verify it exists at the right layer
-        let policy = WorkerToolPolicy::default();
-        let adapter = ProviderAdapter::new(None, policy, WorkerCategory::Quick);
+        let adapter = ProviderAdapter::new(
+            None,
+            WorkerToolPolicy {
+                can_write: false,
+                ..WorkerToolPolicy::default()
+            },
+            WorkerCategory::Quick,
+        );
 
-        // By default, all tools are allowed
-        assert!(adapter.check_tool_allowed("terminal")?);
-        assert!(adapter.check_tool_allowed("edit")?);
+        let error = adapter
+            .check_tool_allowed("write")
+            .expect_err("disabled write policy must reject before execution");
+        assert_eq!(error.tool_name, "write");
+        assert!(error.reason.contains("denied"));
 
         Ok(())
     }
@@ -3304,6 +3382,253 @@ mod tests {
         .model_params()?
         .expect("premium should be supported");
         assert!(params.capabilities.contains(&"tools".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_command_worker_variant_env_var() -> Result<()> {
+        // Use Deep category + category-specific env var to avoid interfering
+        // with parallel tests that rely on the default Quick category.
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_variant_env".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test variant env".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(
+                "sh -c 'echo GEARBOX_WORKER_MODEL_VARIANT=$GEARBOX_WORKER_MODEL_VARIANT'"
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let orig_deep = env::var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT").ok();
+        unsafe {
+            env::set_var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT", "pro");
+            env::remove_var("GEARBOX_WORKER_MODEL_VARIANT");
+        }
+
+        let result = WorkerRegistry::default().run(WorkerRunRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("deep"),
+        });
+
+        unsafe {
+            if let Some(v) = orig_deep {
+                env::set_var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT", v);
+            } else {
+                env::remove_var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT");
+            }
+        }
+
+        let result = result?;
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        let stdout_path = result.stdout_path.context("stdout_path should be set")?;
+        let stdout = fs::read_to_string(stdout_path)?;
+        assert!(
+            stdout.contains("GEARBOX_WORKER_MODEL_VARIANT=pro"),
+            "stdout should contain the env var with value 'pro': {:?}",
+            stdout
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_worker_fail_closed_on_variant() -> Result<()> {
+        // Use Deep category + category-specific env var to avoid interfering
+        // with parallel tests that rely on the default Quick category.
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_native_variant".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test native variant reject".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("zed_agent".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: Some("should not run".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+        };
+
+        let orig_deep = env::var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT").ok();
+        unsafe {
+            env::set_var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT", "pro");
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeNativeBackend {
+            started: started.clone(),
+        }));
+
+        let result = registry.run(WorkerRunRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("deep"),
+        });
+
+        unsafe {
+            if let Some(v) = orig_deep {
+                env::set_var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT", v);
+            } else {
+                env::remove_var("GEARBOX_GEAR_CATEGORY_DEEP_VARIANT");
+            }
+        }
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("provider variant contract"),
+            "error should mention variant contract: {}",
+            err
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "native backend must not start when variant is rejected"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_command_worker_no_variant_no_env_var() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_no_variant_env".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test no variant env".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(
+                "sh -c 'if [ -n \"$GEARBOX_WORKER_MODEL_VARIANT\" ]; then exit 1; else echo no_variant; fi'"
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let orig_explore = env::var("GEARBOX_GEAR_CATEGORY_EXPLORE_VARIANT").ok();
+        let orig_worker = env::var("GEARBOX_GEAR_WORKER_VARIANT").ok();
+        let orig_model = env::var("GEARBOX_WORKER_MODEL_VARIANT").ok();
+        unsafe {
+            env::remove_var("GEARBOX_GEAR_CATEGORY_EXPLORE_VARIANT");
+            env::remove_var("GEARBOX_GEAR_WORKER_VARIANT");
+            env::remove_var("GEARBOX_WORKER_MODEL_VARIANT");
+        }
+
+        let result = WorkerRegistry::default().run(WorkerRunRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("explore"),
+        });
+
+        unsafe {
+            if let Some(v) = orig_explore {
+                env::set_var("GEARBOX_GEAR_CATEGORY_EXPLORE_VARIANT", v);
+            } else {
+                env::remove_var("GEARBOX_GEAR_CATEGORY_EXPLORE_VARIANT");
+            }
+            if let Some(v) = orig_worker {
+                env::set_var("GEARBOX_GEAR_WORKER_VARIANT", v);
+            } else {
+                env::remove_var("GEARBOX_GEAR_WORKER_VARIANT");
+            }
+            if let Some(v) = orig_model {
+                env::set_var("GEARBOX_WORKER_MODEL_VARIANT", v);
+            } else {
+                env::remove_var("GEARBOX_WORKER_MODEL_VARIANT");
+            }
+        }
+
+        let result = result?;
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        let stdout_path = result.stdout_path.context("stdout_path should be set")?;
+        let stdout = fs::read_to_string(stdout_path)?;
+        assert!(
+            stdout.contains("no_variant"),
+            "stdout should show no_variant (env var was absent): {:?}",
+            stdout
+        );
 
         Ok(())
     }
@@ -3996,6 +4321,8 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            model_variant: None,
+            tool_policy: WorkerToolPolicy::default(),
             packet_path: temp_dir.path().join("packet.json"),
             prompt_path: temp_dir.path().join("prompt.md"),
             subscriptions,
@@ -4139,6 +4466,8 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            model_variant: None,
+            tool_policy: WorkerToolPolicy::default(),
             packet_path: temp_dir.path().join("packet.json"),
             prompt_path: temp_dir.path().join("prompt.md"),
             subscriptions,
@@ -4234,6 +4563,8 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            model_variant: None,
+            tool_policy: WorkerToolPolicy::default(),
             packet_path: temp_dir.path().join("packet.json"),
             prompt_path: temp_dir.path().join("prompt.md"),
             subscriptions,

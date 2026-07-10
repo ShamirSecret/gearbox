@@ -388,56 +388,6 @@ impl StateStore {
         Ok(())
     }
 
-    #[deprecated(
-        since = "1.0.0",
-        note = "use continuation_state_path_for_session instead"
-    )]
-    pub fn continuation_state_path(&self) -> PathBuf {
-        self.continuation_dir().join("state.json")
-    }
-
-    #[deprecated(
-        since = "1.0.0",
-        note = "use read_continuation_state_for_session instead"
-    )]
-    #[allow(deprecated)]
-    pub fn read_continuation_state(&self) -> Result<Option<ContinuationState>> {
-        let path = self.continuation_state_path();
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        Ok(Some(serde_json::from_str(&contents).with_context(
-            || format!("failed to parse {}", path.display()),
-        )?))
-    }
-
-    #[deprecated(
-        since = "1.0.0",
-        note = "use continuation_is_stopped_for_session instead"
-    )]
-    #[allow(deprecated)]
-    pub fn continuation_is_stopped(&self) -> Result<bool> {
-        Ok(self
-            .read_continuation_state()?
-            .is_some_and(|state| state.status == ContinuationStatus::Stopped))
-    }
-
-    #[deprecated(
-        since = "1.0.0",
-        note = "use clear_continuation_stop_for_session instead"
-    )]
-    #[allow(deprecated)]
-    pub fn clear_continuation_stop(&self) -> Result<()> {
-        let path = self.continuation_state_path();
-        if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to clear {}", path.display()))?;
-        }
-        Ok(())
-    }
-
     pub fn artifact_dir(&self, goal_id: &str) -> PathBuf {
         self.artifacts_dir().join(goal_id)
     }

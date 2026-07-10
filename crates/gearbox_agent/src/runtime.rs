@@ -59,6 +59,8 @@ pub struct RunOptions {
     pub coordinator_review_hook: Option<CoordinatorReviewHook>,
     pub task_manager_control: Option<TaskManagerControl>,
     pub task_manager: Option<SharedTaskManager>,
+    /// Stable caller-owned identity for continuation persistence.
+    pub session_id: Option<String>,
     pub continuation: bool,
 }
 
@@ -183,7 +185,10 @@ impl Orchestrator {
         check_run_cancelled(options.cancellation_token.as_ref())?;
 
         let id_suffix = id_timestamp();
-        let session_id = format!("ses_{id_suffix}");
+        let session_id = options
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("ses_{id_suffix}"));
         let goal_id = format!("goal_{id_suffix}");
 
         if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
@@ -3503,10 +3508,16 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
-            continuation: false,
+            session_id: Some("acp-session-1".to_string()),
+            continuation: true,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
+        let continuation_state = StateStore::new(temp_dir.path())
+            .read_continuation_state_for_session("acp-session-1")?
+            .context("continuation state should use the caller session id")?;
+        assert_eq!(continuation_state.goal_id, outcome.goal_id);
+        assert_eq!(continuation_state.status, ContinuationStatus::Completed);
         assert!(outcome.final_report_path.exists());
         assert!(outcome.events_path.exists());
         assert!(outcome.artifacts_root.join("spec.md").exists());
@@ -4949,6 +4960,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })?;
 
@@ -5051,6 +5063,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })?;
 
@@ -5149,6 +5162,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })?;
 
@@ -5319,6 +5333,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })?;
 
@@ -5370,6 +5385,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })?;
 
@@ -5427,6 +5443,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })?;
 
@@ -5484,6 +5501,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            session_id: None,
             continuation: false,
         })
         .expect_err("run should be cancelled");
