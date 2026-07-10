@@ -2331,7 +2331,7 @@ impl NativeAgentConnection {
         let store = StateStore::new(workspace);
         store.initialize()?;
         let goal_id = store
-            .read_continuation_state()?
+            .read_continuation_state_for_session(&session_id.to_string())?
             .map(|state| state.goal_id)
             .unwrap_or_else(|| "active".to_string());
         store.write_continuation_state(
@@ -2379,7 +2379,7 @@ impl NativeAgentConnection {
                 Ok(Some(gear_workspace_for_session(session, agent, cx)?))
             })?
             .context("Gear session not found")?;
-        StateStore::new(workspace).clear_continuation_stop()?;
+        StateStore::new(workspace).clear_continuation_stop_for_session(&session_id.to_string())?;
         Ok(true)
     }
 
@@ -2786,8 +2786,10 @@ impl NativeAgentConnection {
             let run_task_manager_control = task_manager_control.clone();
             let run_task_manager = task_manager.clone();
             let run_worker_config = cx.update(|cx| gear_worker_config_from_env(cx));
+            let continuation_session_id = cancellation_session_id.to_string();
             let run_task = cx.background_spawn(async move {
-                StateStore::new(&workspace).clear_continuation_stop()?;
+                StateStore::new(&workspace)
+                    .clear_continuation_stop_for_session(&continuation_session_id)?;
                 let event_sink = {
                     let event_tx = event_tx.clone();
                     Arc::new(move |event: &gearbox_agent::state::Event| {

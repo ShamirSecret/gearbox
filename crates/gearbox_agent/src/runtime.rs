@@ -180,16 +180,18 @@ impl Orchestrator {
 
         let store = StateStore::new(&workspace);
         store.initialize()?;
-        if options.continuation && store.continuation_is_stopped()? {
-            bail!(
-                "Gear continuation is stopped; explicitly restart the continuation before running again"
-            );
-        }
         check_run_cancelled(options.cancellation_token.as_ref())?;
 
         let id_suffix = id_timestamp();
         let session_id = format!("ses_{id_suffix}");
         let goal_id = format!("goal_{id_suffix}");
+
+        if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
+            bail!(
+                "Gear continuation is stopped; explicitly restart the continuation before running again"
+            );
+        }
+
         let scope = Scope::new(
             options.allowed_paths.clone(),
             options.forbidden_paths.clone(),
@@ -388,7 +390,7 @@ impl Orchestrator {
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
-            if options.continuation && store.continuation_is_stopped()? {
+            if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
                 final_evaluation = Some(GoalEvaluation {
                     status: GoalStatus::NeedsUser,
                     should_continue: false,
@@ -974,7 +976,7 @@ impl Orchestrator {
         store.write_goal(&goal)?;
         store.write_tasks(&goal_id, &tasks)?;
         if options.continuation {
-            let continuation_status = if store.continuation_is_stopped()? {
+            let continuation_status = if store.continuation_is_stopped_for_session(&session_id)? {
                 ContinuationStatus::Stopped
             } else {
                 ContinuationStatus::Completed
@@ -3968,9 +3970,9 @@ mod tests {
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
         store.write_continuation_state("session-1", "goal-1", ContinuationStatus::Stopped)?;
-        assert!(store.continuation_is_stopped()?);
-        store.clear_continuation_stop()?;
-        assert!(!store.continuation_is_stopped()?);
+        assert!(store.continuation_is_stopped_for_session("session-1")?);
+        store.clear_continuation_stop_for_session("session-1")?;
+        assert!(!store.continuation_is_stopped_for_session("session-1")?);
         Ok(())
     }
 
@@ -3980,37 +3982,35 @@ mod tests {
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
 
-        // Session A writes stopped state
+        // Session A writes stopped
         let path_a =
             store.write_continuation_state("ses_A", "goal_A", ContinuationStatus::Stopped)?;
-        assert!(store.continuation_is_stopped()?);
+        assert!(store.continuation_is_stopped_for_session("ses_A")?);
 
-        // Session B writes running state — this OVERWRITES A's state (the bug)
+        // Session B writes running — previously this overwrote A (bug), now it should NOT
         let path_b =
             store.write_continuation_state("ses_B", "goal_B", ContinuationStatus::Running)?;
 
-        // BUG PROOF 1: Both writes returned the SAME path (single state.json)
-        assert_eq!(
-            path_a, path_b,
-            "BUG: different sessions wrote to the same path"
-        );
+        // VERIFICATION: Different sessions now have DIFFERENT paths
+        assert_ne!(path_a, path_b, "FIX: different sessions should write to different paths");
 
-        // BUG PROOF 2: After B's write, A's session state is GONE.
-        // The file now contains B's data with session_id "ses_B", not "ses_A".
-        let state_json = std::fs::read_to_string(&path_a)?;
-        assert!(
-            state_json.contains("ses_A"),
-            "BUG: ses_B overwrote ses_A's continuation data — file contains: {}",
-            state_json
-        );
+        // VERIFICATION: A's state is preserved (file still contains ses_A)
+        let state_json_a = std::fs::read_to_string(&path_a)?;
+        assert!(state_json_a.contains("ses_A"), "FIX: ses_A's data should still be present");
 
-        // BUG PROOF 3: continuation_is_stopped() returns false because B wrote Running.
-        // But A had stopped! A's intent is lost.
-        // THIS ASSERTION WILL FAIL on the buggy single-file code.
-        assert!(
-            store.continuation_is_stopped()?,
-            "BUG: session A's stopped status was overwritten by session B's running status"
-        );
+        // VERIFICATION: A's stopped status is preserved
+        assert!(store.continuation_is_stopped_for_session("ses_A")?,
+            "FIX: ses_A should still be stopped");
+
+        // VERIFICATION: B is running
+        assert!(!store.continuation_is_stopped_for_session("ses_B")?,
+            "FIX: ses_B should be running");
+
+        // VERIFICATION: Clearing A does not affect B
+        store.clear_continuation_stop_for_session("ses_A")?;
+        assert!(!store.continuation_is_stopped_for_session("ses_A")?);
+        assert!(!store.continuation_is_stopped_for_session("ses_B")?,
+            "FIX: clearing ses_A should not affect ses_B's running state");
 
         Ok(())
     }
@@ -4030,27 +4030,14 @@ mod tests {
         // Same session writes to the same path (overwrites its own state — OK)
         assert_eq!(path_1, path_2, "same session should write to the same path");
 
-        // A different session should write to a DIFFERENT path.
-        // With the bug, both paths are `.gearbox-agent/continuation/state.json` — the same!
+        // DIFFERENT sessions now write to DIFFERENT paths
         let path_b =
             store.write_continuation_state("ses_Y", "goal_Y", ContinuationStatus::Running)?;
-        assert_eq!(
-            path_1, path_b,
-            "BUG: sessions X and Y wrote to the same path — {} should be different from {}",
-            path_1.display(),
-            path_b.display()
-        );
+        assert_ne!(path_1, path_b, "FIX: different sessions should write to different paths");
 
-        // Verify session_id is preserved in the JSON content (it's already there).
+        // ses_X's file still contains ses_X (not overwritten by ses_Y)
         let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path_1)?)?;
-        assert_eq!(
-            saved["session_id"], "ses_Y",
-            "file should contain ses_Y (last writer)"
-        );
-
-        // The session_id IS available in the data — this proves it could be used
-        // as a per-session path key. No ACP schema change needed; the string
-        // already flows through write_continuation_state.
+        assert_eq!(saved["session_id"], "ses_X", "ses_X's file should still contain ses_X");
         Ok(())
     }
 

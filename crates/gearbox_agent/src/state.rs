@@ -293,7 +293,6 @@ impl StateStore {
             self.events_dir(),
             self.artifacts_dir(),
             self.workers_dir(),
-            self.continuation_dir(),
         ] {
             fs::create_dir_all(&path)
                 .with_context(|| format!("failed to create {}", path.display()))?;
@@ -329,12 +328,17 @@ impl StateStore {
         self.root.join("continuation")
     }
 
-    pub fn continuation_state_path(&self) -> PathBuf {
-        self.continuation_dir().join("state.json")
+    /// Per-session continuation state path: `.gearbox-agent/continuation/{session_id}/state.json`
+    pub fn continuation_state_path_for_session(&self, session_id: &str) -> PathBuf {
+        self.continuation_dir().join(session_id).join("state.json")
     }
 
-    pub fn read_continuation_state(&self) -> Result<Option<ContinuationState>> {
-        let path = self.continuation_state_path();
+    /// Read continuation state for a specific session
+    pub fn read_continuation_state_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ContinuationState>> {
+        let path = self.continuation_state_path_for_session(session_id);
         if !path.exists() {
             return Ok(None);
         }
@@ -345,6 +349,7 @@ impl StateStore {
         )?))
     }
 
+    /// Write continuation state — path is per-session
     pub fn write_continuation_state(
         &self,
         session_id: &str,
@@ -357,17 +362,58 @@ impl StateStore {
             status,
             updated_at: timestamp(),
         };
-        let path = self.continuation_state_path();
+        let path = self.continuation_state_path_for_session(session_id);
         write_json(&path, &state)?;
         Ok(path)
     }
 
+    /// Check if continuation is stopped for a specific session
+    pub fn continuation_is_stopped_for_session(&self, session_id: &str) -> Result<bool> {
+        Ok(self
+            .read_continuation_state_for_session(session_id)?
+            .is_some_and(|state| state.status == ContinuationStatus::Stopped))
+    }
+
+    /// Clear continuation stop for a specific session
+    pub fn clear_continuation_stop_for_session(&self, session_id: &str) -> Result<()> {
+        let path = self.continuation_state_path_for_session(session_id);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to clear {}", path.display()))?;
+            // Also remove the session directory if empty
+            if let Some(parent) = path.parent() {
+                fs::remove_dir(parent).ok();
+            }
+        }
+        Ok(())
+    }
+
+    #[deprecated(since = "1.0.0", note = "use continuation_state_path_for_session instead")]
+    pub fn continuation_state_path(&self) -> PathBuf {
+        self.continuation_dir().join("state.json")
+    }
+
+    #[deprecated(since = "1.0.0", note = "use read_continuation_state_for_session instead")]
+    pub fn read_continuation_state(&self) -> Result<Option<ContinuationState>> {
+        let path = self.continuation_state_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse {}", path.display()),
+        )?))
+    }
+
+    #[deprecated(since = "1.0.0", note = "use continuation_is_stopped_for_session instead")]
     pub fn continuation_is_stopped(&self) -> Result<bool> {
         Ok(self
             .read_continuation_state()?
             .is_some_and(|state| state.status == ContinuationStatus::Stopped))
     }
 
+    #[deprecated(since = "1.0.0", note = "use clear_continuation_stop_for_session instead")]
     pub fn clear_continuation_stop(&self) -> Result<()> {
         let path = self.continuation_state_path();
         if path.exists() {

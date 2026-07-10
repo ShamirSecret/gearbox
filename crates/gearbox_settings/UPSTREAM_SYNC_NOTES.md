@@ -309,7 +309,7 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 
 | Shared file | Gear-only behavior and upstream boundary |
 |---|---|
-| `crates/agent/src/agent.rs` | Gear sessions expose typed `ActionOutcome`/`SendOutcome`/`SteerOutcome`, route task commands through the shared `TaskManager`, and add Stop Continuation persistence plus continuation lifecycle events. Non-Gear agent behavior is unchanged. |
+| `[MOD]` `crates/agent/src/agent.rs` | Gear sessions expose typed `ActionOutcome`/`SendOutcome`/`SteerOutcome`, route task commands through the shared `TaskManager`, and add Stop Continuation persistence plus continuation lifecycle events. Continuation stop/restart → per-session state isolation: `read_continuation_state()` → `read_continuation_state_for_session()`, `clear_continuation_stop()` → `clear_continuation_stop_for_session()`. Non-Gear agent behavior is unchanged. |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` | Gear-only controls display structured rejection reasons and expose Stop Continuation, including while the continuation loop is idle; upstream conversation controls retain their existing paths. |
 
 The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear sessions. Internal upstream action names, ACP protocol identifiers, and non-Gear cancellation behavior remain unchanged.
