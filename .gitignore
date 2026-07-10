@@ -67,3 +67,4 @@ crates/docs_preprocessor/actions.json
 .factory/skills/openspec-*/
 openspec/
 .omo/
+.dogfood/

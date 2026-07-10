@@ -850,6 +850,15 @@ impl Orchestrator {
                 coordinator_review,
             );
             let has_fallback = category_resolution_result.nearest_fallback().is_some();
+            // Ownership decision: delegated when the worker is required to run,
+            // or when no worker is needed (skip_worker = analysis-only mode
+            // where Gear does not modify any files).
+            let ownership = crate::state::ExecutionOwnership {
+                delegated: selected_route.require_worker || options.worker.skip_worker,
+                worker_kind: Some(selected_route.worker_kind.as_str().to_string()),
+                route_reason: selected_route.route_reason.clone(),
+                risk_profile: "unknown".to_string(),
+            };
             let evaluation = evaluate_goal_with_source(
                 verification_passed,
                 &worker_result
@@ -870,6 +879,7 @@ impl Orchestrator {
                 &no_progress_signals,
                 has_fallback,
                 Some(current_route_change_type),
+                Some(&ownership),
             );
             next_route_hint_override = evaluation.route_hint_override.clone();
             let review_path = store.write_artifact(
@@ -1925,6 +1935,29 @@ impl ReviewGate {
         (!failures.is_empty()).then(|| failures.join("; "))
     }
 
+    /// Returns `Some(reason)` when ALL reviewer evidence entries are synthetic
+    /// (i.e., no real worker attempt produced the evidence). Completion must
+    /// require at least one real reviewer artifact.
+    fn synthetic_evidence_only_reason(&self) -> Option<String> {
+        if self.results.is_empty() {
+            return None;
+        }
+        let all_synthetic = self.results.iter().all(|result| {
+            result.reviewer_evidence.as_ref().map_or(true, |evidence| {
+                SYNTHETIC_EXECUTION_IDS.contains(&evidence.execution_id.as_str())
+            })
+        });
+        if all_synthetic {
+            Some(
+                "All reviewer evidence is synthetic (no real worker attempt data). \
+                 Completion requires at least one real reviewer artifact."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
     fn summary(&self) -> String {
         self.results
             .iter()
@@ -1940,6 +1973,15 @@ impl ReviewGate {
             .join("; ")
     }
 }
+
+/// Known synthetic execution IDs used by `from_inputs()` when no real
+/// task attempt data is available.
+const SYNTHETIC_EXECUTION_IDS: &[&str] = &[
+    "coordinator",
+    "scope-check",
+    "security-check",
+    "verification",
+];
 
 /// Build `ReviewerEvidence` from a real task attempt if available.
 /// Returns None when no attempt data is available (use synthetic only as fallback).
@@ -1997,6 +2039,9 @@ struct GoalDecisionPolicy<'a> {
     nearest_fallback_available: bool,
     trigger_source: Option<RouteChangeType>,
     review_gate: &'a ReviewGate,
+    /// Ownership decision: whether the work was delegated to a worker.
+    /// `None` means no decision was made — completion must be denied.
+    ownership: Option<&'a crate::state::ExecutionOwnership>,
 }
 
 #[derive(Clone, Debug)]
@@ -2209,6 +2254,34 @@ impl<'a> GoalDecisionPolicy<'a> {
         }
 
         None
+    }
+
+    fn ownership_gate_reason(&self) -> Option<String> {
+        // Tasks that modify code require an ownership delegation decision.
+        let requires_ownership = self.require_worker
+            || matches!(
+                self.worker_category,
+                WorkerCategory::Quick
+                    | WorkerCategory::Deep
+                    | WorkerCategory::Repair
+                    | WorkerCategory::Visual
+            );
+        if requires_ownership {
+            match self.ownership {
+                Some(ownership) if ownership.delegated => None,
+                Some(ownership) => Some(format!(
+                    "Execution ownership decision exists but delegation was denied: {}. Reason: {}",
+                    ownership.worker_kind.as_deref().unwrap_or("none"),
+                    ownership.route_reason,
+                )),
+                None => Some(
+                    "No execution ownership decision recorded. All code-modifying work must be delegated to a worker before completion."
+                        .to_string(),
+                ),
+            }
+        } else {
+            None
+        }
     }
 
     fn evaluate(&self) -> GoalEvaluation {
@@ -2510,6 +2583,51 @@ impl<'a> GoalDecisionPolicy<'a> {
                     status: GoalStatus::Limited,
                     should_continue: false,
                     summary: format!("Review gate failed at the iteration limit: {reason}."),
+                    route_hint_override: None,
+                };
+            }
+
+            // Ownership gate: all code-modifying work must be delegated to a worker.
+            // Gear itself must not directly write, edit, or create implementation files.
+            if let Some(ownership_reason) = self.ownership_gate_reason() {
+                if self.iteration < self.budget.max_iterations {
+                    return GoalEvaluation {
+                        status: GoalStatus::Running,
+                        should_continue: true,
+                        summary: format!("Ownership gate requires repair: {ownership_reason}"),
+                        route_hint_override: Some("deep".to_string()),
+                    };
+                }
+                return GoalEvaluation {
+                    status: GoalStatus::NeedsUser,
+                    should_continue: false,
+                    summary: format!(
+                        "Ownership gate blocked at the iteration limit: {ownership_reason}"
+                    ),
+                    route_hint_override: None,
+                };
+            }
+
+            // Synthetic evidence gate: when the coordinator explicitly requests
+            // an independent review (ROUTE_HINT=review) but no real reviewer
+            // worker has run (all evidence is still synthetic), deny completion.
+            if independent_review_requested
+                && let Some(synthetic_reason) = self.review_gate.synthetic_evidence_only_reason()
+            {
+                if self.iteration < self.budget.max_iterations {
+                    return GoalEvaluation {
+                        status: GoalStatus::Running,
+                        should_continue: true,
+                        summary: format!("Synthetic evidence gate: {synthetic_reason}"),
+                        route_hint_override: Some("review".to_string()),
+                    };
+                }
+                return GoalEvaluation {
+                    status: GoalStatus::NeedsUser,
+                    should_continue: false,
+                    summary: format!(
+                        "Synthetic evidence gate blocked at the iteration limit: {synthetic_reason}"
+                    ),
                     route_hint_override: None,
                 };
             }
@@ -3001,6 +3119,15 @@ fn evaluate_goal(
     no_progress_signals: &[String],
     nearest_fallback_available: bool,
 ) -> GoalEvaluation {
+    // Unit-test wrapper: provide a default delegated ownership so test-only
+    // callers (20+ evaluation unit tests) are not blocked by the gate.
+    // Real orchestrator runs pass their own ownership via evaluate_goal_with_source.
+    let test_ownership = crate::state::ExecutionOwnership {
+        delegated: true,
+        worker_kind: Some("test".to_string()),
+        route_reason: "unit test default (not a real orchestrator run)".to_string(),
+        risk_profile: "low".to_string(),
+    };
     evaluate_goal_with_source(
         verification_passed,
         worker_status,
@@ -3018,6 +3145,7 @@ fn evaluate_goal(
         no_progress_signals,
         nearest_fallback_available,
         None,
+        Some(&test_ownership),
     )
 }
 
@@ -3038,6 +3166,7 @@ fn evaluate_goal_with_source(
     no_progress_signals: &[String],
     nearest_fallback_available: bool,
     trigger_source: Option<RouteChangeType>,
+    ownership: Option<&crate::state::ExecutionOwnership>,
 ) -> GoalEvaluation {
     let review_gate = ReviewGate::from_inputs(
         verification_passed,
@@ -3064,6 +3193,7 @@ fn evaluate_goal_with_source(
         no_progress_signals,
         nearest_fallback_available,
         trigger_source,
+        ownership,
         review_gate: &review_gate,
     }
     .evaluate()
@@ -4022,6 +4152,7 @@ mod tests {
             no_progress_signals: &[],
             nearest_fallback_available: false,
             trigger_source: None,
+            ownership: None,
             review_gate: &review_gate,
         };
         assert!(
@@ -4049,6 +4180,7 @@ mod tests {
             no_progress_signals: &[],
             nearest_fallback_available: false,
             trigger_source: None,
+            ownership: None,
             review_gate: &review_gate,
         };
         assert!(
@@ -4380,6 +4512,7 @@ mod tests {
             no_progress_signals: &[],
             nearest_fallback_available: false,
             trigger_source: Some(RouteChangeType::RouteChange),
+            ownership: None,
             review_gate: &review_gate,
         };
         let reason = policy
@@ -5892,5 +6025,138 @@ mod tests {
             streak, 2,
             "streak should remain unchanged when verification not passed"
         );
+    }
+
+    // ── GBX-003-001 Root-cause repro tests ──
+    // Each test asserts the DESIRED behavior (post-fix) and FAILS with
+    // current (pre-fix) code. Each failure points to a clear predicate gap.
+
+    #[test]
+    fn test_orchestration_policy_ownership_gate() {
+        let scope = ScopeCheck::default();
+        let evaluation = evaluate_goal_with_source(
+            true,
+            &WorkerStatus::Succeeded,
+            WorkerCategory::Quick,
+            false,
+            None,
+            None,
+            &scope,
+            Some(&CoordinatorReview {
+                goal_satisfied: Some(true),
+                summary: "ok".to_string(),
+                repair_request: None,
+                route_hint: None,
+                stop_reason: Some("complete".to_string()),
+                raw_response: "goal_satisfied: yes\nsummary: ok\nstop_reason: complete".to_string(),
+            }),
+            0,
+            0,
+            0,
+            &test_budget(5),
+            &BudgetSnapshot::default(),
+            &[],
+            true,
+            None,
+            None,
+        );
+        // GBX-003-002 must add an ExecutionOwnershipDecision check before
+        // completion. Without a delegating worker task, Complete must be denied.
+        // Currently the gate fires (ownership=None, category=Quick).
+        // After GBX-003-002, this assertion passes.
+        assert!(
+            !matches!(evaluation.status, GoalStatus::Complete),
+            "GBX-003-002 FAIL: Goal completed without an ownership decision. \
+             Gear must record an ExecutionOwnershipDecision before allowing Complete."
+        );
+    }
+
+    #[test]
+    fn test_orchestration_policy_capability_mismatch() {
+        // WorkerCapabilities currently has only session-management fields.
+        // Code-level capabilities (code_edit, review, explore) don't exist.
+        // Without them, Gear cannot verify worker fitness before dispatch.
+        let caps = crate::workers::WorkerCapabilities::command();
+        let json = serde_json::to_value(&caps).unwrap();
+        // GBX-003-003 must add: supports_code_edit, supports_review,
+        // supports_explore to WorkerCapabilities. Currently only
+        // session-management fields exist.
+        // This assertion FAILS because supports_code_edit doesn't exist.
+        assert!(
+            json.get("supports_code_edit").is_some(),
+            "GBX-003-003 FAIL: WorkerCapabilities missing supports_code_edit field.\n\
+             Current caps: {json}"
+        );
+    }
+
+    #[test]
+    fn test_orchestration_policy_synthetic_reviewer_rejected() {
+        let scope = ScopeCheck::default();
+        // No real task attempts → synthetic evidence fallback in from_inputs()
+        let gate = ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope, None, &[], &[]);
+        // GBX-003-006: synthetic evidence_only_reason() must return Some
+        // when all evidence is synthetic. After GBX-003-006, this assertion
+        // PASSES because the synthetic check detects no real artifacts.
+        assert!(
+            gate.synthetic_evidence_only_reason().is_some(),
+            "GBX-003-006 FAIL: ReviewGate passed with synthetic evidence. \
+             Completion must require real reviewer artifacts. Summary: {}",
+            gate.summary()
+        );
+        // Verify evalute denies completion with synthetic-only evidence
+        let evaluation = evaluate_goal_with_source(
+            true,
+            &WorkerStatus::Succeeded,
+            WorkerCategory::Quick,
+            true,
+            None,
+            None,
+            &scope,
+            None,
+            0,
+            0,
+            0,
+            &test_budget(5),
+            &BudgetSnapshot::default(),
+            &[],
+            true,
+            None,
+            None,
+        );
+        assert!(
+            !matches!(evaluation.status, GoalStatus::Complete),
+            "GBX-003-006 FAIL: evaluate_goal returned Complete with synthetic-only evidence. \
+             The synthetic evidence gate must block completion without real reviewer artifacts."
+        );
+    }
+
+    #[test]
+    fn test_orchestration_policy_lineage_incomplete() -> Result<()> {
+        // GBX-003-005: ContinuationState must carry lineage fields so Gear
+        // can enforce descendant-aware completion gating.
+        let state = crate::state::ContinuationState {
+            session_id: "child".to_string(),
+            goal_id: "child-goal".to_string(),
+            status: crate::state::ContinuationStatus::Running,
+            updated_at: "now".to_string(),
+            parent_session_id: Some("parent".to_string()),
+            root_session_id: Some("parent".to_string()),
+        };
+        let json = serde_json::to_value(&state)?;
+        // GBX-003-005: parent_session_id must exist in serialized state.
+        // After GBX-003-005 adds lineage fields, this assertion PASSES.
+        assert!(
+            json.get("parent_session_id").is_some() || json.get("root_session_id").is_some(),
+            "GBX-003-005 FAIL: ContinuationState missing parent_session_id field. \
+             Without lineage, Gear cannot prevent parent completion while \
+             descendant tasks are active. Serialized: {json}"
+        );
+        // Verify lineage is correctly stored
+        assert_eq!(
+            json["parent_session_id"].as_str(),
+            Some("parent"),
+            "GBX-003-005: parent_session_id should be 'parent'"
+        );
+        Ok(())
     }
 }

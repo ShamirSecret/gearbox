@@ -40,6 +40,48 @@ pub struct ContinuationState {
     pub goal_id: String,
     pub status: ContinuationStatus,
     pub updated_at: String,
+    /// The parent session that spawned this work, if any.
+    /// Used to enforce lineage-based completion gating:
+    /// ancestor sessions cannot complete while descendant work is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// The root orchestrator session for this work tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<String>,
+}
+
+/// Gear-owned work lineage that tracks the hierarchy of related sessions.
+/// Written to `.gearbox-agent/continuation/<root-session>/lineage.json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkLineage {
+    /// Root orchestrator session that started this work tree.
+    pub root_session_id: String,
+    /// All orchestrator sessions in this work tree (may have multiple after restart).
+    pub orchestrator_session_ids: Vec<String>,
+    /// Worker session IDs spawned by the orchestrator(s).
+    pub worker_session_ids: Vec<String>,
+    /// Number of plan items remaining.
+    pub plan_remaining_items: usize,
+    /// Active (non-terminal) task IDs.
+    pub active_task_ids: Vec<String>,
+    /// Overall continuation status for this work tree.
+    pub status: ContinuationStatus,
+    /// When this lineage record was last updated.
+    pub updated_at: String,
+}
+
+impl WorkLineage {
+    pub fn new(root_session_id: String) -> Self {
+        Self {
+            root_session_id: root_session_id.clone(),
+            orchestrator_session_ids: vec![root_session_id],
+            worker_session_ids: Vec::new(),
+            plan_remaining_items: 0,
+            active_task_ids: Vec::new(),
+            status: ContinuationStatus::Running,
+            updated_at: timestamp(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +89,24 @@ pub struct CoordinatorModel {
     pub provider_id: String,
     pub model_id: String,
     pub name: String,
+}
+
+/// Ownership decision for execution: was the implementation delegated
+/// to a worker, or was it attempted directly by Gear?
+///
+/// All code-modifying tasks must produce a `delegated: true` decision
+/// before Gear may mark the goal Complete. The `route_reason` explains
+/// why a particular worker (or no worker) was selected.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionOwnership {
+    /// Whether execution was delegated to a worker.
+    pub delegated: bool,
+    /// The selected worker kind, if delegated.
+    pub worker_kind: Option<String>,
+    /// Why this ownership decision was made.
+    pub route_reason: String,
+    /// Risk profile used for routing: "low", "medium", "high", or "unknown".
+    pub risk_profile: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +388,32 @@ impl StateStore {
         self.root.join("continuation")
     }
 
+    pub fn lineage_dir(&self) -> PathBuf {
+        self.root.join("continuation").join("lineage")
+    }
+
+    pub fn lineage_path(&self, root_session_id: &str) -> PathBuf {
+        self.lineage_dir().join(format!("{root_session_id}.json"))
+    }
+
+    pub fn write_lineage(&self, lineage: &WorkLineage) -> Result<PathBuf> {
+        let path = self.lineage_path(&lineage.root_session_id);
+        write_json(&path, lineage)?;
+        Ok(path)
+    }
+
+    pub fn read_lineage(&self, root_session_id: &str) -> Result<Option<WorkLineage>> {
+        let path = self.lineage_path(root_session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse {}", path.display()),
+        )?))
+    }
+
     /// Per-session continuation state path: `.gearbox-agent/continuation/{session_id}/state.json`
     pub fn continuation_state_path_for_session(&self, session_id: &str) -> PathBuf {
         self.continuation_dir().join(session_id).join("state.json")
@@ -361,6 +447,8 @@ impl StateStore {
             goal_id: goal_id.to_string(),
             status,
             updated_at: timestamp(),
+            parent_session_id: None,
+            root_session_id: None,
         };
         let path = self.continuation_state_path_for_session(session_id);
         write_json(&path, &state)?;

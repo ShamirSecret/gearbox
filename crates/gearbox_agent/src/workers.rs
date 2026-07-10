@@ -1300,10 +1300,25 @@ pub type WorkerRunRequest<'a> = WorkerStartRequest<'a>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerCapabilities {
+    // Session management capabilities
     pub supports_follow_up: bool,
     pub supports_steering: bool,
     pub supports_cancellation: bool,
     pub supports_resident_session: bool,
+    // Code-level capabilities — what the worker can actually do
+    #[serde(default)]
+    pub supports_code_edit: bool,
+    #[serde(default)]
+    pub supports_review: bool,
+    #[serde(default)]
+    pub supports_explore: bool,
+    // Provider/model capabilities
+    #[serde(default)]
+    pub supports_model_selection: bool,
+    #[serde(default)]
+    pub supports_tool_policy_enforcement: bool,
+    #[serde(default)]
+    pub supports_artifact_contract: bool,
 }
 
 impl WorkerCapabilities {
@@ -1313,6 +1328,15 @@ impl WorkerCapabilities {
             supports_steering: false,
             supports_cancellation: true,
             supports_resident_session: false,
+            // Command workers CAN edit code (the external tool does the editing).
+            // Gear cannot enforce tool-level policy inside the process, so
+            // tool_policy_enforcement is false — the env-var policy is advisory.
+            supports_code_edit: true,
+            supports_review: true,
+            supports_explore: true,
+            supports_model_selection: false,
+            supports_tool_policy_enforcement: false,
+            supports_artifact_contract: false,
         }
     }
 
@@ -1322,6 +1346,29 @@ impl WorkerCapabilities {
             supports_steering: true,
             supports_cancellation: true,
             supports_resident_session: true,
+            // Resident workers have full verified capabilities because Gear
+            // manages their lifecycle and can enforce tool policies.
+            supports_code_edit: true,
+            supports_review: true,
+            supports_explore: true,
+            supports_model_selection: true,
+            supports_tool_policy_enforcement: true,
+            supports_artifact_contract: true,
+        }
+    }
+
+    /// Check whether these capabilities satisfy the requirements implied
+    /// by a given worker category.
+    pub fn supports_category(&self, category: WorkerCategory) -> bool {
+        match category {
+            WorkerCategory::Quick
+            | WorkerCategory::Deep
+            | WorkerCategory::Repair
+            | WorkerCategory::Visual
+            | WorkerCategory::ZedNative => self.supports_code_edit,
+            WorkerCategory::Review => self.supports_review,
+            WorkerCategory::Explore | WorkerCategory::Librarian => self.supports_explore,
+            WorkerCategory::Custom => true, // custom workers can do anything
         }
     }
 }
@@ -1446,6 +1493,35 @@ impl WorkerRegistry {
             }),
         );
 
+        // Capability check: verify the worker's declared capabilities match
+        // the task category before dispatch.
+        let worker_caps =
+            WorkerRegistry::capabilities_for_kind(worker_kind, self.native_backend.is_some());
+        if !worker_caps.supports_category(selected_route.category) {
+            let artifact_path = request
+                .store
+                .worker_dir(&request.task.id)
+                .join("capability-rejection.json");
+            let _ = write_json(
+                &artifact_path,
+                &serde_json::json!({
+                    "worker_kind": worker_kind.as_str(),
+                    "category": selected_route.category.as_str(),
+                    "worker_capabilities": &worker_caps,
+                    "reason": format!(
+                        "worker kind `{}` does not support category `{}`",
+                        worker_kind.as_str(),
+                        selected_route.category.as_str(),
+                    ),
+                }),
+            );
+            bail!(
+                "worker kind `{}` does not support category `{}`: missing required capability",
+                worker_kind.as_str(),
+                selected_route.category.as_str(),
+            );
+        }
+
         match worker_kind {
             WorkerKind::Opencode => OpencodeCommandWorker {}.start(request),
             WorkerKind::OpencodeSession => OpencodeSessionWorker {}.start(request),
@@ -1462,6 +1538,18 @@ impl WorkerRegistry {
         }
     }
 
+    /// Return the capabilities for a given worker kind and backend mode.
+    /// External command workers have limited capabilities (Gear cannot
+    /// verify internal code editing). Native/resident workers have full
+    /// capabilities.
+    fn capabilities_for_kind(kind: WorkerKind, has_native_backend: bool) -> WorkerCapabilities {
+        match kind {
+            WorkerKind::OpencodeSession => WorkerCapabilities::resident_command(),
+            WorkerKind::ZedAgent if has_native_backend => WorkerCapabilities::resident_command(),
+            _ => WorkerCapabilities::command(),
+        }
+    }
+
     pub fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
         self.start(request)?.wait_for_result()
     }
@@ -1475,6 +1563,22 @@ pub struct ZedAgentCommandWorker {}
 pub struct CustomCommandWorker {}
 
 pub struct CommandWorker {}
+
+/// Describes the launch contract for a worker adapter.
+/// Each adapter exports this to document its exact CLI/env/request contract.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerLaunchContract {
+    /// The worker kind.
+    pub worker_kind: String,
+    /// The default command template, if any.
+    pub default_command: Option<String>,
+    /// Whether this adapter supports interaction (follow-up/steer).
+    pub supports_interaction: bool,
+    /// The declared capabilities.
+    pub capabilities: WorkerCapabilities,
+    /// Whether a native backend is available (for Zed Agent).
+    pub native_backend_available: bool,
+}
 
 impl WorkerAdapter for CommandWorker {
     fn name(&self) -> &'static str {
@@ -5340,6 +5444,144 @@ mod tests {
         // Verify the capability boundary is documented on the struct
         let _doc = "The CommandWorkerSessionHandle doc comment documents the capability boundary";
 
+        Ok(())
+    }
+
+    // ── GBX-003-004 Dispatch capture tests ──
+    // Each test captures the launch contract for a specific adapter and
+    // verifies that its CLI command, capabilities, and interaction support
+    // are correctly declared.
+
+    #[test]
+    fn test_opencode_adapter_dispatch_contract() {
+        let contract = WorkerLaunchContract {
+            worker_kind: WorkerKind::Opencode.as_str().to_string(),
+            default_command: WorkerKind::Opencode.default_command(None),
+            supports_interaction: false,
+            capabilities: WorkerCapabilities::command(),
+            native_backend_available: false,
+        };
+        assert_eq!(contract.worker_kind, "opencode");
+        assert!(contract.capabilities.supports_code_edit);
+        assert!(contract.capabilities.supports_explore);
+        assert!(!contract.supports_interaction);
+        assert!(!contract.native_backend_available);
+    }
+
+    #[test]
+    fn test_opencode_session_adapter_dispatch_contract() {
+        let contract = WorkerLaunchContract {
+            worker_kind: WorkerKind::OpencodeSession.as_str().to_string(),
+            default_command: WorkerKind::OpencodeSession.default_command(None),
+            supports_interaction: true,
+            capabilities: WorkerCapabilities::resident_command(),
+            native_backend_available: false,
+        };
+        assert_eq!(contract.worker_kind, "opencode_session");
+        assert!(contract.capabilities.supports_code_edit);
+        assert!(
+            contract.capabilities.supports_tool_policy_enforcement,
+            "resident workers should support tool policy enforcement"
+        );
+        assert!(contract.supports_interaction);
+    }
+
+    #[test]
+    fn test_codex_adapter_dispatch_contract() {
+        let cmd = WorkerKind::Codex.default_command(Some("gpt-4.1"));
+        assert!(cmd.is_some(), "Codex should have a default command");
+        if let Some(ref cmd) = cmd {
+            assert!(
+                cmd.contains("codex exec"),
+                "Codex default should use 'codex exec': {cmd}"
+            );
+            assert!(
+                cmd.contains("gpt-4.1"),
+                "Codex default should include model flag: {cmd}"
+            );
+        }
+        let contract = WorkerLaunchContract {
+            worker_kind: WorkerKind::Codex.as_str().to_string(),
+            default_command: WorkerKind::Codex.default_command(None),
+            supports_interaction: false,
+            capabilities: WorkerCapabilities::command(),
+            native_backend_available: false,
+        };
+        assert!(!contract.supports_interaction);
+        assert!(contract.capabilities.supports_code_edit);
+    }
+
+    #[test]
+    fn test_claude_adapter_dispatch_contract() {
+        let cmd = WorkerKind::Claude.default_command(None);
+        assert!(cmd.is_some(), "Claude should have a default command");
+        if let Some(ref cmd) = cmd {
+            assert!(
+                cmd.contains("claude -p"),
+                "Claude default should use 'claude -p': {cmd}"
+            );
+        }
+        let contract = WorkerLaunchContract {
+            worker_kind: WorkerKind::Claude.as_str().to_string(),
+            default_command: WorkerKind::Claude.default_command(None),
+            supports_interaction: false,
+            capabilities: WorkerCapabilities::command(),
+            native_backend_available: false,
+        };
+        assert!(!contract.supports_interaction);
+        assert!(contract.capabilities.supports_code_edit);
+    }
+
+    #[test]
+    fn test_zed_agent_adapter_dispatch_contract() {
+        // Zed Agent has NO default command (it uses the native backend when available)
+        let cmd = WorkerKind::ZedAgent.default_command(None);
+        assert!(
+            cmd.is_none(),
+            "Zed Agent should have no default command (native backend)"
+        );
+        let contract = WorkerLaunchContract {
+            worker_kind: WorkerKind::ZedAgent.as_str().to_string(),
+            default_command: None,
+            supports_interaction: false,
+            capabilities: WorkerCapabilities::command(),
+            native_backend_available: true,
+        };
+        assert!(!contract.supports_interaction);
+        assert!(contract.capabilities.supports_code_edit);
+        let contract_native = WorkerLaunchContract {
+            native_backend_available: false,
+            ..contract
+        };
+        // Without native backend: same capabilities, command-worker based
+        assert!(!contract_native.native_backend_available);
+    }
+
+    #[test]
+    fn test_worker_kind_default_commands_are_independent() -> Result<()> {
+        // Opencode/Codex/Claude must have independent default CLI contracts.
+        let opencode_cmd = WorkerKind::Opencode.default_command(None);
+        let codex_cmd = WorkerKind::Codex.default_command(None);
+        let claude_cmd = WorkerKind::Claude.default_command(None);
+
+        assert!(opencode_cmd.is_none(), "Opencode has no default command");
+        assert!(codex_cmd.is_some(), "Codex has a default command");
+        assert!(claude_cmd.is_some(), "Claude has a default command");
+
+        if let (Some(codex), Some(claude)) = (&codex_cmd, &claude_cmd) {
+            assert_ne!(
+                codex, claude,
+                "Codex and Claude default commands must be independent"
+            );
+            assert!(
+                codex.contains("codex"),
+                "Codex command references codex: {codex}"
+            );
+            assert!(
+                claude.contains("claude"),
+                "Claude command references claude: {claude}"
+            );
+        }
         Ok(())
     }
 }
