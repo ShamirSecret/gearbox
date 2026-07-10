@@ -626,6 +626,23 @@ impl Orchestrator {
             lineage.updated_at = timestamp();
             store.write_lineage(&lineage)?;
 
+            // If this was a review iteration, complete the pending review task
+            // from the previous iteration that triggered this review.
+            if worker_route_hint == Some("review") && iteration > 1 {
+                let prev_review_id = review_task_id(iteration - 1);
+                if let Some(review_task) = tasks.iter_mut().find(|t| t.id == prev_review_id) {
+                    review_task.status = TaskStatus::Complete;
+                    review_task.assigned_worker =
+                        Some(selected_route.worker_kind.as_str().to_string());
+                    review_task.outputs.evidence.push(
+                        iteration_worker_result
+                            .outcome_path
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+            }
+
             append_event(
                 &store,
                 &options.event_sink,
@@ -910,6 +927,7 @@ impl Orchestrator {
                 Some(current_route_change_type),
                 Some(&ownership),
                 None,
+                &worker_task_record.attempts,
             );
             next_route_hint_override = evaluation.route_hint_override.clone();
             let review_path = store.write_artifact(
@@ -970,6 +988,7 @@ impl Orchestrator {
                 &evaluation.summary,
                 Some(worker_task_id.clone()),
                 repair_request_path.as_deref(),
+                selected_route.worker_kind.as_str(),
             );
             store.write_tasks(&goal_id, &tasks)?;
             append_event(
@@ -1728,6 +1747,7 @@ fn add_review_task(
     summary: &str,
     parent_task_id: Option<String>,
     repair_request_path: Option<&std::path::Path>,
+    worker_kind: &str,
 ) {
     let mut evidence = vec![review_path.to_string_lossy().to_string()];
     if let Some(repair_request_path) = repair_request_path {
@@ -1739,8 +1759,8 @@ fn add_review_task(
         parent_task_id,
         title: format!("Review goal after iteration {iteration}"),
         kind: TaskKind::Review,
-        status: TaskStatus::Complete,
-        assigned_worker: None,
+        status: TaskStatus::Pending,
+        assigned_worker: Some(worker_kind.to_string()),
         attempt: iteration,
         scope: scope.clone(),
         inputs: TaskInputs::default(),
@@ -1846,55 +1866,15 @@ impl ReviewGate {
         let comment_check_clean = !context_risk_signals
             .iter()
             .any(|signal| signal.starts_with("comment_check:"));
-        // Use real attempt data when available; fall back to synthetic with proper labels.
+        // Use real attempt data when available; None when no real reviewer ran.
         let goal_verification_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::GoalVerification, task_attempts)
-                .unwrap_or_else(|| ReviewerEvidence {
-                    execution_id: "coordinator".to_string(),
-                    route: "coordinator".to_string(),
-                    artifact_path: None,
-                    verdict: if verification_passed && goal_satisfied {
-                        "pass".to_string()
-                    } else {
-                        "fail".to_string()
-                    },
-                });
+            reviewer_evidence_from_attempt(ReviewDimension::GoalVerification, task_attempts);
         let code_quality_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::CodeQuality, task_attempts)
-                .unwrap_or_else(|| ReviewerEvidence {
-                    execution_id: "scope-check".to_string(),
-                    route: "scope-check".to_string(),
-                    artifact_path: None,
-                    verdict: if scope_clean && comment_check_clean {
-                        "pass".to_string()
-                    } else {
-                        "fail".to_string()
-                    },
-                });
+            reviewer_evidence_from_attempt(ReviewDimension::CodeQuality, task_attempts);
         let security_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::Security, task_attempts)
-                .unwrap_or_else(|| ReviewerEvidence {
-                    execution_id: "security-check".to_string(),
-                    route: "security-check".to_string(),
-                    artifact_path: None,
-                    verdict: if scope_check.forbidden_touches.is_empty() {
-                        "pass".to_string()
-                    } else {
-                        "fail".to_string()
-                    },
-                });
+            reviewer_evidence_from_attempt(ReviewDimension::Security, task_attempts);
         let qa_execution_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::QaExecution, task_attempts)
-                .unwrap_or_else(|| ReviewerEvidence {
-                    execution_id: "verification".to_string(),
-                    route: "verification".to_string(),
-                    artifact_path: None,
-                    verdict: if verification_passed {
-                        "pass".to_string()
-                    } else {
-                        "fail".to_string()
-                    },
-                });
+            reviewer_evidence_from_attempt(ReviewDimension::QaExecution, task_attempts);
         Self {
             require_all_pass: review_required,
             results: vec![
@@ -1906,7 +1886,7 @@ impl ReviewGate {
                     } else {
                         "verification or coordinator goal acceptance failed".to_string()
                     },
-                    reviewer_evidence: Some(goal_verification_evidence),
+                    reviewer_evidence: goal_verification_evidence,
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::CodeQuality,
@@ -1923,7 +1903,7 @@ impl ReviewGate {
                             "scope checks are not clean".to_string()
                         }
                     },
-                    reviewer_evidence: Some(code_quality_evidence),
+                    reviewer_evidence: code_quality_evidence,
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::Security,
@@ -1936,7 +1916,7 @@ impl ReviewGate {
                             scope_check.forbidden_touches.join(", ")
                         )
                     },
-                    reviewer_evidence: Some(security_evidence),
+                    reviewer_evidence: security_evidence,
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::QaExecution,
@@ -1946,7 +1926,7 @@ impl ReviewGate {
                     } else {
                         "one or more verification commands failed".to_string()
                     },
-                    reviewer_evidence: Some(qa_execution_evidence),
+                    reviewer_evidence: qa_execution_evidence,
                 },
             ],
         }
@@ -1965,9 +1945,9 @@ impl ReviewGate {
         (!failures.is_empty()).then(|| failures.join("; "))
     }
 
-    /// Returns `Some(reason)` when ALL reviewer evidence entries are synthetic
-    /// (i.e., no real worker attempt produced the evidence). Completion must
-    /// require at least one real reviewer artifact.
+    /// Returns `Some(reason)` when ALL reviewer evidence entries are None
+    /// or synthetic (no real worker attempt produced the evidence). Completion
+    /// requires at least one real reviewer artifact.
     fn synthetic_evidence_only_reason(&self) -> Option<String> {
         if self.results.is_empty() {
             return None;
@@ -1979,7 +1959,7 @@ impl ReviewGate {
         });
         if all_synthetic {
             Some(
-                "All reviewer evidence is synthetic (no real worker attempt data). \
+                "No real reviewer evidence available. \
                  Completion requires at least one real reviewer artifact."
                     .to_string(),
             )
@@ -2026,7 +2006,9 @@ fn reviewer_evidence_from_attempt(
         .clone()
         .or_else(|| last_attempt.outcome_path.clone());
     Some(ReviewerEvidence {
-        execution_id,
+        // Suffix with dimension label so each dimension gets a unique
+        // execution_id even when all evidence derives from the same worker attempt.
+        execution_id: format!("{}_{}", execution_id, dimension.label()),
         route: dimension.label().to_string(),
         artifact_path: artifact_path.map(|p| p.to_string_lossy().to_string()),
         verdict: "pass".to_string(),
@@ -2682,12 +2664,8 @@ impl<'a> GoalDecisionPolicy<'a> {
                 };
             }
 
-            // Synthetic evidence gate: when the coordinator explicitly requests
-            // an independent review (ROUTE_HINT=review) but no real reviewer
-            // worker has run (all evidence is still synthetic), deny completion.
-            if independent_review_requested
-                && let Some(synthetic_reason) = self.review_gate.synthetic_evidence_only_reason()
-            {
+            // Synthetic evidence gate — always check, not only when review is requested.
+            if let Some(synthetic_reason) = self.review_gate.synthetic_evidence_only_reason() {
                 if self.iteration < self.budget.max_iterations {
                     return GoalEvaluation {
                         status: GoalStatus::Running,
@@ -3196,6 +3174,7 @@ fn evaluate_goal_with_source(
     trigger_source: Option<RouteChangeType>,
     ownership: Option<&crate::state::ExecutionOwnership>,
     lineage: Option<&WorkLineage>,
+    task_attempts: &[TaskAttempt],
 ) -> GoalEvaluation {
     let review_gate = ReviewGate::from_inputs(
         verification_passed,
@@ -3203,7 +3182,7 @@ fn evaluate_goal_with_source(
         scope_check,
         coordinator_review,
         &budget_snapshot.context_risk_signals,
-        &[],
+        task_attempts,
     );
     GoalDecisionPolicy {
         verification_passed,
@@ -3655,6 +3634,28 @@ mod tests {
         }
     }
 
+    fn mock_task_attempt() -> TaskAttempt {
+        TaskAttempt {
+            attempt: 1,
+            worker_kind: "test-worker".to_string(),
+            worker_command: None,
+            worker_model: None,
+            worker_category: "test".to_string(),
+            route_hint: None,
+            route_reason: "test".to_string(),
+            status: crate::task_manager::TaskAttemptStatus::Completed,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            finished_at: Some("2024-01-01T00:01:00Z".to_string()),
+            session_id: Some("test-reviewer-session".to_string()),
+            result_path: None,
+            outcome_path: None,
+            summary: "Mock task attempt".to_string(),
+            failure_kind: None,
+            retry_reason: None,
+            error: None,
+        }
+    }
+
     #[test]
     fn run_creates_ledger_artifacts_and_verification() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -3793,6 +3794,7 @@ mod tests {
                 decided_at: crate::state::timestamp(),
             }),
             None,
+            &[mock_task_attempt()],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Complete);
@@ -3832,6 +3834,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3869,6 +3872,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3908,6 +3912,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3946,6 +3951,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3985,6 +3991,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4027,6 +4034,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4057,6 +4065,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4086,6 +4095,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4124,6 +4134,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4153,6 +4164,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4182,6 +4194,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4532,6 +4545,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
         assert!(first_evaluation.should_continue);
 
@@ -4558,6 +4572,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
         assert_eq!(second_evaluation.status, GoalStatus::Limited);
         assert!(!second_evaluation.should_continue);
@@ -4811,6 +4826,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4849,6 +4865,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -5053,6 +5070,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5090,6 +5108,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5121,6 +5140,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5163,6 +5183,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -5191,6 +5212,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -6043,6 +6065,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
         assert_eq!(evaluation.status, GoalStatus::Limited);
         assert!(evaluation.summary.contains("file change limit"));
@@ -6076,6 +6099,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
         assert_eq!(evaluation.status, GoalStatus::Running);
         assert!(evaluation.should_continue);
@@ -6178,6 +6202,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
         // GBX-003-002 must add an ExecutionOwnershipDecision check before
         // completion. Without a delegating worker task, Complete must be denied.
@@ -6242,6 +6267,7 @@ mod tests {
             None,
             None,
             None,
+        &[],
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
@@ -6314,6 +6340,7 @@ mod tests {
             None,
             Some(&ownership),
             None,
+        &[],
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
@@ -6380,6 +6407,7 @@ mod tests {
             0, 0, 1, &budget, &BudgetSnapshot::default(),
             &[], false, None, Some(&ownership),
             Some(&lineage),
+        &[],
         );
         // Lineage has active tasks → must NOT be Complete
         assert!(
@@ -6430,6 +6458,7 @@ mod tests {
             0, 0, 1, &budget, &BudgetSnapshot::default(),
             &[], false, None, Some(&ownership),
             None,
+        &[],
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),

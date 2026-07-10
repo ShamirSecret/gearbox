@@ -3819,7 +3819,8 @@ fn transition_task_record(
                 record.failure_kind = None;
                 record.retry_reason = None;
                 record.error = None;
-                record.session_id = session_id;
+                record.session_id = session_id
+                    .or_else(|| Some(format!("{}_session", record.task_id)));
                 apply_attempt_status(record, TaskAttemptStatus::Running);
                 true
             }
