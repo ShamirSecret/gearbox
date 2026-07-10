@@ -4946,6 +4946,7 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
             worker: route.worker_kind.as_str().to_string(),
             worker_model: route.worker_model.map(ToString::to_string),
             variant: route.variant.clone(),
+            variant_applied: route.variant.clone(),
             prompt_append: route.prompt_append.clone(),
             tools: route.tools.clone(),
             category_resolution,

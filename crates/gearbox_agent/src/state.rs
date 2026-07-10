@@ -536,7 +536,7 @@ pub fn event(
     }
 }
 
-fn write_json<T>(path: &Path, value: &T) -> Result<()>
+pub fn write_json<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize + ?Sized,
 {
