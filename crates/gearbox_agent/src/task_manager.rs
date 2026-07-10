@@ -74,6 +74,8 @@ pub enum ActionOutcome {
     NotContinuable,
     /// No matching task found
     Noop,
+    /// The caller is outside the task's session scope.
+    ScopeDenied { reason: String },
 }
 
 impl ActionOutcome {
@@ -84,6 +86,21 @@ impl ActionOutcome {
     pub fn is_cancel_applied(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::NotContinuable => Some("task is not continuable".to_string()),
+            Self::ScopeDenied { reason } => Some(reason.clone()),
+            Self::Noop => Some("no managed task is active".to_string()),
+            Self::Cancelled | Self::Interrupted => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskCommandContext {
+    pub caller_session_id: Option<String>,
+    pub all_scope: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,6 +148,15 @@ impl SendOutcome {
     pub fn is_accepted(&self) -> bool {
         matches!(self, Self::Sent | Self::Queued | Self::Revive)
     }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::NotContinuable => Some("task is not continuable".to_string()),
+            Self::ScopeDenied { reason } | Self::NotFound { reason } => Some(reason.clone()),
+            Self::Noop => Some("no managed task is active".to_string()),
+            Self::Sent | Self::Queued | Self::Revive => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +180,15 @@ pub enum SteerOutcome {
 impl SteerOutcome {
     pub fn is_accepted(&self) -> bool {
         matches!(self, Self::Steered | Self::Queued | Self::Revive)
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::NotContinuable => Some("task is not continuable".to_string()),
+            Self::ScopeDenied { reason } | Self::NotFound { reason } => Some(reason.clone()),
+            Self::Noop => Some("no managed task is active".to_string()),
+            Self::Steered | Self::Queued | Self::Revive => None,
+        }
     }
 }
 
@@ -331,6 +366,18 @@ pub struct TaskLifecycleEvent {
     pub previous_residency_state: Option<ResidencyState>,
     pub run_epoch: u64,
     pub summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TaskCommandEvent {
+    task_id: String,
+    action: String,
+    accepted: bool,
+    all_scope: bool,
+    caller_session_id: Option<String>,
+    reason: Option<String>,
+    run_epoch: u64,
+    timestamp: String,
 }
 
 #[derive(Clone, Debug)]
@@ -583,6 +630,14 @@ struct ResidentTask {
     queued_task: QueuedTask,
 }
 
+#[derive(Clone, Debug)]
+struct PendingRevive {
+    task_id: String,
+    message: String,
+    kind: QueuedMessageKind,
+    caller_session_id: Option<String>,
+}
+
 struct FinishedTaskMessage {
     task_id: String,
     running_task: RunningTask,
@@ -631,6 +686,34 @@ fn messageability_for_record(record: &TaskRecord) -> Messageability {
             reason: "task was skipped".to_string(),
         },
     }
+}
+
+fn task_scope_allows(record: &TaskRecord, context: &TaskCommandContext) -> bool {
+    if context.all_scope || context.caller_session_id.is_none() {
+        return true;
+    }
+    let caller_session_id = context.caller_session_id.as_deref();
+    [
+        record.parent_session_id.as_deref(),
+        record.root_session_id.as_deref(),
+        record.session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|owner| Some(owner) == caller_session_id)
+}
+
+fn scope_denied_reason(record: &TaskRecord, _context: &TaskCommandContext) -> String {
+    let owner = record
+        .parent_session_id
+        .as_deref()
+        .or(record.root_session_id.as_deref())
+        .or(record.session_id.as_deref())
+        .unwrap_or("unknown");
+    format!(
+        "task `{}` belongs to session `{owner}` and cannot be controlled by the caller",
+        record.task_id
+    )
 }
 
 fn continuation_hint_for_record(record: &TaskRecord) -> String {
@@ -771,6 +854,7 @@ impl TaskManagerControl {
         task_id: &str,
         kind: QueuedMessageKind,
         message: String,
+        caller_session_id: Option<String>,
     ) -> Result<()> {
         self.pending_messages
             .lock()
@@ -780,7 +864,7 @@ impl TaskManagerControl {
             .push_back(QueuedMessage {
                 kind,
                 message,
-                caller_session_id: Some(task_id.to_string()),
+                caller_session_id,
                 created_at: timestamp(),
             });
         Ok(())
@@ -793,6 +877,22 @@ impl TaskManagerControl {
             .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
             .remove(task_id)
             .unwrap_or_default())
+    }
+
+    fn prepend_pending_messages(
+        &self,
+        task_id: &str,
+        messages: VecDeque<QueuedMessage>,
+    ) -> Result<()> {
+        let mut pending_messages = self
+            .pending_messages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
+        let queue = pending_messages.entry(task_id.to_string()).or_default();
+        for message in messages.into_iter().rev() {
+            queue.push_front(message);
+        }
+        Ok(())
     }
 
     pub fn send_follow_up_current_task(&self, prompt: String) -> Result<SendOutcome> {
@@ -818,12 +918,12 @@ impl TaskManagerControl {
             return Ok(ActionOutcome::NotContinuable);
         }
 
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .cancel()?;
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
         Ok(ActionOutcome::Cancelled)
     }
 
@@ -836,13 +936,13 @@ impl TaskManagerControl {
             return Ok(ActionOutcome::NotContinuable);
         }
 
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .interrupt()?;
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
-        Ok(ActionOutcome::Cancelled)
+        Ok(ActionOutcome::Interrupted)
     }
 
     pub fn cancel_task(&self, task_id: &str) -> Result<ActionOutcome> {
@@ -857,12 +957,12 @@ impl TaskManagerControl {
             return Ok(ActionOutcome::NotContinuable);
         }
 
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .cancel()?;
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
         Ok(ActionOutcome::Cancelled)
     }
 
@@ -878,13 +978,13 @@ impl TaskManagerControl {
             return Ok(ActionOutcome::NotContinuable);
         }
 
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
         current_task
             .handle
             .as_ref()
             .context("running task missing handle")?
             .interrupt()?;
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
-        Ok(ActionOutcome::Cancelled)
+        Ok(ActionOutcome::Interrupted)
     }
 
     pub fn send_follow_up_task(&self, task_id: &str, prompt: String) -> Result<SendOutcome> {
@@ -901,7 +1001,7 @@ impl TaskManagerControl {
 
         match current_task.status {
             ManagedTaskStatus::Pending => {
-                self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt)?;
+                self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt, None)?;
                 Ok(SendOutcome::Queued)
             }
             ManagedTaskStatus::Running => {
@@ -932,7 +1032,7 @@ impl TaskManagerControl {
 
         match current_task.status {
             ManagedTaskStatus::Pending => {
-                self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt)?;
+                self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt, None)?;
                 Ok(SteerOutcome::Queued)
             }
             ManagedTaskStatus::Running => {
@@ -989,6 +1089,7 @@ pub struct TaskManager {
     running_tasks: HashMap<String, RunningTask>,
     resident_tasks: HashMap<String, ResidentTask>,
     queued_tasks: VecDeque<QueuedTask>,
+    pending_revives: VecDeque<PendingRevive>,
     completed_runs: HashMap<String, ManagedWorkerRun>,
     completed_errors: HashMap<String, String>,
     completed_archive: VecDeque<TaskRecord>,
@@ -996,6 +1097,7 @@ pub struct TaskManager {
     release_guard: ReleaseGuard,
     runtime_policy: TaskRuntimePolicy,
     control: TaskManagerControl,
+    session_scope: Option<String>,
     artifacts_root: Option<PathBuf>,
     finished_task_tx: Sender<FinishedTaskMessage>,
     finished_task_rx: Receiver<FinishedTaskMessage>,
@@ -1084,6 +1186,7 @@ impl Default for TaskManager {
             running_tasks: HashMap::new(),
             resident_tasks: HashMap::new(),
             queued_tasks: VecDeque::new(),
+            pending_revives: VecDeque::new(),
             completed_runs: HashMap::new(),
             completed_errors: HashMap::new(),
             completed_archive: VecDeque::new(),
@@ -1091,6 +1194,7 @@ impl Default for TaskManager {
             release_guard: ReleaseGuard::default(),
             runtime_policy: TaskRuntimePolicy::default(),
             control: TaskManagerControl::default(),
+            session_scope: None,
             artifacts_root: None,
             finished_task_tx,
             finished_task_rx,
@@ -1133,12 +1237,76 @@ impl TaskManager {
         self.control.clone()
     }
 
+    pub fn set_session_scope(&mut self, session_id: impl Into<String>) {
+        self.session_scope = Some(session_id.into());
+    }
+
     pub fn set_worker_registry(&mut self, registry: WorkerRegistry) {
         self.registry = registry;
     }
 
     pub fn set_artifacts_root(&mut self, artifacts_root: PathBuf) {
         self.artifacts_root = Some(artifacts_root);
+    }
+
+    fn append_task_command_event(
+        &self,
+        task_id: &str,
+        action: &str,
+        context: &TaskCommandContext,
+        accepted: bool,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let Some(task_record_path) = self.task_record_paths.get(task_id) else {
+            return Ok(());
+        };
+        let Some(store) = state_store_from_task_record_path(task_record_path) else {
+            return Ok(());
+        };
+        let run_epoch = self
+            .records
+            .get(task_id)
+            .map(|record| record.run_epoch)
+            .unwrap_or_default();
+        let event = TaskCommandEvent {
+            task_id: task_id.to_string(),
+            action: action.to_string(),
+            accepted,
+            all_scope: context.all_scope,
+            caller_session_id: context.caller_session_id.clone(),
+            reason,
+            run_epoch,
+            timestamp: timestamp(),
+        };
+        let path = store.worker_dir(task_id).join("task-command-events.jsonl");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let json =
+            serde_json::to_string(&event).context("failed to serialize task command event")?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        writeln!(file, "{json}").with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    fn record_task_command_event(
+        &self,
+        task_id: &str,
+        action: &str,
+        context: &TaskCommandContext,
+        accepted: bool,
+        reason: Option<String>,
+    ) {
+        if let Err(error) =
+            self.append_task_command_event(task_id, action, context, accepted, reason)
+        {
+            eprintln!("failed to persist Gear task command audit for `{task_id}`: {error:#}");
+        }
     }
 
     pub fn max_parallel_workers(&self) -> usize {
@@ -1243,7 +1411,7 @@ impl TaskManager {
         let worker_model = selected_route.worker_model.map(ToString::to_string);
         let worker_category = selected_route.category.as_str().to_string();
         let route_hint = queued_task.route_hint.clone();
-        let route_reason = selected_route.route_reason.clone();
+        let route_reason = selected_route.route_reason;
         let store = queued_task.store.clone();
         let started_at = timestamp();
         let record = TaskRecord {
@@ -1263,8 +1431,8 @@ impl TaskManager {
             notification_failed_epoch: None,
             killed: false,
             session_id: None,
-            parent_session_id: None,
-            root_session_id: None,
+            parent_session_id: self.session_scope.clone(),
+            root_session_id: self.session_scope.clone(),
             parent_task_id: queued_task.task.parent_task_id.clone(),
             result_path: None,
             outcome_path: None,
@@ -1294,7 +1462,7 @@ impl TaskManager {
         };
         write_task_record(&store, &record)?;
         append_task_lifecycle_event(&store, &record, None)?;
-        self.records.insert(task_id.clone(), record.clone());
+        self.records.insert(task_id.clone(), record);
         self.task_record_paths.insert(
             task_id.clone(),
             store.worker_dir(&task_id).join("task-record.json"),
@@ -1420,10 +1588,11 @@ impl TaskManager {
     ///   - record, archive, control, concurrency, release_guard all cleaned up
     fn destroy_resident_task(&mut self, task_id: &str, cause: &str) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
+        self.pending_revives
+            .retain(|request| request.task_id != task_id);
         // Release concurrency for running tasks
-        let running_task = self.running_tasks.remove(task_id).map(|running_task| {
+        let running_task = self.running_tasks.remove(task_id).inspect(|running_task| {
             self.concurrency.release(&running_task.queued_task);
-            running_task
         });
         let resident_task = self.resident_tasks.remove(task_id);
 
@@ -1668,7 +1837,7 @@ impl TaskManager {
             .collect::<std::collections::HashSet<_>>();
 
         let preserved_keep: Vec<usize> = if preserved_indices.len() <= preserved_budget {
-            preserved_indices.clone()
+            preserved_indices
         } else {
             preserved_indices
                 .iter()
@@ -1840,11 +2009,7 @@ impl TaskManager {
                             let run_epoch = record.run_epoch;
                             self.control
                                 .update_current_status(task_id, record.status.clone())?;
-                            self.release_running_task_once(
-                                task_id,
-                                run_epoch,
-                                &running_task,
-                            )?;
+                            self.release_running_task_once(task_id, run_epoch, &running_task)?;
                             self.records.insert(task_id.to_string(), record);
                             self.start_queued_task(retry_task)?;
                             return Ok(None);
@@ -1908,7 +2073,7 @@ impl TaskManager {
                             finished_at: timestamp(),
                             summary: "Worker task interrupted.".to_string(),
                             failure_kind: TaskFailureKind::WorkerCancelled,
-                            error: Some(error_text.clone()),
+                            error: Some(error_text),
                         },
                     )
                 } else if error_text.contains("timed out waiting for outcome") {
@@ -1918,7 +2083,7 @@ impl TaskManager {
                             finished_at: timestamp(),
                             summary: "Worker task timed out waiting for outcome.".to_string(),
                             failure_kind: TaskFailureKind::WorkerFailed,
-                            error: Some(error_text.clone()),
+                            error: Some(error_text),
                             killed: false,
                         },
                     )
@@ -1932,7 +2097,7 @@ impl TaskManager {
                             finished_at: timestamp(),
                             summary: "Worker task failed before producing an outcome.".to_string(),
                             failure_kind: TaskFailureKind::WorkerFailed,
-                            error: Some(error_text.clone()),
+                            error: Some(error_text),
                         },
                     )
                 } else {
@@ -1941,7 +2106,7 @@ impl TaskManager {
                         TaskTransition::Cancel {
                             finished_at: timestamp(),
                             summary: "Worker task cancelled.".to_string(),
-                            error: Some(error_text.clone()),
+                            error: Some(error_text),
                         },
                     )
                 };
@@ -1969,11 +2134,7 @@ impl TaskManager {
                             let run_epoch = record.run_epoch;
                             self.control
                                 .update_current_status(task_id, record.status.clone())?;
-                            self.release_running_task_once(
-                                task_id,
-                                run_epoch,
-                                &running_task,
-                            )?;
+                            self.release_running_task_once(task_id, run_epoch, &running_task)?;
                             self.records.insert(task_id.to_string(), record);
                             self.start_queued_task(retry_task)?;
                             return Ok(None);
@@ -2068,6 +2229,8 @@ impl TaskManager {
     }
 
     fn cancel_task_direct(&mut self, task_id: &str) -> Result<ActionOutcome> {
+        self.pending_revives
+            .retain(|request| request.task_id != task_id);
         let mut queued_store = None;
         if let Some(index) = self
             .queued_tasks
@@ -2117,7 +2280,9 @@ impl TaskManager {
             && let Some(running_task) = self.running_tasks.get(task_id)
             && let Err(error) = running_task.handle.cancel()
         {
-            eprintln!("failed to cancel Gear worker task `{task_id}` after terminal transition: {error:#}");
+            eprintln!(
+                "failed to cancel Gear worker task `{task_id}` after terminal transition: {error:#}"
+            );
             return Err(error);
         }
         Ok(outcome)
@@ -2141,7 +2306,33 @@ impl TaskManager {
         Ok(outcome)
     }
 
+    pub fn cancel_task_with_context(
+        &mut self,
+        task_id: &str,
+        context: &TaskCommandContext,
+    ) -> Result<ActionOutcome> {
+        let Some(record) = self.records.get(task_id).cloned() else {
+            return Ok(ActionOutcome::Noop);
+        };
+        if !task_scope_allows(&record, context) {
+            let reason = scope_denied_reason(&record, context);
+            self.record_task_command_event(task_id, "cancel", context, false, Some(reason.clone()));
+            return Ok(ActionOutcome::ScopeDenied { reason });
+        }
+        let outcome = self.cancel_task_with_outcome(task_id)?;
+        self.record_task_command_event(
+            task_id,
+            "cancel",
+            context,
+            matches!(&outcome, ActionOutcome::Cancelled),
+            outcome.reason(),
+        );
+        Ok(outcome)
+    }
+
     fn interrupt_task_direct(&mut self, task_id: &str) -> Result<ActionOutcome> {
+        self.pending_revives
+            .retain(|request| request.task_id != task_id);
         let is_running = self.running_tasks.contains_key(task_id);
         let Some(record) = self.records.get_mut(task_id) else {
             bail!("unknown managed task: {task_id}");
@@ -2177,7 +2368,9 @@ impl TaskManager {
             && let Some(running_task) = self.running_tasks.get(task_id)
         {
             if let Err(error) = running_task.handle.interrupt() {
-                eprintln!("failed to interrupt Gear worker task `{task_id}` after terminal transition: {error:#}");
+                eprintln!(
+                    "failed to interrupt Gear worker task `{task_id}` after terminal transition: {error:#}"
+                );
                 return Err(error);
             }
             if let Some(output) = running_task.handle.last_output() {
@@ -2186,7 +2379,11 @@ impl TaskManager {
                 if let Some(attempt) = updated_record.attempts.last_mut() {
                     attempt.summary = output;
                 }
-                if let Some(store) = self.running_tasks.get(task_id).map(|task| task.store.clone()) {
+                if let Some(store) = self
+                    .running_tasks
+                    .get(task_id)
+                    .map(|task| task.store.clone())
+                {
                     write_task_record(&store, &updated_record)?;
                 }
                 record.summary = updated_record.summary;
@@ -2201,6 +2398,36 @@ impl TaskManager {
         for descendant_task_id in descendant_task_ids {
             let _ = self.interrupt_task_direct(&descendant_task_id)?;
         }
+        Ok(outcome)
+    }
+
+    pub fn interrupt_task_with_context(
+        &mut self,
+        task_id: &str,
+        context: &TaskCommandContext,
+    ) -> Result<ActionOutcome> {
+        let Some(record) = self.records.get(task_id).cloned() else {
+            return Ok(ActionOutcome::Noop);
+        };
+        if !task_scope_allows(&record, context) {
+            let reason = scope_denied_reason(&record, context);
+            self.record_task_command_event(
+                task_id,
+                "interrupt",
+                context,
+                false,
+                Some(reason.clone()),
+            );
+            return Ok(ActionOutcome::ScopeDenied { reason });
+        }
+        let outcome = self.interrupt_task(task_id)?;
+        self.record_task_command_event(
+            task_id,
+            "interrupt",
+            context,
+            matches!(&outcome, ActionOutcome::Interrupted),
+            outcome.reason(),
+        );
         Ok(outcome)
     }
 
@@ -2230,98 +2457,143 @@ impl TaskManager {
             return Ok(false);
         }
 
+        let previous_record = self
+            .records
+            .get(task_id)
+            .cloned()
+            .context("resident task record disappeared during revive")?;
+        let rollback_queued_task = resident_task.queued_task.clone();
+        let rollback_handle = resident_task.handle.clone();
         let started_at = timestamp();
         let handle = resident_task.handle.clone();
         let session_id = handle.session_id();
-        let record = self
-            .records
-            .get_mut(task_id)
-            .context("resident task record disappeared during revive")?;
-        record.status = ManagedTaskStatus::Running;
-        record.residency_state = ResidencyState::Resident;
-        record.run_epoch = record.run_epoch.saturating_add(1);
-        record.started_at = started_at.clone();
-        record.finished_at = None;
-        record.session_id = session_id.clone();
-        record.result_path = None;
-        record.outcome_path = None;
-        record.summary = "Worker task revived.".to_string();
-        record.failure_kind = None;
-        record.retry_reason = None;
-        record.error = None;
-        record.killed = false;
-        record.attempts.push(TaskAttempt {
-            attempt: record.attempts.last().map_or(1, |attempt| attempt.attempt + 1),
-            worker_kind: record.worker_kind.clone(),
-            worker_command: record.worker_command.clone(),
-            worker_model: record.worker_model.clone(),
-            worker_category: record.worker_category.clone(),
-            route_hint: record.route_hint.clone(),
-            route_reason: format!("revived from epoch {}", record.run_epoch - 1),
-            status: TaskAttemptStatus::Running,
-            started_at,
-            finished_at: None,
-            session_id,
-            result_path: None,
-            outcome_path: None,
-            summary: "Worker task revived.".to_string(),
-            failure_kind: None,
-            retry_reason: None,
-            error: None,
-        });
-        let record_snapshot = record.clone();
-        write_task_record(&resident_task.queued_task.store, &record_snapshot)?;
-        append_task_lifecycle_event(&resident_task.queued_task.store, &record_snapshot, None)?;
-
-        let subscription = if handle.session_id().is_some() {
-            Some(handle.subscribe(Arc::new(|_| {}))?)
-        } else {
-            None
-        };
-        self.control.set_current(
-            task_id.to_string(),
-            ManagedTaskStatus::Running,
-            Some(handle.clone()),
-        )?;
-        let running_task = RunningTask {
-            store: resident_task.queued_task.store.clone(),
-            handle,
-            queued_task: resident_task.queued_task,
-            started_at: Instant::now(),
-            _subscription: subscription,
-        };
-        self.running_tasks
-            .insert(task_id.to_string(), running_task.clone());
-
-        let delivery_result = match message_kind {
-            QueuedMessageKind::FollowUp => running_task.handle.send_follow_up(prompt),
-            QueuedMessageKind::Steer => running_task.handle.steer(prompt),
-        };
-        if let Err(error) = delivery_result {
-            self.running_tasks.remove(task_id);
-            self.concurrency.release(&running_task.queued_task);
-            self.resident_tasks.insert(
+        let revive_result = (|| -> Result<RunningTask> {
+            let subscription = if handle.session_id().is_some() {
+                Some(handle.subscribe(Arc::new(|_| {}))?)
+            } else {
+                None
+            };
+            let record = self
+                .records
+                .get_mut(task_id)
+                .context("resident task record disappeared during revive")?;
+            record.status = ManagedTaskStatus::Running;
+            record.residency_state = ResidencyState::Resident;
+            record.run_epoch = record.run_epoch.saturating_add(1);
+            record.started_at = started_at.clone();
+            record.finished_at = None;
+            record.session_id = session_id.clone();
+            record.result_path = None;
+            record.outcome_path = None;
+            record.summary = "Worker task revived.".to_string();
+            record.failure_kind = None;
+            record.retry_reason = None;
+            record.error = None;
+            record.killed = false;
+            record.attempts.push(TaskAttempt {
+                attempt: record
+                    .attempts
+                    .last()
+                    .map_or(1, |attempt| attempt.attempt + 1),
+                worker_kind: record.worker_kind.clone(),
+                worker_command: record.worker_command.clone(),
+                worker_model: record.worker_model.clone(),
+                worker_category: record.worker_category.clone(),
+                route_hint: record.route_hint.clone(),
+                route_reason: format!("revived from epoch {}", record.run_epoch - 1),
+                status: TaskAttemptStatus::Running,
+                started_at,
+                finished_at: None,
+                session_id,
+                result_path: None,
+                outcome_path: None,
+                summary: "Worker task revived.".to_string(),
+                failure_kind: None,
+                retry_reason: None,
+                error: None,
+            });
+            let record_snapshot = record.clone();
+            write_task_record(&resident_task.queued_task.store, &record_snapshot)?;
+            append_task_lifecycle_event(&resident_task.queued_task.store, &record_snapshot, None)?;
+            self.control.set_current(
                 task_id.to_string(),
-                ResidentTask {
-                    handle: running_task.handle.clone(),
-                    queued_task: running_task.queued_task.clone(),
-                },
-            );
-            return Err(error);
-        }
+                ManagedTaskStatus::Running,
+                Some(handle.clone()),
+            )?;
+            let running_task = RunningTask {
+                store: resident_task.queued_task.store.clone(),
+                handle,
+                queued_task: resident_task.queued_task,
+                started_at: Instant::now(),
+                _subscription: subscription,
+            };
+            self.running_tasks
+                .insert(task_id.to_string(), running_task.clone());
+            match message_kind {
+                QueuedMessageKind::FollowUp => {
+                    running_task.handle.send_follow_up(prompt)?;
+                }
+                QueuedMessageKind::Steer => {
+                    running_task.handle.steer(prompt)?;
+                }
+            }
+            Ok(running_task)
+        })();
+        let running_task = match revive_result {
+            Ok(running_task) => running_task,
+            Err(error) => {
+                self.running_tasks.remove(task_id);
+                self.concurrency.release(&rollback_queued_task);
+                self.resident_tasks.insert(
+                    task_id.to_string(),
+                    ResidentTask {
+                        handle: rollback_handle.clone(),
+                        queued_task: rollback_queued_task.clone(),
+                    },
+                );
+                self.records
+                    .insert(task_id.to_string(), previous_record.clone());
+                if let Err(rollback_error) =
+                    write_task_record(&rollback_queued_task.store, &previous_record)
+                {
+                    eprintln!(
+                        "failed to restore Gear task `{task_id}` after revive failure: {rollback_error:#}"
+                    );
+                }
+                self.control.set_current(
+                    task_id.to_string(),
+                    previous_record.status,
+                    Some(rollback_handle),
+                )?;
+                return Err(error);
+            }
+        };
 
         self.dispatch_running_task(task_id.to_string(), running_task);
         Ok(true)
     }
 
     pub fn send_follow_up_task(&mut self, task_id: &str, prompt: String) -> Result<SendOutcome> {
+        self.send_follow_up_task_inner(task_id, prompt, None)
+    }
+
+    fn send_follow_up_task_inner(
+        &mut self,
+        task_id: &str,
+        prompt: String,
+        caller_session_id: Option<String>,
+    ) -> Result<SendOutcome> {
         let Some(record) = self.records.get(task_id) else {
             return Ok(SendOutcome::Noop);
         };
 
         if record.status == ManagedTaskStatus::Pending {
-            self.control
-                .queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt)?;
+            self.control.queue_pending_message(
+                task_id,
+                QueuedMessageKind::FollowUp,
+                prompt,
+                caller_session_id,
+            )?;
             return Ok(SendOutcome::Queued);
         }
 
@@ -2331,8 +2603,17 @@ impl TaskManager {
         }
 
         if messageability_for_record(record) == Messageability::Revive {
-            if self.revive_task(task_id, prompt, QueuedMessageKind::FollowUp)? {
+            if self.revive_task(task_id, prompt.clone(), QueuedMessageKind::FollowUp)? {
                 return Ok(SendOutcome::Revive);
+            }
+            if self.resident_tasks.contains_key(task_id) {
+                self.pending_revives.push_back(PendingRevive {
+                    task_id: task_id.to_string(),
+                    message: prompt,
+                    kind: QueuedMessageKind::FollowUp,
+                    caller_session_id,
+                });
+                return Ok(SendOutcome::Queued);
             }
             return Ok(SendOutcome::NotContinuable);
         }
@@ -2340,14 +2621,61 @@ impl TaskManager {
         Ok(SendOutcome::NotContinuable)
     }
 
+    pub fn send_follow_up_task_with_context(
+        &mut self,
+        task_id: &str,
+        prompt: String,
+        context: &TaskCommandContext,
+    ) -> Result<SendOutcome> {
+        let Some(record) = self.records.get(task_id).cloned() else {
+            return Ok(SendOutcome::NotFound {
+                reason: format!("managed task `{task_id}` was not found"),
+            });
+        };
+        if !task_scope_allows(&record, context) {
+            let reason = scope_denied_reason(&record, context);
+            self.record_task_command_event(
+                task_id,
+                "send_follow_up",
+                context,
+                false,
+                Some(reason.clone()),
+            );
+            return Ok(SendOutcome::ScopeDenied { reason });
+        }
+        let outcome =
+            self.send_follow_up_task_inner(task_id, prompt, context.caller_session_id.clone())?;
+        self.record_task_command_event(
+            task_id,
+            "send_follow_up",
+            context,
+            outcome.is_accepted(),
+            outcome.reason(),
+        );
+        Ok(outcome)
+    }
+
     pub fn steer_task(&mut self, task_id: &str, prompt: String) -> Result<SteerOutcome> {
+        self.steer_task_inner(task_id, prompt, None)
+    }
+
+    fn steer_task_inner(
+        &mut self,
+        task_id: &str,
+        prompt: String,
+        caller_session_id: Option<String>,
+    ) -> Result<SteerOutcome> {
         let Some(record) = self.records.get(task_id) else {
             return Ok(SteerOutcome::Noop);
         };
 
         if record.status == ManagedTaskStatus::Pending {
-            self.control
-                .queue_pending_message(task_id, QueuedMessageKind::Steer, prompt)?;
+            self.control.queue_pending_message(
+                task_id,
+                QueuedMessageKind::Steer,
+                prompt,
+                caller_session_id,
+            )?;
             return Ok(SteerOutcome::Queued);
         }
 
@@ -2357,13 +2685,49 @@ impl TaskManager {
         }
 
         if messageability_for_record(record) == Messageability::Revive {
-            if self.revive_task(task_id, prompt, QueuedMessageKind::Steer)? {
+            if self.revive_task(task_id, prompt.clone(), QueuedMessageKind::Steer)? {
                 return Ok(SteerOutcome::Revive);
+            }
+            if self.resident_tasks.contains_key(task_id) {
+                self.pending_revives.push_back(PendingRevive {
+                    task_id: task_id.to_string(),
+                    message: prompt,
+                    kind: QueuedMessageKind::Steer,
+                    caller_session_id,
+                });
+                return Ok(SteerOutcome::Queued);
             }
             return Ok(SteerOutcome::NotContinuable);
         }
 
         Ok(SteerOutcome::NotContinuable)
+    }
+
+    pub fn steer_task_with_context(
+        &mut self,
+        task_id: &str,
+        prompt: String,
+        context: &TaskCommandContext,
+    ) -> Result<SteerOutcome> {
+        let Some(record) = self.records.get(task_id).cloned() else {
+            return Ok(SteerOutcome::NotFound {
+                reason: format!("managed task `{task_id}` was not found"),
+            });
+        };
+        if !task_scope_allows(&record, context) {
+            let reason = scope_denied_reason(&record, context);
+            self.record_task_command_event(task_id, "steer", context, false, Some(reason.clone()));
+            return Ok(SteerOutcome::ScopeDenied { reason });
+        }
+        let outcome = self.steer_task_inner(task_id, prompt, context.caller_session_id.clone())?;
+        self.record_task_command_event(
+            task_id,
+            "steer",
+            context,
+            outcome.is_accepted(),
+            outcome.reason(),
+        );
+        Ok(outcome)
     }
 
     pub fn list(&self) -> Vec<TaskRecord> {
@@ -2477,7 +2841,60 @@ impl TaskManager {
             .any(|running_task| scopes_overlap(&queued_task.task, &running_task.queued_task.task))
     }
 
+    fn process_pending_revives(&mut self) -> Result<()> {
+        let mut pending = std::mem::take(&mut self.pending_revives);
+        let mut remaining = VecDeque::new();
+        while let Some(request) = pending.pop_front() {
+            if let Some(running_task) = self.running_tasks.get(&request.task_id) {
+                let delivery_result = match &request.kind {
+                    QueuedMessageKind::FollowUp => {
+                        running_task.handle.send_follow_up(request.message.clone())
+                    }
+                    QueuedMessageKind::Steer => running_task.handle.steer(request.message.clone()),
+                };
+                if let Err(error) = delivery_result {
+                    eprintln!(
+                        "failed to deliver queued resident revive for task `{}` from session {:?}: {error:#}",
+                        request.task_id, request.caller_session_id
+                    );
+                    remaining.push_back(request);
+                    remaining.extend(pending);
+                    break;
+                }
+                continue;
+            }
+            let can_revive = self.records.get(&request.task_id).is_some_and(|record| {
+                messageability_for_record(record) == Messageability::Revive
+                    && self.resident_tasks.contains_key(&request.task_id)
+            });
+            if !can_revive {
+                continue;
+            }
+            let Some(resident_task) = self.resident_tasks.get(&request.task_id) else {
+                continue;
+            };
+            if !self.concurrency.can_start(&resident_task.queued_task) {
+                remaining.push_back(request);
+                continue;
+            }
+            if !self.revive_task(
+                &request.task_id,
+                request.message.clone(),
+                request.kind.clone(),
+            )? {
+                eprintln!(
+                    "Gear resident revive remained queued for task `{}` from session {:?}",
+                    request.task_id, request.caller_session_id
+                );
+                remaining.push_back(request);
+            }
+        }
+        self.pending_revives = remaining;
+        Ok(())
+    }
+
     fn process_queue(&mut self) -> Result<()> {
+        self.process_pending_revives()?;
         while self.running_tasks.len() < self.concurrency.max_parallel_workers() {
             let Some(index) = self
                 .queued_tasks
@@ -2627,6 +3044,8 @@ impl TaskManager {
                         session_id: handle.session_id(),
                     },
                 );
+                record.parent_session_id = self.session_scope.clone();
+                record.root_session_id = self.session_scope.clone();
                 write_task_record(&queued_task.store, record)?;
                 append_task_lifecycle_event(&queued_task.store, record, Some(&transition))?;
             }
@@ -2655,18 +3074,26 @@ impl TaskManager {
             self.running_tasks
                 .insert(task_id.clone(), running_task.clone());
             let pending_messages = self.control.take_pending_messages(&task_id)?;
-            for queued_message in pending_messages {
+            let mut pending_messages = pending_messages.into_iter();
+            while let Some(queued_message) = pending_messages.next() {
                 let delivery_result = match queued_message.kind {
-                    QueuedMessageKind::FollowUp => {
-                        running_task.handle.send_follow_up(queued_message.message)
+                    QueuedMessageKind::FollowUp => running_task
+                        .handle
+                        .send_follow_up(queued_message.message.clone()),
+                    QueuedMessageKind::Steer => {
+                        running_task.handle.steer(queued_message.message.clone())
                     }
-                    QueuedMessageKind::Steer => running_task.handle.steer(queued_message.message),
                 };
                 if let Err(error) = delivery_result {
                     eprintln!(
                         "failed to deliver queued Gear message for task `{task_id}` from {:?} created at {}: {error:#}",
                         queued_message.caller_session_id, queued_message.created_at
                     );
+                    let mut retry_messages = VecDeque::from([queued_message]);
+                    retry_messages.extend(pending_messages);
+                    self.control
+                        .prepend_pending_messages(&task_id, retry_messages)?;
+                    break;
                 }
             }
             self.dispatch_running_task(task_id, running_task);
@@ -3072,7 +3499,7 @@ fn parse_timestamp_ms(ts: &str) -> Option<u64> {
 }
 
 fn day_of_year(y: u64, m: u64, d: u64) -> u64 {
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let days = [
         0,
         31,
@@ -3302,7 +3729,7 @@ fn transition_task_record(
             record.outcome_path = None;
             record.summary = summary;
             record.failure_kind = None;
-            record.retry_reason = Some(retry_reason.clone());
+            record.retry_reason = Some(retry_reason);
             record.error = None;
             true
         }
@@ -3387,7 +3814,7 @@ fn write_model_unavailable_artifacts(
         stderr_path: None,
         last_message_path: None,
         result_path,
-        outcome_path: outcome_path.clone(),
+        outcome_path,
     };
     let outcome = WorkerOutcome {
         status: WorkerStatus::Skipped,
@@ -3450,6 +3877,10 @@ fn write_route_transform_artifact(
     let next_session_id = next_attempt
         .and_then(|attempt| attempt.session_id.as_deref())
         .unwrap_or("pending");
+    let failure_kind = failure_kind
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "none".to_string());
+    let previous_status = format!("{:?}", previous_attempt.status);
     let contents = format!(
         r#"# Worker Route Transform
 
@@ -3482,16 +3913,14 @@ Task: `{task_id}`
 "#,
         task_id = task_id,
         decision_summary = decision_summary,
-        failure_kind = failure_kind
-            .map(|kind| format!("{kind:?}"))
-            .unwrap_or_else(|| "none".to_string()),
+        failure_kind = failure_kind,
         previous_attempt_index = previous_attempt.attempt,
         previous_provider = previous_provider,
         previous_worker_kind = previous_attempt.worker_kind,
         previous_worker_model = previous_attempt.worker_model.as_deref().unwrap_or("none"),
         previous_worker_command = previous_attempt.worker_command.as_deref().unwrap_or("none"),
         previous_session_id = previous_attempt.session_id.as_deref().unwrap_or("none"),
-        previous_status = format!("{:?}", previous_attempt.status),
+        previous_status = previous_status,
         previous_retry_reason = previous_attempt.retry_reason.as_deref().unwrap_or("none"),
         next_attempt_index = next_attempt.map(|attempt| attempt.attempt).unwrap_or(0),
         next_provider = next_provider,
@@ -3610,7 +4039,7 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
     queued_task.task.attempt = next_attempt;
     queued_task.route_attempt = route_selection_attempt;
     let worker_category = selected_route.category.as_str().to_string();
-    let route_reason = selected_route.route_reason.clone();
+    let route_reason = selected_route.route_reason;
     let route_hint = queued_task.route_hint.clone();
     let started_at = timestamp();
     let retry_reason = format!(
@@ -3828,7 +4257,7 @@ mod tests {
 
     use super::*;
     use crate::state::{Scope, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus};
-    use crate::workers::{WorkerConfig, WorkerKind, WorkerRoute};
+    use crate::workers::{WorkerConfig, WorkerEventListener, WorkerKind, WorkerRoute};
 
     fn test_task(id: &str) -> Task {
         Task {
@@ -4220,10 +4649,11 @@ mod tests {
             skip_worker: false,
             require_worker: true,
         };
+        let task_id = task.id.clone();
         let mut queued_task = QueuedTask {
             store,
             workspace: temp_dir.path().to_path_buf(),
-            task: task.clone(),
+            task,
             route_attempt: 1,
             goal: "test goal".to_string(),
             verification_commands: Vec::new(),
@@ -4235,7 +4665,7 @@ mod tests {
         };
         let started_at = timestamp();
         let mut record = TaskRecord {
-            task_id: task.id.clone(),
+            task_id,
             worker_kind: "opencode".to_string(),
             worker_command: Some("sh -c 'exit 2'".to_string()),
             worker_model: None,
@@ -4315,10 +4745,11 @@ mod tests {
             skip_worker: false,
             require_worker: true,
         };
+        let task_id = task.id.clone();
         let mut queued_task = QueuedTask {
             store,
             workspace: temp_dir.path().to_path_buf(),
-            task: task.clone(),
+            task,
             route_attempt: 1,
             goal: "test goal".to_string(),
             verification_commands: Vec::new(),
@@ -4330,7 +4761,7 @@ mod tests {
         };
         let started_at = timestamp();
         let mut record = TaskRecord {
-            task_id: task.id.clone(),
+            task_id,
             worker_kind: "codex".to_string(),
             worker_command: Some("codex exec -m gpt-5.1".to_string()),
             worker_model: Some("gpt.5-1".to_string()),
@@ -4482,10 +4913,11 @@ mod tests {
             skip_worker: false,
             require_worker: true,
         };
+        let task_id = task.id.clone();
         let mut queued_task = QueuedTask {
             store,
             workspace: temp_dir.path().to_path_buf(),
-            task: task.clone(),
+            task,
             route_attempt: 1,
             goal: "test goal".to_string(),
             verification_commands: Vec::new(),
@@ -4498,7 +4930,7 @@ mod tests {
         queued_task.task.attempt = 1;
         let started_at = timestamp();
         let mut record = TaskRecord {
-            task_id: task.id.clone(),
+            task_id,
             worker_kind: "codex".to_string(),
             worker_command: Some("printf codex".to_string()),
             worker_model: None,
@@ -5047,6 +5479,50 @@ mod tests {
         fn last_output(&self) -> Option<String> {
             None
         }
+
+        fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
+            Ok(WorkerSubscription::noop())
+        }
+    }
+
+    struct FakeReviveFailureHandle;
+
+    impl WorkerSessionHandle for FakeReviveFailureHandle {
+        fn session_id(&self) -> Option<String> {
+            Some("session_revive_failure".to_string())
+        }
+
+        fn send_follow_up(&self, _prompt: String) -> Result<()> {
+            bail!("simulated revive delivery failure")
+        }
+
+        fn steer(&self, _prompt: String) -> Result<()> {
+            bail!("simulated revive delivery failure")
+        }
+
+        fn interrupt(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+            bail!("not supported")
+        }
+
+        fn wait_for_result(&self) -> Result<WorkerResult> {
+            bail!("not supported")
+        }
+
+        fn last_output(&self) -> Option<String> {
+            None
+        }
+
+        fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
+            Ok(WorkerSubscription::noop())
+        }
     }
 
     struct FakeHangingHandle;
@@ -5134,7 +5610,7 @@ mod tests {
         );
         assert_eq!(
             control.interrupt_task("task_interrupt")?,
-            ActionOutcome::Cancelled
+            ActionOutcome::Interrupted
         );
         assert_eq!(interrupted.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -5184,16 +5660,15 @@ mod tests {
         let control = TaskManagerControl::default();
         let interrupted = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicUsize::new(0));
-        let follow_ups = Arc::new(Mutex::new(Vec::new()));
-        let steers = Arc::new(Mutex::new(Vec::new()));
+
         control.set_current(
             "task_cancel".to_string(),
             ManagedTaskStatus::Running,
             Some(Arc::new(FakeInterruptHandle {
                 interrupted: interrupted.clone(),
                 cancelled: cancelled.clone(),
-                follow_ups: follow_ups.clone(),
-                steers: steers.clone(),
+                follow_ups: Arc::new(Mutex::new(Vec::new())),
+                steers: Arc::new(Mutex::new(Vec::new())),
             })),
         )?;
 
@@ -5720,15 +6195,16 @@ mod tests {
             coordinator_brief: None,
             route_hint: None,
         });
+        let running_task_id = running_task.id.clone();
         manager.running_tasks.insert(
-            running_task.id.clone(),
+            running_task_id,
             RunningTask {
                 store,
                 handle: Arc::new(FakeHangingHandle),
                 queued_task: QueuedTask {
                     store: StateStore::new(temp_dir.path()),
                     workspace: temp_dir.path().to_path_buf(),
-                    task: running_task.clone(),
+                    task: running_task,
                     route_attempt: 1,
                     goal: "test goal".to_string(),
                     verification_commands: Vec::new(),
@@ -6587,14 +7063,14 @@ mod tests {
         let root_running_task = RunningTask {
             store: store.clone(),
             handle: running_handle(root_cancelled.clone()),
-            queued_task: root_queued_task.clone(),
+            queued_task: root_queued_task,
             started_at: Instant::now(),
             _subscription: None,
         };
         let child_running_task = RunningTask {
             store: store.clone(),
             handle: running_handle(child_cancelled.clone()),
-            queued_task: child_queued_task.clone(),
+            queued_task: child_queued_task,
             started_at: Instant::now(),
             _subscription: None,
         };
@@ -6691,6 +7167,18 @@ mod tests {
         );
         assert!(!complete.applied);
         assert_eq!(record.status, ManagedTaskStatus::Cancelled);
+
+        let late_failure = transition_task_record(
+            &mut record,
+            TaskTransition::Fail {
+                finished_at: timestamp(),
+                summary: "late failure".to_string(),
+                failure_kind: TaskFailureKind::WorkerFailed,
+                error: Some("late worker error".to_string()),
+            },
+        );
+        assert!(!late_failure.applied);
+        assert_eq!(record.status, ManagedTaskStatus::Cancelled);
     }
 
     #[test]
@@ -6707,7 +7195,7 @@ mod tests {
 
         assert_eq!(
             manager.interrupt_task("task_interrupt")?,
-            ActionOutcome::Cancelled
+            ActionOutcome::Interrupted
         );
 
         let record = manager
@@ -8092,6 +8580,482 @@ mod tests {
         assert_eq!(
             control.steer_task("task_cancelled", "steer after cancel 2".to_string())?,
             SteerOutcome::NotContinuable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_resident_task_revives_with_new_epoch_and_running_tracking() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let follow_ups = Arc::new(Mutex::new(Vec::new()));
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeInterruptHandle {
+            interrupted: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+            follow_ups: follow_ups.clone(),
+            steers: Arc::new(Mutex::new(Vec::new())),
+        });
+        let task_id = "task_revive".to_string();
+        let make_queued_task = |task_id: &str| QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task(task_id),
+            route_attempt: 1,
+            goal: "revive test".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: Vec::new(),
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 2,
+                max_parallel_per_key: 2,
+                stale_task_timeout_secs: 30,
+                skip_worker: true,
+                require_worker: false,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let queued_task = make_queued_task(&task_id);
+        let mut manager = TaskManager::new();
+        manager.apply_worker_config(&queued_task.config);
+        let mut record = test_task_record(
+            &task_id,
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.residency_state = ResidencyState::Resident;
+        record.run_epoch = 4;
+        manager.records.insert(task_id.clone(), record);
+        manager.resident_tasks.insert(
+            task_id.clone(),
+            ResidentTask {
+                handle: handle.clone(),
+                queued_task,
+            },
+        );
+        manager
+            .control
+            .set_current(task_id.clone(), ManagedTaskStatus::Completed, Some(handle))?;
+
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "continue".to_string())?,
+            SendOutcome::Revive
+        );
+        let record = manager
+            .records
+            .get(&task_id)
+            .context("missing revived record")?;
+        assert_eq!(record.status, ManagedTaskStatus::Running);
+        assert_eq!(record.run_epoch, 5);
+        assert_eq!(record.attempts.len(), 2);
+        assert!(manager.running_tasks.contains_key(&task_id));
+        assert_eq!(
+            follow_ups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("follow-up mutex poisoned"))?
+                .as_slice(),
+            ["continue"]
+        );
+
+        let steer_id = "task_steer_revive".to_string();
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let steer_handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeInterruptHandle {
+            interrupted: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+            follow_ups: Arc::new(Mutex::new(Vec::new())),
+            steers: steers.clone(),
+        });
+        let mut steer_record = test_task_record(
+            &steer_id,
+            ManagedTaskStatus::Interrupted,
+            TaskAttemptStatus::Interrupted,
+        );
+        steer_record.residency_state = ResidencyState::Resident;
+        steer_record.run_epoch = 2;
+        manager.records.insert(steer_id.clone(), steer_record);
+        manager.resident_tasks.insert(
+            steer_id.clone(),
+            ResidentTask {
+                handle: steer_handle.clone(),
+                queued_task: make_queued_task(&steer_id),
+            },
+        );
+        manager.control.set_current(
+            steer_id.clone(),
+            ManagedTaskStatus::Interrupted,
+            Some(steer_handle),
+        )?;
+
+        assert_eq!(
+            manager.steer_task(&steer_id, "adjust".to_string())?,
+            SteerOutcome::Revive
+        );
+        assert_eq!(
+            manager
+                .records
+                .get(&steer_id)
+                .context("missing steer revived record")?
+                .run_epoch,
+            3
+        );
+        assert_eq!(
+            steers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("steer mutex poisoned"))?
+                .as_slice(),
+            ["adjust"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_resident_revive_failure_restores_terminal_state() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_revive_failure".to_string();
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task(&task_id),
+            route_attempt: 1,
+            goal: "revive failure test".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::Opencode,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: Vec::new(),
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: true,
+                require_worker: false,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeReviveFailureHandle);
+        let mut manager = TaskManager::new();
+        manager.apply_worker_config(&queued_task.config);
+        let mut record = test_task_record(
+            &task_id,
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 7;
+        record.finished_at = Some(timestamp());
+        write_task_record(&store, &record)?;
+        manager.records.insert(task_id.clone(), record.clone());
+        manager.resident_tasks.insert(
+            task_id.clone(),
+            ResidentTask {
+                handle: handle.clone(),
+                queued_task,
+            },
+        );
+        manager
+            .control
+            .set_current(task_id.clone(), ManagedTaskStatus::Completed, Some(handle))?;
+
+        let error = manager
+            .send_follow_up_task(&task_id, "continue".to_string())
+            .expect_err("revive delivery should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated revive delivery failure")
+        );
+        let restored = manager
+            .records
+            .get(&task_id)
+            .context("missing restored task record")?;
+        assert_eq!(restored.status, ManagedTaskStatus::Completed);
+        assert_eq!(restored.run_epoch, 7);
+        assert_eq!(restored.attempts.len(), record.attempts.len());
+        assert!(!manager.running_tasks.contains_key(&task_id));
+        assert!(manager.resident_tasks.contains_key(&task_id));
+        assert_eq!(
+            manager.control.current_task_status()?,
+            Some(ManagedTaskStatus::Completed)
+        );
+        let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
+            store.worker_dir(&task_id).join("task-record.json"),
+        )?)?;
+        assert_eq!(persisted.status, ManagedTaskStatus::Completed);
+        assert_eq!(persisted.run_epoch, 7);
+        let resident = manager
+            .resident_tasks
+            .get(&task_id)
+            .context("missing restored resident task")?;
+        assert!(manager.concurrency.can_start(&resident.queued_task));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_resident_revive_waits_for_concurrency_slot() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: true,
+            require_worker: false,
+        };
+        let make_queued_task = |task_id: &str| QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task(task_id),
+            route_attempt: 1,
+            goal: "concurrency revive test".to_string(),
+            verification_commands: Vec::new(),
+            config: config.clone(),
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+
+        let busy_queued_task = make_queued_task("task_busy");
+        let busy_handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeHangingHandle);
+        let mut manager = TaskManager::new();
+        manager.apply_worker_config(&config);
+        assert!(manager.concurrency.acquire(&busy_queued_task));
+        manager.running_tasks.insert(
+            "task_busy".to_string(),
+            RunningTask {
+                store: store.clone(),
+                handle: busy_handle,
+                queued_task: busy_queued_task,
+                started_at: Instant::now(),
+                _subscription: None,
+            },
+        );
+
+        let follow_ups = Arc::new(Mutex::new(Vec::new()));
+        let resident_handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeInterruptHandle {
+            interrupted: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+            follow_ups: follow_ups.clone(),
+            steers: Arc::new(Mutex::new(Vec::new())),
+        });
+        let task_id = "task_waiting_revive".to_string();
+        let mut record = test_task_record(
+            &task_id,
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.residency_state = ResidencyState::Resident;
+        manager.records.insert(task_id.clone(), record);
+        manager.resident_tasks.insert(
+            task_id.clone(),
+            ResidentTask {
+                handle: resident_handle,
+                queued_task: make_queued_task(&task_id),
+            },
+        );
+
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "wait for slot".to_string())?,
+            SendOutcome::Queued
+        );
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "second queued message".to_string())?,
+            SendOutcome::Queued
+        );
+        assert_eq!(manager.pending_revives.len(), 2);
+
+        let busy = manager
+            .running_tasks
+            .remove("task_busy")
+            .context("busy task disappeared")?;
+        manager.concurrency.release(&busy.queued_task);
+        manager.process_queue()?;
+
+        assert!(manager.pending_revives.is_empty());
+        assert!(manager.running_tasks.contains_key(&task_id));
+        assert_eq!(
+            follow_ups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("follow-up mutex poisoned"))?
+                .as_slice(),
+            ["wait for slot", "second queued message"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_command_scope_denies_sibling_session_and_preserves_owner() -> Result<()> {
+        let mut manager = TaskManager::new();
+        let mut record = test_task_record(
+            "task_scoped",
+            ManagedTaskStatus::Pending,
+            TaskAttemptStatus::Pending,
+        );
+        record.parent_session_id = Some("session-owner".to_string());
+        record.root_session_id = Some("session-root".to_string());
+        manager.records.insert(record.task_id.clone(), record);
+
+        let denied = manager.send_follow_up_task_with_context(
+            "task_scoped",
+            "blocked".to_string(),
+            &TaskCommandContext {
+                caller_session_id: Some("session-sibling".to_string()),
+                all_scope: false,
+            },
+        )?;
+        assert!(matches!(denied, SendOutcome::ScopeDenied { .. }));
+
+        let queued = manager.send_follow_up_task_with_context(
+            "task_scoped",
+            "allowed".to_string(),
+            &TaskCommandContext {
+                caller_session_id: Some("session-owner".to_string()),
+                all_scope: false,
+            },
+        )?;
+        assert_eq!(queued, SendOutcome::Queued);
+        let messages = manager.control.take_pending_messages("task_scoped")?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages
+                .front()
+                .and_then(|message| message.caller_session_id.as_deref()),
+            Some("session-owner")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_command_scope_all_scope_allows_cross_session_control() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let mut manager = TaskManager::new();
+        let mut record = test_task_record(
+            "task_all_scope",
+            ManagedTaskStatus::Pending,
+            TaskAttemptStatus::Pending,
+        );
+        record.parent_session_id = Some("session-owner".to_string());
+        record.root_session_id = Some("session-root".to_string());
+        manager.records.insert(record.task_id.clone(), record);
+        manager.task_record_paths.insert(
+            "task_all_scope".to_string(),
+            store.worker_dir("task_all_scope").join("task-record.json"),
+        );
+
+        let outcome = manager.send_follow_up_task_with_context(
+            "task_all_scope",
+            "cross-session control".to_string(),
+            &TaskCommandContext {
+                caller_session_id: Some("session-sibling".to_string()),
+                all_scope: true,
+            },
+        )?;
+        assert_eq!(outcome, SendOutcome::Queued);
+        let messages = manager.control.take_pending_messages("task_all_scope")?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages
+                .front()
+                .and_then(|message| message.caller_session_id.as_deref()),
+            Some("session-sibling")
+        );
+        let command_events = fs::read_to_string(
+            store
+                .worker_dir("task_all_scope")
+                .join("task-command-events.jsonl"),
+        )?;
+        assert!(command_events.contains("\"action\":\"send_follow_up\""));
+        assert!(command_events.contains("\"accepted\":true"));
+        assert!(command_events.contains("\"all_scope\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn task_command_audit_failure_preserves_accepted_outcome() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let blocked_workspace_root = temp_dir.path().join("blocked-workspace-root");
+        fs::write(&blocked_workspace_root, "not a directory")?;
+
+        let task_id = "task_audit_failure";
+        let mut manager = TaskManager::new();
+        let mut record = test_task_record(
+            task_id,
+            ManagedTaskStatus::Pending,
+            TaskAttemptStatus::Pending,
+        );
+        record.parent_session_id = Some("session-owner".to_string());
+        manager.records.insert(task_id.to_string(), record);
+        manager.task_record_paths.insert(
+            task_id.to_string(),
+            blocked_workspace_root
+                .join("a/b/c")
+                .join("task-record.json"),
+        );
+
+        let outcome = manager.send_follow_up_task_with_context(
+            task_id,
+            "accepted despite audit failure".to_string(),
+            &TaskCommandContext {
+                caller_session_id: Some("session-owner".to_string()),
+                all_scope: false,
+            },
+        )?;
+
+        assert_eq!(outcome, SendOutcome::Queued);
+        let messages = manager.control.take_pending_messages(task_id)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, "accepted despite audit failure");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_messages_requeue_preserves_order_after_delivery_failure() -> Result<()> {
+        let control = TaskManagerControl::default();
+        for (index, message) in ["first", "second", "third"].into_iter().enumerate() {
+            control.queue_pending_message(
+                "task_pending_retry",
+                QueuedMessageKind::FollowUp,
+                message.to_string(),
+                Some(format!("session-{index}")),
+            )?;
+        }
+
+        let mut pending = control.take_pending_messages("task_pending_retry")?;
+        assert_eq!(
+            pending.pop_front().map(|message| message.message),
+            Some("first".to_string())
+        );
+        control.prepend_pending_messages("task_pending_retry", pending)?;
+
+        let retry_messages = control.take_pending_messages("task_pending_retry")?;
+        assert_eq!(
+            retry_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect::<Vec<_>>(),
+            vec!["second".to_string(), "third".to_string()]
         );
         Ok(())
     }

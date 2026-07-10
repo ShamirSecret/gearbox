@@ -11,8 +11,9 @@ use serde_json::json;
 use crate::languages::{LanguageDetection, detect_with_request};
 use crate::product;
 use crate::state::{
-    Budget, CoordinatorModel, Event, EventKind, Goal, GoalStatus, Scope, Session, StateStore, Task,
-    TaskInputs, TaskKind, TaskOutputs, TaskStatus, event, id_timestamp, timestamp,
+    Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalStatus, Scope,
+    Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, event, id_timestamp,
+    timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -58,6 +59,7 @@ pub struct RunOptions {
     pub coordinator_review_hook: Option<CoordinatorReviewHook>,
     pub task_manager_control: Option<TaskManagerControl>,
     pub task_manager: Option<SharedTaskManager>,
+    pub continuation: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +180,11 @@ impl Orchestrator {
 
         let store = StateStore::new(&workspace);
         store.initialize()?;
+        if options.continuation && store.continuation_is_stopped()? {
+            bail!(
+                "Gear continuation is stopped; explicitly restart the continuation before running again"
+            );
+        }
         check_run_cancelled(options.cancellation_token.as_ref())?;
 
         let id_suffix = id_timestamp();
@@ -227,6 +234,21 @@ impl Orchestrator {
 
         store.write_session(&session)?;
         store.write_goal(&goal)?;
+        if options.continuation {
+            store.write_continuation_state(&session_id, &goal_id, ContinuationStatus::Running)?;
+            append_event(
+                &store,
+                &options.event_sink,
+                event(
+                    &session_id,
+                    Some(&goal_id),
+                    None,
+                    EventKind::ContinuationStarted,
+                    "Gear continuation started",
+                    json!({ "status": "running" }),
+                ),
+            )?;
+        }
         append_event(
             &store,
             &options.event_sink,
@@ -363,8 +385,19 @@ impl Orchestrator {
             goal_id: goal_id.clone(),
         };
 
+        #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
+            if options.continuation && store.continuation_is_stopped()? {
+                final_evaluation = Some(GoalEvaluation {
+                    status: GoalStatus::NeedsUser,
+                    should_continue: false,
+                    summary: "Continuation was stopped by the user before the next worker turn."
+                        .to_string(),
+                    route_hint_override: None,
+                });
+                break;
+            }
             let parent_task_id = goal.current_task_id.clone();
             let worker_route_hint = next_route_hint_override.as_deref().or_else(|| {
                 last_coordinator_review
@@ -639,6 +672,7 @@ impl Orchestrator {
             after_diff = git_snapshot(&workspace)?;
             diff_history.push(after_diff.clone());
             scope_check = check_scope(&after_diff, &scope);
+            let comment_violations = comment_check(&workspace, &after_diff.changed_files)?;
             check_run_cancelled(options.cancellation_token.as_ref())?;
             append_event(
                 &store,
@@ -740,12 +774,18 @@ impl Orchestrator {
             )?;
 
             last_verification_path = Some(verification_path.clone());
-            let no_progress_signals = detect_stagnation(
+            let mut no_progress_signals = detect_stagnation(
                 &diff_history,
                 &verification_history,
                 &repair_request_history,
                 &worker_output_history,
             );
+            if !comment_violations.is_empty() {
+                no_progress_signals.push(format!(
+                    "comment_check: organizational comments at {}",
+                    comment_violations.join(", ")
+                ));
+            }
             let coordinator_review = run_coordinator_review(
                 &store,
                 &options.event_sink,
@@ -773,13 +813,20 @@ impl Orchestrator {
             )?;
             last_coordinator_review = coordinator_review.clone();
             let coordinator_review = coordinator_review.as_ref();
+            let mut context_risk_signals = detect_context_risk_signals(collect_context_risk_texts(
+                &iteration_worker_result_for_risk,
+                &iteration_worker_outcome,
+                &worker_task_record,
+                coordinator_review,
+            ));
+            if !comment_violations.is_empty() {
+                context_risk_signals.push(format!(
+                    "comment_check: {} violation(s)",
+                    comment_violations.len()
+                ));
+            }
             let budget_snapshot = BudgetSnapshot {
-                context_risk_signals: detect_context_risk_signals(collect_context_risk_texts(
-                    &iteration_worker_result_for_risk,
-                    &iteration_worker_outcome,
-                    &worker_task_record,
-                    coordinator_review,
-                )),
+                context_risk_signals,
                 ..budget_snapshot_for_review
             };
             let budget_summary = budget_summary(
@@ -844,6 +891,25 @@ impl Orchestrator {
                     coordinator_review,
                 ),
             )?;
+            let review_gate = ReviewGate::from_inputs(
+                verification_passed,
+                &worker_result
+                    .as_ref()
+                    .context("missing worker result for review gate")?
+                    .status,
+                &scope_check,
+                coordinator_review,
+                &budget_snapshot.context_risk_signals,
+            );
+            let repair_request_path = review_gate.failed_reason().map(|reason| {
+                store.write_artifact(
+                    &goal_id,
+                    &format!("review-repair-request-iteration-{iteration}.md"),
+                    &format!(
+                        "# Review Gate Repair Request\n\nIteration: `{iteration}`\n\nThe required review dimensions failed:\n\n- {reason}\n\nRepair only the smallest changes needed to satisfy the failed dimensions, then rerun verification.\n"
+                    ),
+                )
+            }).transpose()?;
             add_review_task(
                 &mut tasks,
                 &goal_id,
@@ -852,6 +918,7 @@ impl Orchestrator {
                 &review_path,
                 &evaluation.summary,
                 Some(worker_task_id.clone()),
+                repair_request_path.as_deref(),
             );
             store.write_tasks(&goal_id, &tasks)?;
             append_event(
@@ -883,6 +950,7 @@ impl Orchestrator {
 
         let final_evaluation = final_evaluation.context("Gear loop did not evaluate the goal")?;
         let worker_result = worker_result.context("Gear loop did not produce a worker result")?;
+        let final_task_id = goal.current_task_id.clone();
         goal.status = final_evaluation.status;
         goal.current_task_id = None;
         goal.updated_at = timestamp();
@@ -905,6 +973,30 @@ impl Orchestrator {
         });
         store.write_goal(&goal)?;
         store.write_tasks(&goal_id, &tasks)?;
+        if options.continuation {
+            let continuation_status = if store.continuation_is_stopped()? {
+                ContinuationStatus::Stopped
+            } else {
+                ContinuationStatus::Completed
+            };
+            store.write_continuation_state(&session_id, &goal_id, continuation_status.clone())?;
+            append_event(
+                &store,
+                &options.event_sink,
+                event(
+                    &session_id,
+                    Some(&goal_id),
+                    final_task_id.as_deref(),
+                    match &continuation_status {
+                        ContinuationStatus::Stopped => EventKind::ContinuationStopped,
+                        ContinuationStatus::Completed => EventKind::ContinuationCompleted,
+                        ContinuationStatus::Running => EventKind::ContinuationStarted,
+                    },
+                    "Gear continuation state updated",
+                    json!({ "status": &continuation_status }),
+                ),
+            )?;
+        }
 
         let final_event_kind = match goal.status {
             GoalStatus::Complete => EventKind::GoalCompleted,
@@ -932,7 +1024,7 @@ impl Orchestrator {
         }
         task_manager_tick_loop.stop()?;
 
-        let status = goal.status.clone();
+        let status = goal.status;
         Ok(RunOutcome {
             goal_id,
             session_id: session_id.clone(),
@@ -1584,7 +1676,12 @@ fn add_review_task(
     review_path: &std::path::Path,
     summary: &str,
     parent_task_id: Option<String>,
+    repair_request_path: Option<&std::path::Path>,
 ) {
+    let mut evidence = vec![review_path.to_string_lossy().to_string()];
+    if let Some(repair_request_path) = repair_request_path {
+        evidence.push(repair_request_path.to_string_lossy().to_string());
+    }
     tasks.push(Task {
         id: review_task_id(iteration),
         goal_id: goal_id.to_string(),
@@ -1599,7 +1696,7 @@ fn add_review_task(
         outputs: TaskOutputs {
             changed_files: Vec::new(),
             commands_run: Vec::new(),
-            evidence: vec![review_path.to_string_lossy().to_string()],
+            evidence,
             summary: summary.to_string(),
         },
     });
@@ -1611,6 +1708,138 @@ struct GoalEvaluation {
     should_continue: bool,
     summary: String,
     route_hint_override: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDimension {
+    GoalVerification,
+    CodeQuality,
+    Security,
+    QaExecution,
+}
+
+impl ReviewDimension {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GoalVerification => "goal_verification",
+            Self::CodeQuality => "code_quality",
+            Self::Security => "security",
+            Self::QaExecution => "qa_execution",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewDimensionResult {
+    pub dimension: ReviewDimension,
+    pub passed: bool,
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewGate {
+    pub require_all_pass: bool,
+    pub results: Vec<ReviewDimensionResult>,
+}
+
+impl ReviewGate {
+    fn from_inputs(
+        verification_passed: bool,
+        worker_status: &WorkerStatus,
+        scope_check: &crate::tools::ScopeCheck,
+        coordinator_review: Option<&CoordinatorReview>,
+        context_risk_signals: &[String],
+    ) -> Self {
+        let review_required = true;
+        let goal_satisfied = coordinator_review
+            .and_then(|review| review.goal_satisfied)
+            .unwrap_or(coordinator_review.is_none());
+        let scope_clean = scope_check.forbidden_touches.is_empty()
+            && scope_check.outside_allowed_paths.is_empty()
+            && !scope_check.max_files_exceeded;
+        let comment_check_clean = !context_risk_signals
+            .iter()
+            .any(|signal| signal.starts_with("comment_check:"));
+        Self {
+            require_all_pass: review_required,
+            results: vec![
+                ReviewDimensionResult {
+                    dimension: ReviewDimension::GoalVerification,
+                    passed: verification_passed && goal_satisfied,
+                    evidence: if verification_passed && goal_satisfied {
+                        "verification passed and coordinator accepted the goal".to_string()
+                    } else {
+                        "verification or coordinator goal acceptance failed".to_string()
+                    },
+                },
+                ReviewDimensionResult {
+                    dimension: ReviewDimension::CodeQuality,
+                    passed: scope_clean && comment_check_clean,
+                    evidence: if scope_clean && comment_check_clean {
+                        format!(
+                            "worker status `{}` accepted and scope checks are clean",
+                            worker_status.as_str()
+                        )
+                    } else {
+                        if !comment_check_clean {
+                            "comment checker reported organizational comments".to_string()
+                        } else {
+                            "scope checks are not clean".to_string()
+                        }
+                    },
+                },
+                ReviewDimensionResult {
+                    dimension: ReviewDimension::Security,
+                    passed: scope_check.forbidden_touches.is_empty(),
+                    evidence: if scope_check.forbidden_touches.is_empty() {
+                        "no forbidden paths were touched".to_string()
+                    } else {
+                        format!(
+                            "forbidden paths touched: {}",
+                            scope_check.forbidden_touches.join(", ")
+                        )
+                    },
+                },
+                ReviewDimensionResult {
+                    dimension: ReviewDimension::QaExecution,
+                    passed: verification_passed,
+                    evidence: if verification_passed {
+                        "verification commands passed".to_string()
+                    } else {
+                        "one or more verification commands failed".to_string()
+                    },
+                },
+            ],
+        }
+    }
+
+    fn failed_reason(&self) -> Option<String> {
+        if !self.require_all_pass {
+            return None;
+        }
+        let failures = self
+            .results
+            .iter()
+            .filter(|result| !result.passed)
+            .map(|result| format!("{}: {}", result.dimension.label(), result.evidence))
+            .collect::<Vec<_>>();
+        (!failures.is_empty()).then(|| failures.join("; "))
+    }
+
+    fn summary(&self) -> String {
+        self.results
+            .iter()
+            .map(|result| {
+                format!(
+                    "{}={}: {}",
+                    result.dimension.label(),
+                    if result.passed { "pass" } else { "fail" },
+                    result.evidence
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1648,6 +1877,7 @@ struct GoalDecisionPolicy<'a> {
     no_progress_signals: &'a [String],
     nearest_fallback_available: bool,
     trigger_source: Option<RouteChangeType>,
+    review_gate: &'a ReviewGate,
 }
 
 #[derive(Clone, Debug)]
@@ -2145,13 +2375,38 @@ impl<'a> GoalDecisionPolicy<'a> {
                 };
             }
 
+            if let Some(reason) = self.review_gate.failed_reason() {
+                if self.iteration < self.budget.max_iterations {
+                    return GoalEvaluation {
+                        status: GoalStatus::Running,
+                        should_continue: true,
+                        summary: format!(
+                            "Review gate failed after iteration {}; repair is required: {reason}.",
+                            self.iteration
+                        ),
+                        route_hint_override: Some("review".to_string()),
+                    };
+                }
+                return GoalEvaluation {
+                    status: GoalStatus::Limited,
+                    should_continue: false,
+                    summary: format!("Review gate failed at the iteration limit: {reason}."),
+                    route_hint_override: None,
+                };
+            }
+
             let summary = if *self.worker_status == WorkerStatus::Succeeded {
-                format!("Goal completed after {} Gear iteration(s).", self.iteration)
+                format!(
+                    "Goal completed after {} Gear iteration(s). Review gate: {}.",
+                    self.iteration,
+                    self.review_gate.summary()
+                )
             } else {
                 format!(
-                    "Goal completed after {} Gear iteration(s); verification passed while worker status was {}.",
+                    "Goal completed after {} Gear iteration(s); verification passed while worker status was {}. Review gate: {}.",
                     self.iteration,
-                    self.worker_status.as_str()
+                    self.worker_status.as_str(),
+                    self.review_gate.summary()
                 )
             };
             return GoalEvaluation {
@@ -2415,6 +2670,39 @@ fn worker_artifact_path(worker_result: &WorkerResult, file_name: &str) -> Option
         .map(|artifact_dir| artifact_dir.join(file_name))
 }
 
+fn comment_check(workspace: &std::path::Path, changed_files: &[String]) -> Result<Vec<String>> {
+    if std::env::var("GEARBOX_GEAR_COMMENT_CHECK").ok().as_deref() != Some("1") {
+        return Ok(Vec::new());
+    }
+
+    let mut violations = Vec::new();
+    for relative_path in changed_files {
+        let path = workspace.join(relative_path);
+        let Ok(contents) = std_fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line_number, line) in contents.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("///") || trimmed.starts_with("//!") {
+                continue;
+            }
+            let is_organizational_comment = trimmed.starts_with("//")
+                && ["assigns ", "this function ", "first, ", "step ", "now we "]
+                    .iter()
+                    .any(|prefix| {
+                        trimmed[2..]
+                            .trim_start()
+                            .to_ascii_lowercase()
+                            .starts_with(prefix)
+                    });
+            if is_organizational_comment {
+                violations.push(format!("{relative_path}:{}", line_number + 1));
+            }
+        }
+    }
+    Ok(violations)
+}
+
 fn worker_text_head_tail(text: &str, line_limit: usize) -> (String, String) {
     let lines = text.lines().collect::<Vec<_>>();
     if lines.is_empty() {
@@ -2632,6 +2920,13 @@ fn evaluate_goal_with_source(
     nearest_fallback_available: bool,
     trigger_source: Option<RouteChangeType>,
 ) -> GoalEvaluation {
+    let review_gate = ReviewGate::from_inputs(
+        verification_passed,
+        worker_status,
+        scope_check,
+        coordinator_review,
+        &budget_snapshot.context_risk_signals,
+    );
     GoalDecisionPolicy {
         verification_passed,
         worker_status,
@@ -2649,6 +2944,7 @@ fn evaluate_goal_with_source(
         no_progress_signals,
         nearest_fallback_available,
         trigger_source,
+        review_gate: &review_gate,
     }
     .evaluate()
 }
@@ -2762,6 +3058,26 @@ fn goal_review_artifact(
         })
         .unwrap_or_else(|| "No provider-backed coordinator review ran.".to_string());
     let worker_transcript_summary = worker_transcript_summary(worker_result);
+    let review_gate = ReviewGate::from_inputs(
+        verification_results.iter().all(|result| result.success),
+        &worker_result.status,
+        scope_check,
+        coordinator_review,
+        no_progress_signals,
+    );
+    let review_gate_dimensions = review_gate
+        .results
+        .iter()
+        .map(|result| {
+            format!(
+                "- {}: `{}` — {}",
+                result.dimension.label(),
+                if result.passed { "pass" } else { "fail" },
+                result.evidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         r#"# Goal Review
@@ -2814,6 +3130,11 @@ Iteration: `{iteration}` / `{max_iterations}`
 
 {}
 
+## Review Gate
+
+- require_all_pass: `{}`
+{}
+
 ## Scope
 
 - forbidden_touches: {}
@@ -2859,6 +3180,8 @@ Iteration: `{iteration}` / `{max_iterations}`
         },
         verification_summary,
         coordinator_summary,
+        review_gate.require_all_pass,
+        review_gate_dimensions,
         scope_check.forbidden_touches.len(),
         scope_check.outside_allowed_paths.len(),
         scope_check.changed_file_count,
@@ -3104,6 +3427,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -3536,6 +3860,8 @@ mod tests {
     fn worker_call_count_increments_once_per_iteration() {
         let scope_check = crate::tools::ScopeCheck::default();
         let budget = BudgetController::default();
+        let review_gate =
+            ReviewGate::from_inputs(false, &WorkerStatus::Failed, &scope_check, None, &[]);
         let snapshot = BudgetSnapshot {
             worker_call_count: 1,
             attempt_count: 3,
@@ -3569,6 +3895,7 @@ mod tests {
             no_progress_signals: &[],
             nearest_fallback_available: false,
             trigger_source: None,
+            review_gate: &review_gate,
         };
         assert!(
             policy.budget_guard_reason().is_none(),
@@ -3595,6 +3922,7 @@ mod tests {
             no_progress_signals: &[],
             nearest_fallback_available: false,
             trigger_source: None,
+            review_gate: &review_gate,
         };
         assert!(
             limited_policy.budget_guard_reason().is_some(),
@@ -3607,6 +3935,43 @@ mod tests {
                 .contains("worker_calls"),
             "guard reason should mention worker_calls"
         );
+    }
+
+    #[test]
+    fn review_gate_reports_each_required_dimension() {
+        let mut scope_check = crate::tools::ScopeCheck::default();
+        scope_check.forbidden_touches.push(".env".to_string());
+        let review = CoordinatorReview {
+            goal_satisfied: Some(true),
+            summary: "accepted".to_string(),
+            repair_request: None,
+            route_hint: None,
+            stop_reason: None,
+            raw_response: "GOAL_SATISFIED: yes".to_string(),
+        };
+        let gate = ReviewGate::from_inputs(
+            true,
+            &WorkerStatus::Succeeded,
+            &scope_check,
+            Some(&review),
+            &[],
+        );
+        assert!(gate.require_all_pass);
+        assert_eq!(gate.results.len(), 4);
+        assert!(gate.failed_reason().is_some());
+        assert!(gate.summary().contains("security=fail"));
+    }
+
+    #[test]
+    fn continuation_stop_marker_survives_and_can_be_cleared() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        store.write_continuation_state("session-1", "goal-1", ContinuationStatus::Stopped)?;
+        assert!(store.continuation_is_stopped()?);
+        store.clear_continuation_stop()?;
+        assert!(!store.continuation_is_stopped()?);
+        Ok(())
     }
 
     #[test]
@@ -3703,6 +4068,8 @@ mod tests {
             max_provider_unknown_streak: 2,
             ..BudgetController::default()
         };
+        let review_gate =
+            ReviewGate::from_inputs(false, &WorkerStatus::Failed, &scope_check, None, &[]);
         let route_snapshot = BudgetSnapshot {
             worker_call_count: 1,
             ..BudgetSnapshot::default()
@@ -3724,6 +4091,7 @@ mod tests {
             no_progress_signals: &[],
             nearest_fallback_available: false,
             trigger_source: Some(RouteChangeType::RouteChange),
+            review_gate: &review_gate,
         };
         let reason = policy
             .budget_guard_reason()
@@ -3906,6 +4274,8 @@ mod tests {
             artifact.contains(&summary),
             "goal review artifact should embed the exact same budget_summary string"
         );
+        assert!(artifact.contains("## Review Gate"));
+        assert!(artifact.contains("goal_verification"));
     }
 
     #[test]
@@ -4376,6 +4746,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -4477,6 +4848,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -4574,6 +4946,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -4743,6 +5116,7 @@ mod tests {
             coordinator_review_hook: Some(hook),
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -4793,6 +5167,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Limited);
@@ -4849,6 +5224,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Complete);
@@ -4905,6 +5281,7 @@ mod tests {
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
+            continuation: false,
         })
         .expect_err("run should be cancelled");
 

@@ -134,6 +134,46 @@ impl WorkerToolPolicy {
         ]
         .join("\n")
     }
+
+    fn with_environment_overrides(mut self, category: WorkerCategory) -> Self {
+        let prefix = format!(
+            "GEARBOX_GEAR_CATEGORY_{}",
+            category.as_str().replace('-', "_").to_ascii_uppercase()
+        );
+        for (field, value) in [
+            ("QUESTION", &mut self.question),
+            (
+                "ALLOW_RECURSIVE_GEAR_TASKS",
+                &mut self.allow_recursive_gear_tasks,
+            ),
+            ("CAN_WRITE", &mut self.can_write),
+            ("CAN_REVIEW", &mut self.can_review),
+            ("CAN_EXPLORE", &mut self.can_explore),
+        ] {
+            let name = format!("{prefix}_{field}");
+            if let Ok(raw) = env::var(&name) {
+                match raw.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => *value = true,
+                    "0" | "false" | "no" | "off" => *value = false,
+                    _ => {}
+                }
+            }
+        }
+        self
+    }
+}
+
+fn tool_policy_for_category(category: WorkerCategory) -> WorkerToolPolicy {
+    category.tool_policy().with_environment_overrides(category)
+}
+
+fn worker_variant_for_category(category: WorkerCategory) -> Option<String> {
+    let category_key = category.as_str().replace('-', "_").to_ascii_uppercase();
+    env::var(format!("GEARBOX_GEAR_CATEGORY_{category_key}_VARIANT"))
+        .or_else(|_| env::var("GEARBOX_GEAR_WORKER_VARIANT"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -282,7 +322,7 @@ impl WorkerConfig {
         attempt: usize,
         route_hint: Option<&str>,
     ) -> SelectedWorkerRoute<'_> {
-        CategoryRouter::default().resolve(self, attempt, route_hint)
+        CategoryRouter.resolve(self, attempt, route_hint)
     }
 }
 
@@ -347,7 +387,8 @@ impl CategoryRouter {
                         category.prompt_append(),
                         worker_prompt_append_from_env(),
                     ),
-                    tools: category.tool_policy(),
+                    tools: tool_policy_for_category(category),
+                    variant: worker_variant_for_category(category),
                 };
             }
 
@@ -378,7 +419,8 @@ impl CategoryRouter {
                                 category.prompt_append(),
                                 worker_prompt_append_from_env(),
                             ),
-                            tools: category.tool_policy(),
+                            tools: tool_policy_for_category(category),
+                            variant: worker_variant_for_category(category),
                         };
                     }
                 }
@@ -440,7 +482,8 @@ impl CategoryRouter {
                     category.prompt_append(),
                     worker_prompt_append_from_env(),
                 ),
-                tools: category.tool_policy(),
+                tools: tool_policy_for_category(category),
+                variant: worker_variant_for_category(category),
             };
         }
 
@@ -495,7 +538,8 @@ impl CategoryRouter {
                 category.prompt_append(),
                 worker_prompt_append_from_env(),
             ),
-            tools: category.tool_policy(),
+            tools: tool_policy_for_category(category),
+            variant: worker_variant_for_category(category),
         }
     }
 
@@ -563,7 +607,7 @@ pub fn category_resolution_for_route(
         prompt_append: route.prompt_append.clone(),
         available_categories: available_categories.clone(),
         nearest_fallback: nearest_fallback.clone(),
-        fallback_chain: fallback_chain.clone(),
+        fallback_chain,
         tools: route.tools.clone(),
     };
     let resolution_result = if config.skip_worker {
@@ -820,6 +864,7 @@ pub struct SelectedWorkerRoute<'a> {
     pub route_reason: String,
     pub prompt_append: Option<String>,
     pub tools: WorkerToolPolicy,
+    pub variant: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -894,6 +939,8 @@ pub struct WorkerPacket {
     pub worker: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
     pub tools: WorkerToolPolicy,
@@ -1310,6 +1357,7 @@ fn start_command_backed_worker(
         task_id: task.id.clone(),
         worker: worker_name.to_string(),
         worker_model: route.worker_model.map(ToString::to_string),
+        variant: route.variant.clone(),
         prompt_append: route.prompt_append.clone(),
         tools: route.tools.clone(),
         category_resolution,
@@ -1618,7 +1666,7 @@ impl CommandWorkerSessionHandle {
             outcome_path: self.store.worker_dir(&self.task_id).join("outcome.json"),
         };
         self.emit_event(WorkerEvent::TurnFinished {
-            kind: turn_kind.clone(),
+            kind: turn_kind,
             result_path: result.result_path.clone(),
             outcome_path: result.outcome_path.clone(),
             summary: result.summary.clone(),
@@ -2621,23 +2669,23 @@ mod tests {
             require_worker: false,
         };
 
-        let repair = CategoryRouter::default().resolve(&config, 1, Some("repair"));
+        let repair = CategoryRouter.resolve(&config, 1, Some("repair"));
         assert_eq!(repair.worker_kind, WorkerKind::Opencode);
         assert_eq!(repair.category, WorkerCategory::Repair);
 
-        let repair_fallback = CategoryRouter::default().resolve(&config, 2, Some("repair"));
+        let repair_fallback = CategoryRouter.resolve(&config, 2, Some("repair"));
         assert_eq!(repair_fallback.worker_kind, WorkerKind::Codex);
         assert_eq!(repair_fallback.category, WorkerCategory::Repair);
 
-        let review = CategoryRouter::default().resolve(&config, 1, Some("review"));
+        let review = CategoryRouter.resolve(&config, 1, Some("review"));
         assert_eq!(review.worker_kind, WorkerKind::Codex);
         assert_eq!(review.category, WorkerCategory::Review);
 
-        let explore = CategoryRouter::default().resolve(&config, 1, Some("explore"));
+        let explore = CategoryRouter.resolve(&config, 1, Some("explore"));
         assert_eq!(explore.worker_kind, WorkerKind::ZedAgent);
         assert_eq!(explore.category, WorkerCategory::Explore);
 
-        let visual = CategoryRouter::default().resolve(&config, 1, Some("visual"));
+        let visual = CategoryRouter.resolve(&config, 1, Some("visual"));
         assert_eq!(visual.worker_kind, WorkerKind::Codex);
         assert_eq!(visual.category, WorkerCategory::Visual);
     }
@@ -2679,14 +2727,14 @@ mod tests {
             require_worker: false,
         };
 
-        let deep = CategoryRouter::default().resolve(&config, 1, Some("deep"));
+        let deep = CategoryRouter.resolve(&config, 1, Some("deep"));
         assert_eq!(deep.worker_kind, WorkerKind::Claude);
         assert!(
             deep.route_reason
                 .contains("skipping an unavailable provider/model route")
         );
 
-        let sequence = CategoryRouter::default().resolve(&config, 2, None);
+        let sequence = CategoryRouter.resolve(&config, 2, None);
         assert_eq!(sequence.worker_kind, WorkerKind::Claude);
         assert!(
             sequence
@@ -3742,7 +3790,9 @@ mod tests {
             .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { .. }))
             .collect();
         if let WorkerEvent::ToolCallStarted {
-            tool_name, arguments, ..
+            tool_name,
+            arguments,
+            ..
         } = tool_starts[0]
         {
             assert_eq!(tool_name, "read_file");
@@ -3751,7 +3801,9 @@ mod tests {
             panic!("expected ToolCallStarted");
         }
         if let WorkerEvent::ToolCallStarted {
-            tool_name, arguments, ..
+            tool_name,
+            arguments,
+            ..
         } = tool_starts[1]
         {
             assert_eq!(tool_name, "write_file");
@@ -3762,28 +3814,35 @@ mod tests {
 
         let transcript =
             std::fs::read_to_string(store.worker_dir(task_id).join("transcript.jsonl"))?;
-        assert!(transcript.contains("\"assistant_text_delta\""),
+        assert!(
+            transcript.contains("\"assistant_text_delta\""),
             "transcript should contain assistant_text_delta"
         );
-        assert!(transcript.contains("\"tool_call_started\""),
+        assert!(
+            transcript.contains("\"tool_call_started\""),
             "transcript should contain tool_call_started"
         );
-        assert!(transcript.contains("\"tool_call_finished\""),
+        assert!(
+            transcript.contains("\"tool_call_finished\""),
             "transcript should contain tool_call_finished"
         );
-        assert!(transcript.contains("\"read_file\""),
+        assert!(
+            transcript.contains("\"read_file\""),
             "transcript should contain read_file tool name"
         );
-        assert!(transcript.contains("\"write_file\""),
+        assert!(
+            transcript.contains("\"write_file\""),
             "transcript should contain write_file tool name"
         );
 
         let tool_events =
             std::fs::read_to_string(store.worker_dir(task_id).join("tool-events.jsonl"))?;
-        assert!(tool_events.contains("\"tool_call_started\""),
+        assert!(
+            tool_events.contains("\"tool_call_started\""),
             "tool-events should contain tool_call_started"
         );
-        assert!(tool_events.contains("\"tool_call_finished\""),
+        assert!(
+            tool_events.contains("\"tool_call_finished\""),
             "tool-events should contain tool_call_finished"
         );
 
@@ -3860,10 +3919,7 @@ mod tests {
             text_delta_count, 2,
             "should have 2 AssistantTextDelta events (before and after tool_use group)"
         );
-        assert_eq!(
-            tool_started_count, 1,
-            "should have 1 ToolCallStarted event"
-        );
+        assert_eq!(tool_started_count, 1, "should have 1 ToolCallStarted event");
         assert_eq!(
             tool_finished_count, 1,
             "should have 1 ToolCallFinished event"
@@ -3881,13 +3937,16 @@ mod tests {
 
         let transcript =
             std::fs::read_to_string(store.worker_dir(task_id).join("transcript.jsonl"))?;
-        assert!(transcript.contains("\"assistant_text_delta\""),
+        assert!(
+            transcript.contains("\"assistant_text_delta\""),
             "transcript should contain assistant_text_delta"
         );
-        assert!(transcript.contains("\"tool_call_started\""),
+        assert!(
+            transcript.contains("\"tool_call_started\""),
             "transcript should contain tool_call_started"
         );
-        assert!(transcript.contains("\"tool_call_finished\""),
+        assert!(
+            transcript.contains("\"tool_call_finished\""),
             "transcript should contain tool_call_finished"
         );
 

@@ -131,6 +131,7 @@ pub fn run() -> Result<()> {
                 coordinator_review_hook: None,
                 task_manager_control: None,
                 task_manager: None,
+                continuation: false,
             })?;
 
             println!("Gear goal: {}", outcome.goal_id);

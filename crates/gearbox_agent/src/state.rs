@@ -26,6 +26,22 @@ pub struct Session {
     pub current_goal_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationStatus {
+    Running,
+    Stopped,
+    Completed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContinuationState {
+    pub session_id: String,
+    pub goal_id: String,
+    pub status: ContinuationStatus,
+    pub updated_at: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoordinatorModel {
     pub provider_id: String,
@@ -240,6 +256,9 @@ pub enum EventKind {
     WorkerFinished,
     WorkerFailed,
     CompletionNotified,
+    ContinuationStarted,
+    ContinuationStopped,
+    ContinuationCompleted,
     DiffDetected,
     VerificationStarted,
     VerificationFailed,
@@ -274,6 +293,7 @@ impl StateStore {
             self.events_dir(),
             self.artifacts_dir(),
             self.workers_dir(),
+            self.continuation_dir(),
         ] {
             fs::create_dir_all(&path)
                 .with_context(|| format!("failed to create {}", path.display()))?;
@@ -303,6 +323,58 @@ impl StateStore {
 
     pub fn workers_dir(&self) -> PathBuf {
         self.root.join("workers")
+    }
+
+    pub fn continuation_dir(&self) -> PathBuf {
+        self.root.join("continuation")
+    }
+
+    pub fn continuation_state_path(&self) -> PathBuf {
+        self.continuation_dir().join("state.json")
+    }
+
+    pub fn read_continuation_state(&self) -> Result<Option<ContinuationState>> {
+        let path = self.continuation_state_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse {}", path.display()),
+        )?))
+    }
+
+    pub fn write_continuation_state(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        status: ContinuationStatus,
+    ) -> Result<PathBuf> {
+        let state = ContinuationState {
+            session_id: session_id.to_string(),
+            goal_id: goal_id.to_string(),
+            status,
+            updated_at: timestamp(),
+        };
+        let path = self.continuation_state_path();
+        write_json(&path, &state)?;
+        Ok(path)
+    }
+
+    pub fn continuation_is_stopped(&self) -> Result<bool> {
+        Ok(self
+            .read_continuation_state()?
+            .is_some_and(|state| state.status == ContinuationStatus::Stopped))
+    }
+
+    pub fn clear_continuation_stop(&self) -> Result<()> {
+        let path = self.continuation_state_path();
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to clear {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn artifact_dir(&self, goal_id: &str) -> PathBuf {

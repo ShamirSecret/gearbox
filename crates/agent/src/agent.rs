@@ -57,11 +57,11 @@ use gearbox_agent::runtime::{
     CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES, Orchestrator, RunOptions,
 };
-use gearbox_agent::state::{CoordinatorModel, StateStore};
+use gearbox_agent::state::{ContinuationStatus, CoordinatorModel, EventKind, StateStore, event};
 use gearbox_agent::task_manager::{
     ActionOutcome, ManagedTaskStatus, SendOutcome, SharedTaskManager, SteerOutcome,
-    TaskAttemptSnapshot, TaskManager, TaskManagerControl, TaskManagerSnapshot, TaskManagerTickLoop,
-    TaskSnapshot,
+    TaskAttemptSnapshot, TaskCommandContext, TaskManager, TaskManagerControl, TaskManagerSnapshot,
+    TaskManagerTickLoop, TaskSnapshot,
 };
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{
@@ -2269,14 +2269,16 @@ impl NativeAgentConnection {
         task_manager
             .lock()
             .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-            .interrupt_task(&task_id)
+            .interrupt_task_with_context(
+                &task_id,
+                &TaskCommandContext {
+                    caller_session_id: Some(session_id.to_string()),
+                    all_scope: false,
+                },
+            )
     }
 
-    pub fn cancel_gear_task(
-        &self,
-        session_id: &acp::SessionId,
-        cx: &App,
-    ) -> Result<ActionOutcome> {
+    pub fn cancel_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<ActionOutcome> {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
             return Ok(ActionOutcome::Noop);
         };
@@ -2289,7 +2291,96 @@ impl NativeAgentConnection {
         task_manager
             .lock()
             .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-            .cancel_task_with_outcome(&task_id)
+            .cancel_task_with_context(
+                &task_id,
+                &TaskCommandContext {
+                    caller_session_id: Some(session_id.to_string()),
+                    all_scope: false,
+                },
+            )
+    }
+
+    pub fn stop_gear_continuation(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+        let (workspace, control, task_manager, cancellation_token) = self
+            .agent
+            .read_with(
+                cx,
+                |agent,
+                 cx|
+                 -> Result<
+                    Option<(
+                        std::path::PathBuf,
+                        Option<TaskManagerControl>,
+                        Option<SharedTaskManager>,
+                        Option<CancellationToken>,
+                    )>,
+                > {
+                    let Some(session) = agent.sessions.get(session_id) else {
+                        return Ok(None);
+                    };
+                    let workspace = gear_workspace_for_session(session, agent, cx)?;
+                    Ok(Some((
+                        workspace,
+                        session.gear_task_manager_control.clone(),
+                        session.gear_task_manager.clone(),
+                        session.gear_cancellation_token.clone(),
+                    )))
+                },
+            )?
+            .context("Gear session not found")?;
+        let store = StateStore::new(workspace);
+        store.initialize()?;
+        let goal_id = store
+            .read_continuation_state()?
+            .map(|state| state.goal_id)
+            .unwrap_or_else(|| "active".to_string());
+        store.write_continuation_state(
+            &session_id.to_string(),
+            &goal_id,
+            ContinuationStatus::Stopped,
+        )?;
+        let current_task_id = control
+            .as_ref()
+            .map(|control| control.current_task_id())
+            .transpose()?
+            .flatten();
+        store.append_event(&event(
+            &session_id.to_string(),
+            Some(&goal_id),
+            current_task_id.as_deref(),
+            EventKind::ContinuationStopped,
+            "Gear continuation stopped by the user",
+            serde_json::json!({
+                "status": "stopped",
+                "task_id": current_task_id,
+            }),
+        ))?;
+        if let Some(cancellation_token) = cancellation_token {
+            cancellation_token.cancel();
+        }
+        if let (Some(control), Some(task_manager)) = (control, task_manager)
+            && let Some(task_id) = control.current_task_id()?
+        {
+            task_manager
+                .lock()
+                .map_err(|_| anyhow!("gear task manager mutex poisoned"))?
+                .cancel_task(&task_id)?;
+        }
+        Ok(true)
+    }
+
+    pub fn restart_gear_continuation(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+        let workspace = self
+            .agent
+            .read_with(cx, |agent, cx| -> Result<Option<std::path::PathBuf>> {
+                let Some(session) = agent.sessions.get(session_id) else {
+                    return Ok(None);
+                };
+                Ok(Some(gear_workspace_for_session(session, agent, cx)?))
+            })?
+            .context("Gear session not found")?;
+        StateStore::new(workspace).clear_continuation_stop()?;
+        Ok(true)
     }
 
     pub fn send_follow_up_gear_task(
@@ -2310,7 +2401,14 @@ impl NativeAgentConnection {
         task_manager
             .lock()
             .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-            .send_follow_up_task(&task_id, prompt)
+            .send_follow_up_task_with_context(
+                &task_id,
+                prompt,
+                &TaskCommandContext {
+                    caller_session_id: Some(session_id.to_string()),
+                    all_scope: false,
+                },
+            )
     }
 
     pub fn steer_gear_task(
@@ -2331,7 +2429,14 @@ impl NativeAgentConnection {
         task_manager
             .lock()
             .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-            .steer_task(&task_id, prompt)
+            .steer_task_with_context(
+                &task_id,
+                prompt,
+                &TaskCommandContext {
+                    caller_session_id: Some(session_id.to_string()),
+                    all_scope: false,
+                },
+            )
     }
 
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The
@@ -2614,6 +2719,7 @@ impl NativeAgentConnection {
         );
 
         let mut task_manager = TaskManager::with_control(task_manager_control.clone());
+        task_manager.set_session_scope(session_id.to_string());
         task_manager.set_worker_registry(WorkerRegistry::with_native_backend(Arc::new(
             GearZedWorkerBackend::new(native_worker_tx),
         )));
@@ -2681,6 +2787,7 @@ impl NativeAgentConnection {
             let run_task_manager = task_manager.clone();
             let run_worker_config = cx.update(|cx| gear_worker_config_from_env(cx));
             let run_task = cx.background_spawn(async move {
+                StateStore::new(&workspace).clear_continuation_stop()?;
                 let event_sink = {
                     let event_tx = event_tx.clone();
                     Arc::new(move |event: &gearbox_agent::state::Event| {
@@ -2707,6 +2814,7 @@ impl NativeAgentConnection {
                     coordinator_review_hook,
                     task_manager_control: Some(run_task_manager_control),
                     task_manager: Some(run_task_manager),
+                    continuation: true,
                 })?;
                 let final_report = std_fs::read_to_string(&outcome.final_report_path)
                     .with_context(|| {
@@ -4835,6 +4943,7 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
             worker_model: route.worker_model.map(ToString::to_string),
+            variant: route.variant.clone(),
             prompt_append: route.prompt_append.clone(),
             tools: route.tools.clone(),
             category_resolution,

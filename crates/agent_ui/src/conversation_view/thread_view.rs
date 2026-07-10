@@ -2011,16 +2011,17 @@ impl ThreadView {
             return Ok(false);
         };
 
-        let accepted = if steer {
-            connection
-                .steer_gear_task(&self.session_id, prompt, cx)?
-                .is_accepted()
+        let (accepted, reason) = if steer {
+            let outcome = connection.steer_gear_task(&self.session_id, prompt, cx)?;
+            (outcome.is_accepted(), outcome.reason())
         } else {
-            connection
-                .send_follow_up_gear_task(&self.session_id, prompt, cx)?
-                .is_accepted()
+            let outcome = connection.send_follow_up_gear_task(&self.session_id, prompt, cx)?;
+            (outcome.is_accepted(), outcome.reason())
         };
         if !accepted {
+            if let Some(reason) = reason {
+                self.handle_thread_error(anyhow::anyhow!(reason), cx);
+            }
             return Ok(false);
         }
 
@@ -4014,6 +4015,18 @@ impl ThreadView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(connection) = this.as_native_connection(cx) {
                                     match connection.cancel_gear_task(&this.session_id, cx) {
+                                        Ok(_) => cx.notify(),
+                                        Err(error) => this.handle_thread_error(error, cx),
+                                    }
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("gear-task-manager-stop-continuation", "Stop Continuation")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(connection) = this.as_native_connection(cx) {
+                                    match connection.stop_gear_continuation(&this.session_id, cx) {
                                         Ok(_) => cx.notify(),
                                         Err(error) => this.handle_thread_error(error, cx),
                                     }

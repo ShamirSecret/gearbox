@@ -250,33 +250,29 @@
 cargo test -p gearbox_agent
 ```
 
-**结果：** 169 tests pass（基线 153 → P0 轮 +5 → 158 → P1 轮 +7 → 165 → P2 轮 +4 → 169）
+**结果：** 当前本轮 `cargo test -p gearbox_agent -- --nocapture` 为 181 tests pass；后续以命令实际输出为准，不再手工维护累计公式。
 
 ### 剩余未补缺口
 
-以下缺口不在本次 P0/P1/P2 范围内，为后续轮次预留：
+以下项目已经在当前 Gear runtime 中落地，不再作为剩余缺口：统一销毁入口、启动 reconciliation、LRU/TTL、lost 保护、terminal revive、pending drain 和中断时 last output 捕获。
+
+后续仍需补强的缺口如下：
 
 | # | 缺口 | 来源文档 | 影响 | 建议 |
 |---|------|---------|------|------|
-| 1 | 单一销毁端口 | part5-lifecycle.md #1 | 每个路径独立销毁，可能泄漏 | 引入 `destroy_task()` 统一入口 |
-| 2 | 启动 reconciliation | part5-lifecycle.md #2 | 崩溃重启后残留 `running` 记录 | 启动时扫描 task-record.json |
-| 3 | LRU eviction | part5-lifecycle.md #3 | 无 resident 上限控制 | 新增 `admit_resident()` |
-| 4 | TTL 清理 | part5-lifecycle.md #5 | 无时间基记录过期 | 启动时删除超 N 天旧记录 |
-| 5 | `lost` 记录保护 | part5-lifecycle.md #6 | lost 记录无保护 | 引入 lost 状态 |
-| 6 | `reviveTerminal` | part3-steering.md #3 | completed task 不能继续 | 新增 revive 路径 |
-| 7 | `notifyStarted()` drain | part3-steering.md #4 | pending 期间消息丢失 | 消息队列 |
-| 8 | `scopeDenied()` | part3-steering.md #5 | 无控制路径会话隔离 | 新增 caller_session_id 检查 |
-| 9 | 中断时捕获 lastAssistantText | part3-steering.md #2 | 中断后看不到部分进度 | handle.last_output() capture |
+| 1 | provider-specific model variant adapter | gearbox-omo-reference.md §14 | variant 已写入 packet，但尚未适配各 provider 参数 | 为 native/command worker 增加 provider adapter |
+| 2 | 完整事件驱动 Ralph Loop | gearbox-omo-reference.md §2 | 当前仍以 GoalLoop 主循环为主 | 接入 session idle 事件并复用 revive |
+| 3 | Keyword → mode | gearbox-omo-reference.md §3 | prompt 尚未切换 ultrawork/hyperplan/deep 模式 | 在 goal 解析阶段增加显式模式 |
+| 4 | Task Reminder | gearbox-omo-reference.md §9 | 未追踪 task tool 使用频率 | 增加 worker tool-event 计数和提醒 |
+| 5 | `init-deep` / handoff | gearbox-omo-reference.md §11-12 | 尚无 CLI 和结构化交接 artifact | 独立 CLI/产品工单实现 |
+| 6 | plan format / tool-pair validator | gearbox-omo-reference.md §13 | 尚无统一计划格式与工具参数门禁 | 增加 Review Gate 可选维度 |
 
 ### 文档映射
 
 | 完成项 | 记录在 |
 |--------|--------|
-| P0-1~P0-5, P1-3, P2-1 | `docs/gearbox-omo-part8-11-remaining.md` |
-| P0-5, P1-2 | `docs/gearbox-omo-part5-lifecycle.md` |
-| P1-1 | `docs/gearbox-omo-part2-task-manager.md` |
-| P2-2 | `docs/gearbox-omo-part3-steering.md` |
-| P1~P3 全部 | `docs/gearbox-diff-review-2026-07-09.md` 五~六章 |
+| P0/P1/P2 基线 | `docs/arch/` 下对应历史文档 |
+| 本轮控制面、revive、scope、Review Gate、variant、Stop Continuation | `docs/gearbox-omo-next-execution-plan.md` |
 
 ---
 

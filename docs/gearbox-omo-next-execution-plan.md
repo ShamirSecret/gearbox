@@ -2,7 +2,7 @@
 
 > 制定日期：2026-07-10  
 > 对齐基线：`docs/gearbox-omo-reference.md` 与 `/home/donald/文档/github/oh-my-openagent` 当前实现  
-> 前置结果：`cargo test -p gearbox_agent` 已通过 172 个测试
+> 前置结果：`cargo test -p gearbox_agent` 已通过 181 个测试
 
 ## 1. 目标
 
@@ -173,11 +173,11 @@
 
 ### 9.1 文档收口
 
-1. 更新 `docs/gearbox-gear-remaining-gap-dogfood-plan.md`：
+1. 更新归档计划 `docs/arch/gearbox-gear-remaining-gap-dogfood-plan.md`：
    - 把已实现的 destroy/reconciliation/LRU/TTL/lost/pending drain/last output 从“剩余未补”移除。
    - 使用实际测试数，不手工维护累计公式。
 2. 更新 `docs/gearbox-omo-reference.md`，将“Gear 实现要点”分成 `已完成/部分完成/未完成`，避免用 v4.16.0 时的判断描述当前代码。
-3. 共享源码若有新改动，同步 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md`。
+3. 共享源码若有新改动，同步 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md`，并记录本轮 typed outcome、scope guard 和 Stop Continuation 的共享层边界。
 4. 下一批另立计划，不混入本轮：keyword mode、task reminder、`init-deep`、handoff、plan format validator 和完整 Ralph Loop 迁移。
 
 ### 9.2 全量验收
@@ -212,3 +212,22 @@ cargo test -p gearbox_agent -- --nocapture
 | 7 | 文档与全量回归 | 全部 | 文档无已完成的假缺口，全量门槛通过 |
 
 任一工单不得仅以“新增类型或文档”作为完成标准；必须有真实命令路径、持久化状态、失败分支和端到端回归证据。
+
+## 11. 当前执行状态
+
+截至 2026-07-10，本轮代码已落地：
+
+- TaskManager terminal revive：resident handle、run epoch、attempt、concurrency 和 completion tracking 会重新纳管。
+- cancel/interrupt：TaskManager transition 先于 handle 操作；interrupt 使用独立 typed outcome；late completion 不覆盖 terminal record。
+- typed send/steer/cancel/interrupt API：共享 Agent 层保留结构化 outcome，GUI 对拒绝原因显示线程错误。
+- session scope：`TaskCommandContext` 支持 caller session、root/parent ownership、显式 `all_scope` 和 pending caller ownership，并覆盖跨会话允许路径测试。
+- pending drain：投递失败时从失败消息开始按原顺序重新入队，独立回归测试覆盖剩余消息。
+- Review Gate：goal verification、code quality、security、QA 四维结果写入 goal-review artifact，并由 hard-gate summary 驱动 repair；可选 comment checker 通过 `GEARBOX_GEAR_COMMENT_CHECK=1` 启用。
+- category tool policy / model variant：支持 `GEARBOX_GEAR_CATEGORY_<CATEGORY>_*` 与 `GEARBOX_GEAR_WORKER_VARIANT` 环境覆盖，并写入 WorkerPacket。
+- Stop Continuation：`.gearbox-agent/continuation/state.json`、GUI Stop Continuation、continuation lifecycle event、重启清除路径和 GoalLoop 检查已接入。
+
+仍需补强的证据或后续能力：
+
+- native worker 的 variant 仍主要体现在 packet/artifact，尚未为每个 provider 建立独立 variant 适配器。
+- session-idle 事件驱动续跑目前只有 guard 和内部状态接口，完整 Ralph Loop 迁移属于下一批计划。
+- keyword mode、task reminder、`init-deep`、handoff、plan format validator 不属于本轮交付。

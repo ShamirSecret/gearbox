@@ -305,6 +305,15 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 
 ## Follow-up Targets
 
+### 2026-07-10 Gear control-plane alignment
+
+| Shared file | Gear-only behavior and upstream boundary |
+|---|---|
+| `crates/agent/src/agent.rs` | Gear sessions expose typed `ActionOutcome`/`SendOutcome`/`SteerOutcome`, route task commands through the shared `TaskManager`, and add Stop Continuation persistence plus continuation lifecycle events. Non-Gear agent behavior is unchanged. |
+| `crates/agent_ui/src/conversation_view/thread_view.rs` | Gear-only controls display structured rejection reasons and expose Stop Continuation, including while the continuation loop is idle; upstream conversation controls retain their existing paths. |
+
+The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear sessions. Internal upstream action names, ACP protocol identifiers, and non-Gear cancellation behavior remain unchanged.
+
 - Action-name translation layer for command palette entries
 - Continue expanding settings item title/description mappings in `settings_ui.rs` and `gearbox_text.rs`
 - Continue localizing Agent panel labels

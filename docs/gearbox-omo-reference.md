@@ -3,6 +3,22 @@
 > 基于对 omo（oh-my-openagent v4.16.0）源码的深度逆向分析。
 > 目标：将 omo 的核心编排、质量门禁、token 优化机制提取为 Gear 可直接复用的设计。
 
+## 当前实现状态（2026-07-10）
+
+以下状态以当前 Gear 源码为准；本文件后文的“Gear 实现要点”是设计参考，不再代表未实现清单。
+
+| 能力 | 当前状态 | 代码证据 |
+|---|---|---|
+| Model fallback / category route | 已完成基础链路 | `crates/gearbox_agent/src/workers.rs`、`task_manager.rs` |
+| TaskManager steering / terminal revive | 已完成主路径 | `task_manager.rs` 的 typed outcome、resident epoch revive |
+| Completion parent wake | 已完成基础缓冲与串行 flush | `task_manager.rs`、`runtime.rs` |
+| Review Gate | 部分完成 | 四维 hard gate；comment checker 为环境开关 |
+| Category tool policy / model variant | 部分完成 | category 环境覆盖与 WorkerPacket；provider variant 适配待补 |
+| Stop Continuation Guard | 部分完成 | continuation state、lifecycle event、GUI stop、GoalLoop guard |
+| Keyword mode / task reminder | 未完成 | 另立下一批计划 |
+| `init-deep` / handoff / plan validator | 未完成 | 另立下一批计划 |
+| 完整事件驱动 Ralph Loop | 未完成 | 当前仍保留 GoalLoop 主循环 |
+
 ---
 
 ## 一、核心架构：omo 是如何工作的
