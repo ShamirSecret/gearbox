@@ -1,4 +1,4 @@
-//! Gearbox orchestration end-to-end tests.
+//! Gearbox orchestration component tests.
 //!
 //! 1. Small task delegation to Zed Agent
 //! 2. Medium task capability routing to external workers
@@ -6,15 +6,17 @@
 //! 4. Worker complete but review missing → incomplete status
 //! 5. Review passes → complete status with readable artifacts
 //!
-//! All tests use `#[gpui::test]` with deterministic GPUI scheduler.
+//! These tests isolate registry, persistence, and review-gate behavior with fake
+//! collaborators. The real ACP/GPUI lifecycle coverage lives in `agent.rs`.
 
 use super::*;
-use gearbox_agent::runtime::{ReviewDimension, ReviewDimensionResult, ReviewGate, ReviewerEvidence};
+use gearbox_agent::runtime::{
+    ReviewDimension, ReviewDimensionResult, ReviewGate, ReviewerEvidence,
+};
 use gearbox_agent::state::{StateStore, WorkLineage};
 use gearbox_agent::workers::{
     NativeWorkerBackend, WorkerCapabilities, WorkerCategory, WorkerConfig, WorkerKind,
-    WorkerOutcome, WorkerResult, WorkerSessionHandle, WorkerStartRequest,
-    WorkerRegistry,
+    WorkerOutcome, WorkerRegistry, WorkerResult, WorkerSessionHandle, WorkerStartRequest,
 };
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -35,17 +37,27 @@ impl WorkerSessionHandle for FakeWorkerSession {
     fn session_id(&self) -> Option<String> {
         self.state.lock().ok().and_then(|s| s.session_id.clone())
     }
-    fn send_follow_up(&self, _prompt: String) -> anyhow::Result<()> { Ok(()) }
-    fn steer(&self, _prompt: String) -> anyhow::Result<()> { Ok(()) }
-    fn interrupt(&self) -> anyhow::Result<()> { Ok(()) }
-    fn cancel(&self) -> anyhow::Result<()> { Ok(()) }
+    fn send_follow_up(&self, _prompt: String) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn steer(&self, _prompt: String) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn interrupt(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn wait_for_outcome(&self) -> anyhow::Result<WorkerOutcome> {
         anyhow::bail!("not supported")
     }
     fn wait_for_result(&self) -> anyhow::Result<WorkerResult> {
         anyhow::bail!("not supported")
     }
-    fn last_output(&self) -> Option<String> { None }
+    fn last_output(&self) -> Option<String> {
+        None
+    }
 }
 
 struct FakeNativeBackend {
@@ -54,22 +66,32 @@ struct FakeNativeBackend {
 
 impl FakeNativeBackend {
     fn new() -> Self {
-        Self { state: Arc::new(Mutex::new(FakeWorkerShared {
-            last_start_request_summary: None,
-            session_id: Some("fake-session-id".to_string()),
-        })) }
+        Self {
+            state: Arc::new(Mutex::new(FakeWorkerShared {
+                last_start_request_summary: None,
+                session_id: Some("fake-session-id".to_string()),
+            })),
+        }
     }
 }
 
 impl NativeWorkerBackend for FakeNativeBackend {
-    fn start_zed_agent(&self, request: WorkerStartRequest<'_>) -> anyhow::Result<Arc<dyn WorkerSessionHandle>> {
-        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+    fn start_zed_agent(
+        &self,
+        request: WorkerStartRequest<'_>,
+    ) -> anyhow::Result<Arc<dyn WorkerSessionHandle>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
         state.last_start_request_summary = Some(format!(
             "task={}, goal={}, route_attempt={}",
             request.task.id, request.goal, request.route_attempt
         ));
         drop(state);
-        Ok(Arc::new(FakeWorkerSession { state: self.state.clone() }))
+        Ok(Arc::new(FakeWorkerSession {
+            state: self.state.clone(),
+        }))
     }
 }
 
@@ -170,9 +192,12 @@ fn gate_with_review_evidence() -> ReviewGate {
                 evidence: "verification passed and coordinator accepted the goal".to_string(),
                 reviewer_evidence: Some(ReviewerEvidence {
                     execution_id: "worker-session-42_GoalVerification".to_string(),
+                    reviewed_execution_id: "executor-session-41".to_string(),
                     route: "GoalVerification".to_string(),
+                    model: Some("test/reviewer".to_string()),
                     artifact_path: Some("/tmp/goal-verification.md".to_string()),
                     verdict: "pass".to_string(),
+                    findings: vec!["goal evidence inspected".to_string()],
                 }),
             },
             ReviewDimensionResult {
@@ -181,9 +206,12 @@ fn gate_with_review_evidence() -> ReviewGate {
                 evidence: "scope checks are clean".to_string(),
                 reviewer_evidence: Some(ReviewerEvidence {
                     execution_id: "worker-session-42_CodeQuality".to_string(),
+                    reviewed_execution_id: "executor-session-41".to_string(),
                     route: "CodeQuality".to_string(),
+                    model: Some("test/reviewer".to_string()),
                     artifact_path: Some("/tmp/code-quality.md".to_string()),
                     verdict: "pass".to_string(),
+                    findings: vec!["quality evidence inspected".to_string()],
                 }),
             },
             ReviewDimensionResult {
@@ -192,9 +220,12 @@ fn gate_with_review_evidence() -> ReviewGate {
                 evidence: "no forbidden paths were touched".to_string(),
                 reviewer_evidence: Some(ReviewerEvidence {
                     execution_id: "worker-session-42_Security".to_string(),
+                    reviewed_execution_id: "executor-session-41".to_string(),
                     route: "Security".to_string(),
+                    model: Some("test/reviewer".to_string()),
                     artifact_path: Some("/tmp/security.md".to_string()),
                     verdict: "pass".to_string(),
+                    findings: vec!["security evidence inspected".to_string()],
                 }),
             },
             ReviewDimensionResult {
@@ -203,9 +234,12 @@ fn gate_with_review_evidence() -> ReviewGate {
                 evidence: "verification commands passed".to_string(),
                 reviewer_evidence: Some(ReviewerEvidence {
                     execution_id: "worker-session-42_QaExecution".to_string(),
+                    reviewed_execution_id: "executor-session-41".to_string(),
                     route: "QaExecution".to_string(),
+                    model: Some("test/reviewer".to_string()),
                     artifact_path: Some("/tmp/qa-execution.md".to_string()),
                     verdict: "pass".to_string(),
+                    findings: vec!["qa evidence inspected".to_string()],
                 }),
             },
         ],
@@ -215,7 +249,7 @@ fn gate_with_review_evidence() -> ReviewGate {
 // ─── Test 1: Small task delegation to Zed Agent ────────────────────────────
 
 #[gpui::test]
-async fn test_gearbox_small_task_delegation(_cx: &mut TestAppContext) {
+async fn test_gearbox_component_small_task_delegation(_cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let store = StateStore::new(tmp.path());
     store.initialize().expect("failed to initialize StateStore");
@@ -227,20 +261,32 @@ async fn test_gearbox_small_task_delegation(_cx: &mut TestAppContext) {
     let config = test_worker_config();
 
     let request = make_request(&store, tmp.path(), &task, "test small task goal", &config);
-    let handle = registry.start(request).expect("WorkerRegistry::start should succeed");
+    let handle = registry
+        .start(request)
+        .expect("WorkerRegistry::start should succeed");
 
     let session_id = handle.session_id();
-    assert!(session_id.is_some(), "Worker session handle should have a session_id");
-    assert_eq!(session_id.as_deref(), Some("fake-session-id"), "Worker session should report correct session ID");
+    assert!(
+        session_id.is_some(),
+        "Worker session handle should have a session_id"
+    );
+    assert_eq!(
+        session_id.as_deref(),
+        Some("fake-session-id"),
+        "Worker session should report correct session ID"
+    );
 
     let caps = WorkerCapabilities::command();
-    assert!(caps.supports_category(WorkerCategory::Quick), "command worker should support Quick");
+    assert!(
+        caps.supports_category(WorkerCategory::Quick),
+        "command worker should support Quick"
+    );
 }
 
 // ─── Test 2: Capability routing ─────────────────────────────────────────────
 
 #[gpui::test]
-async fn test_gearbox_capability_routing(_cx: &mut TestAppContext) {
+async fn test_gearbox_component_capability_routing(_cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let store = StateStore::new(tmp.path());
     store.initialize().expect("failed to initialize StateStore");
@@ -251,23 +297,39 @@ async fn test_gearbox_capability_routing(_cx: &mut TestAppContext) {
     let task = test_task("test-task-id");
     let config = test_worker_config();
 
-    for category in &[WorkerCategory::Quick, WorkerCategory::Deep, WorkerCategory::Repair, WorkerCategory::Review, WorkerCategory::Explore] {
+    for category in &[
+        WorkerCategory::Quick,
+        WorkerCategory::Deep,
+        WorkerCategory::Repair,
+        WorkerCategory::Review,
+        WorkerCategory::Explore,
+    ] {
         let goal = format!("test category routing for {c:?}", c = category);
         let request = make_request(&store, tmp.path(), &task, &goal, &config);
         let result = registry.start(request);
-        assert!(result.is_ok(), "WorkerRegistry::start should succeed for category {category:?}");
+        assert!(
+            result.is_ok(),
+            "WorkerRegistry::start should succeed for category {category:?}"
+        );
     }
 
     let code_caps = WorkerCapabilities::command();
-    for edit_category in &[WorkerCategory::Quick, WorkerCategory::Deep, WorkerCategory::Repair] {
-        assert!(code_caps.supports_category(*edit_category), "command worker should support {edit_category:?}");
+    for edit_category in &[
+        WorkerCategory::Quick,
+        WorkerCategory::Deep,
+        WorkerCategory::Repair,
+    ] {
+        assert!(
+            code_caps.supports_category(*edit_category),
+            "command worker should support {edit_category:?}"
+        );
     }
 }
 
 // ─── Test 3: Session recovery with lineage consistency ──────────────────────
 
 #[gpui::test]
-async fn test_gearbox_session_recovery(_cx: &mut TestAppContext) {
+async fn test_gearbox_component_session_recovery(_cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let store = StateStore::new(tmp.path());
     store.initialize().expect("failed to initialize StateStore");
@@ -281,7 +343,9 @@ async fn test_gearbox_session_recovery(_cx: &mut TestAppContext) {
     lineage.plan_remaining_items = 2;
     lineage.updated_at = "2025-01-01T00:01:00Z".to_string();
 
-    let path = store.write_lineage(&lineage).expect("should persist lineage");
+    let path = store
+        .write_lineage(&lineage)
+        .expect("should persist lineage");
     assert!(path.exists(), "Lineage file should exist at {path:?}");
 
     let session_record = gearbox_agent::state::Session {
@@ -291,33 +355,67 @@ async fn test_gearbox_session_recovery(_cx: &mut TestAppContext) {
         updated_at: "2025-01-01T00:01:00Z".to_string(),
         current_goal_id: "goal-1".to_string(),
     };
-    store.write_session(&session_record).expect("should write session");
+    store
+        .write_session(&session_record)
+        .expect("should write session");
 
     drop(store);
 
     let recovered_store = StateStore::new(tmp.path());
     recovered_store.initialize().expect("should re-initialize");
 
-    let recovered_lineage = recovered_store.read_lineage(root_session_id)
+    let recovered_lineage = recovered_store
+        .read_lineage(root_session_id)
         .expect("should read lineage after recovery")
         .expect("lineage should exist after recovery");
 
-    assert_eq!(recovered_lineage.root_session_id, root_session_id, "Root session ID should match after recovery");
-    assert_eq!(recovered_lineage.worker_session_ids.len(), 2, "Should have 2 workers after recovery, got {}", recovered_lineage.worker_session_ids.len());
-    assert_eq!(recovered_lineage.active_task_ids.len(), 2, "Should have 2 active tasks after recovery");
-    assert_eq!(recovered_lineage.plan_remaining_items, 2, "plan_remaining_items should be preserved");
-    assert!(recovered_lineage.worker_session_ids.contains(&"worker-1".to_string()), "Lineage should include worker-1");
-    assert!(recovered_lineage.worker_session_ids.contains(&"worker-2".to_string()), "Lineage should include worker-2");
+    assert_eq!(
+        recovered_lineage.root_session_id, root_session_id,
+        "Root session ID should match after recovery"
+    );
+    assert_eq!(
+        recovered_lineage.worker_session_ids.len(),
+        2,
+        "Should have 2 workers after recovery, got {}",
+        recovered_lineage.worker_session_ids.len()
+    );
+    assert_eq!(
+        recovered_lineage.active_task_ids.len(),
+        2,
+        "Should have 2 active tasks after recovery"
+    );
+    assert_eq!(
+        recovered_lineage.plan_remaining_items, 2,
+        "plan_remaining_items should be preserved"
+    );
+    assert!(
+        recovered_lineage
+            .worker_session_ids
+            .contains(&"worker-1".to_string()),
+        "Lineage should include worker-1"
+    );
+    assert!(
+        recovered_lineage
+            .worker_session_ids
+            .contains(&"worker-2".to_string()),
+        "Lineage should include worker-2"
+    );
 }
 
 // ─── Test 4: Incomplete without review ──────────────────────────────────────
 
 #[gpui::test]
-async fn test_gearbox_incomplete_without_review(_cx: &mut TestAppContext) {
+async fn test_gearbox_component_incomplete_without_review(_cx: &mut TestAppContext) {
     let gate = gate_without_review_evidence();
 
-    assert!(gate.require_all_pass, "ReviewGate should require all dimensions");
-    assert!(gate.results.iter().all(|r| r.passed), "All dimensions should pass individually");
+    assert!(
+        gate.require_all_pass,
+        "ReviewGate should require all dimensions"
+    );
+    assert!(
+        gate.results.iter().all(|r| r.passed),
+        "All dimensions should pass individually"
+    );
 
     for result in &gate.results {
         assert!(
@@ -331,19 +429,29 @@ async fn test_gearbox_incomplete_without_review(_cx: &mut TestAppContext) {
 // ─── Test 5: Complete after review ──────────────────────────────────────────
 
 #[gpui::test]
-async fn test_gearbox_complete_after_review(_cx: &mut TestAppContext) {
+async fn test_gearbox_component_complete_after_review(_cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let store = StateStore::new(tmp.path());
     store.initialize().expect("failed to initialize StateStore");
 
-    let artifact_path = store.write_artifact("goal-1", "review-output.md", "All checks passed.")
+    let artifact_path = store
+        .write_artifact("goal-1", "review-output.md", "All checks passed.")
         .expect("should write artifact");
-    assert!(artifact_path.exists(), "Artifact should exist on disk at {artifact_path:?}");
+    assert!(
+        artifact_path.exists(),
+        "Artifact should exist on disk at {artifact_path:?}"
+    );
 
     let gate = gate_with_review_evidence();
 
-    assert!(gate.require_all_pass, "ReviewGate should require all dimensions");
-    assert!(gate.results.iter().all(|r| r.passed), "All dimensions should pass");
+    assert!(
+        gate.require_all_pass,
+        "ReviewGate should require all dimensions"
+    );
+    assert!(
+        gate.results.iter().all(|r| r.passed),
+        "All dimensions should pass"
+    );
 
     for result in &gate.results {
         assert!(
@@ -357,10 +465,17 @@ async fn test_gearbox_complete_after_review(_cx: &mut TestAppContext) {
                 "Evidence execution_id should contain the worker session ID: {}",
                 evidence.execution_id,
             );
-            assert_eq!(evidence.verdict, "pass", "All dimensions should have 'pass' verdict");
+            assert_eq!(
+                evidence.verdict, "pass",
+                "All dimensions should have 'pass' verdict"
+            );
         }
     }
 
     let artifact_content = std::fs::read_to_string(&artifact_path).expect("should read artifact");
-    assert_eq!(artifact_content.trim(), "All checks passed.", "Artifact content should match what was written");
+    assert_eq!(
+        artifact_content.trim(),
+        "All checks passed.",
+        "Artifact content should match what was written"
+    );
 }

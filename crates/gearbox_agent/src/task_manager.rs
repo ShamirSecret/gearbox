@@ -1307,7 +1307,6 @@ impl Default for TaskManager {
     }
 }
 
-
 impl TaskManager {
     pub fn set_lifecycle_event_log(&mut self, log: Option<Arc<Mutex<Vec<String>>>>) {
         self.lifecycle_events = log;
@@ -2050,6 +2049,9 @@ impl TaskManager {
                     self.forget_task(task_id)?;
                     return Ok(None);
                 };
+                if let Some(session_id) = running_task.handle.session_id() {
+                    record.session_id = Some(session_id);
+                }
                 let transition = match result.status {
                     WorkerStatus::Succeeded => transition_task_record(
                         &mut record,
@@ -2186,6 +2188,9 @@ impl TaskManager {
                     self.forget_task(task_id)?;
                     return Ok(None);
                 };
+                if let Some(session_id) = running_task.handle.session_id() {
+                    record.session_id = Some(session_id);
+                }
                 let error_text = format!("{error:#}");
                 let transition = if record.status == ManagedTaskStatus::Interrupted {
                     transition_task_record(
@@ -2621,11 +2626,7 @@ impl TaskManager {
         let handle = resident_task.handle.clone();
         let session_id = handle.session_id();
         let revive_result = (|| -> Result<RunningTask> {
-            let subscription = if handle.session_id().is_some() {
-                Some(handle.subscribe(Arc::new(|_| {}))?)
-            } else {
-                None
-            };
+            let subscription = subscribe_to_worker_events(&handle)?;
             let record = self
                 .records
                 .get_mut(task_id)
@@ -3285,11 +3286,7 @@ impl TaskManager {
                     "concurrency slot unexpectedly unavailable while starting task: {task_id}"
                 ));
             }
-            let subscription = if handle.session_id().is_some() {
-                Some(handle.subscribe(Arc::new(|_| {}))?)
-            } else {
-                None
-            };
+            let subscription = subscribe_to_worker_events(&handle)?;
             self.control.set_current(
                 task_id.clone(),
                 ManagedTaskStatus::Running,
@@ -3340,12 +3337,11 @@ impl TaskManager {
                 let result = running_task.handle.wait_for_idle()?;
                 Ok((outcome, result))
             })();
-            let send_result = finished_task_tx.send(FinishedTaskMessage {
+            if let Err(error) = finished_task_tx.send(FinishedTaskMessage {
                 task_id,
                 running_task,
                 run_result,
-            });
-            if let Err(error) = send_result {
+            }) {
                 eprintln!("failed to dispatch finished Gear worker task: {error}");
             }
         });
@@ -3838,8 +3834,7 @@ fn transition_task_record(
                 record.failure_kind = None;
                 record.retry_reason = None;
                 record.error = None;
-                record.session_id = session_id
-                    .or_else(|| Some(format!("{}_session", record.task_id)));
+                record.session_id = session_id;
                 apply_attempt_status(record, TaskAttemptStatus::Running);
                 true
             }
@@ -4327,6 +4322,9 @@ fn normalized_worker_command(value: Option<&str>) -> Option<String> {
 }
 
 fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut QueuedTask) {
+    if queued_task.task.inputs.phase_route_locked {
+        return;
+    }
     if queued_task.route_hint.is_none() {
         return;
     }
@@ -4414,6 +4412,16 @@ fn should_retry_worker_result(
 
     record.failure_kind == Some(TaskFailureKind::WorkerUnavailable)
         && (!queued_task.config.worker_routes.is_empty() || queued_task.config.require_worker)
+}
+
+fn subscribe_to_worker_events(
+    handle: &Arc<dyn WorkerSessionHandle>,
+) -> Result<Option<WorkerSubscription>> {
+    if handle.supports_event_subscriptions() {
+        Ok(Some(handle.subscribe(Arc::new(|_| {}))?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn concurrency_key_for_task(queued_task: &QueuedTask) -> String {
@@ -4827,6 +4835,12 @@ mod tests {
                 error: Some("exit 2".to_string()),
             }],
         };
+
+        let mut phase_locked_task = queued_task.clone();
+        phase_locked_task.task.inputs.phase_route_locked = true;
+        maybe_append_failure_upgrade_route(&record, &mut phase_locked_task);
+        assert!(phase_locked_task.config.worker_routes.is_empty());
+        assert_eq!(phase_locked_task.route_hint.as_deref(), Some("repair"));
 
         let decision = queue_next_attempt(&mut record, &mut queued_task);
 
@@ -5514,6 +5528,37 @@ mod tests {
     }
 
     #[test]
+    fn delayed_worker_session_id_replaces_no_session_start_state() {
+        let mut record = test_task_record(
+            "task_delayed_session",
+            ManagedTaskStatus::Pending,
+            TaskAttemptStatus::Pending,
+        );
+        let start = transition_task_record(&mut record, TaskTransition::Start { session_id: None });
+        assert!(start.applied);
+        assert_eq!(record.session_id, None);
+        assert_eq!(record.attempts[0].session_id, None);
+
+        record.session_id = Some("real-acp-session".to_string());
+        let complete = transition_task_record(
+            &mut record,
+            TaskTransition::Complete {
+                finished_at: timestamp(),
+                result_path: PathBuf::from("result.json"),
+                outcome_path: PathBuf::from("outcome.json"),
+                summary: "completed".to_string(),
+                failure_kind: None,
+            },
+        );
+        assert!(complete.applied);
+        assert_eq!(record.session_id.as_deref(), Some("real-acp-session"));
+        assert_eq!(
+            record.attempts[0].session_id.as_deref(),
+            Some("real-acp-session")
+        );
+    }
+
+    #[test]
     fn task_manager_tick_settles_finished_worker_without_wait_for() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -5674,6 +5719,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_identity_does_not_imply_event_subscription_support() -> Result<()> {
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeOutputHandle);
+
+        assert!(handle.session_id().is_some());
+        assert!(!handle.supports_event_subscriptions());
+        assert!(subscribe_to_worker_events(&handle)?.is_none());
+        Ok(())
+    }
+
     struct FakeInterruptHandle {
         interrupted: Arc<AtomicUsize>,
         cancelled: Arc<AtomicUsize>,
@@ -5724,6 +5779,10 @@ mod tests {
             None
         }
 
+        fn supports_event_subscriptions(&self) -> bool {
+            true
+        }
+
         fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
             Ok(WorkerSubscription::noop())
         }
@@ -5762,6 +5821,10 @@ mod tests {
 
         fn last_output(&self) -> Option<String> {
             None
+        }
+
+        fn supports_event_subscriptions(&self) -> bool {
+            true
         }
 
         fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {

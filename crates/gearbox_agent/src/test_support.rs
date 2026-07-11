@@ -5,10 +5,13 @@ pub mod test_support {
 
     use anyhow::Result;
 
-    use crate::state::{Scope, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage};
+    use crate::state::{
+        Scope, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage,
+    };
     use crate::workers::{
-        NativeWorkerBackend, WorkerAdapter, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult,
-        WorkerRunRequest, WorkerRegistry, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
+        NativeWorkerBackend, WorkerAdapter, WorkerConfig, WorkerKind, WorkerOutcome,
+        WorkerRegistry, WorkerResult, WorkerRunRequest, WorkerSessionHandle, WorkerStartRequest,
+        WorkerStatus,
     };
 
     // ── FakeWorkerState ──────────────────────────────────────────────────
@@ -91,10 +94,7 @@ pub mod test_support {
 
     impl WorkerSessionHandle for FakeWorkerSessionHandle {
         fn session_id(&self) -> Option<String> {
-            self.state
-                .lock()
-                .ok()
-                .and_then(|s| s.session_id.clone())
+            self.state.lock().ok().and_then(|s| s.session_id.clone())
         }
 
         fn send_follow_up(&self, prompt: String) -> Result<()> {
@@ -315,8 +315,6 @@ pub mod test_support {
             route_hint: None,
         }
     }
-
-
 
     /// Build a minimal `WorkerConfig` for the given `WorkerKind`.
     ///

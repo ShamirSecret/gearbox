@@ -1,4 +1,5 @@
 use crate::languages::{LanguageDetection, LanguageProfile};
+use crate::plan_graph::{PlanGraph, PlanTaskContract};
 use crate::state::{Goal, GoalStatus, Task};
 use crate::tools::{DiffSnapshot, ScopeCheck, ShellCommandResult};
 use crate::workers::WorkerResult;
@@ -65,13 +66,15 @@ pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
     )
 }
 
-pub fn plan(goal: &Goal, tasks: &[Task], detection: &LanguageDetection) -> String {
+pub fn plan(goal: &Goal, plan_graph: &PlanGraph, detection: &LanguageDetection) -> String {
     let generation_guidance = generation_guidance(detection);
-    let task_lines = tasks
+    let task_lines = plan_graph
+        .draft
+        .tasks
         .iter()
-        .map(|task| format!("- `{}`: {} ({:?})", task.id, task.title, task.kind))
+        .map(render_plan_task)
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
     let commands = if detection.verification_commands.is_empty() {
         "- No verification command detected yet.".to_string()
     } else {
@@ -87,21 +90,34 @@ pub fn plan(goal: &Goal, tasks: &[Task], detection: &LanguageDetection) -> Strin
         r#"# Plan
 
 Goal: `{}`
+Plan: `{}`
+Revision: `{}`
+Plan hash: `{}`
+Source: `{:?}`
+
+## Objective
+
+{}
+
+## Topology Lock
+
+{}
+
+## Must Have
+
+{}
+
+## Must Not Have
+
+{}
 
 ## Execution Tasks
 
 {}
 
-## Default Build Path
+## Final Acceptance
 
-- Use the coordinator model recorded below for Gear planning and review context when available.
-- Confirm the workspace facts with deterministic tools.
-- Follow the generation guidance below before writing code.
-- Send bounded implementation work to the configured worker adapter.
-- Inspect diff after the worker returns.
-- Run Gear-owned verification commands.
-- Create a repair task if verification fails.
-- Produce final delivery notes.
+{}
 
 ## Generation Guidance
 
@@ -120,12 +136,195 @@ Goal: `{}`
 {}
 "#,
         goal.id,
+        plan_graph.plan_id,
+        plan_graph.revision,
+        plan_graph.plan_hash,
+        plan_graph.source,
+        plan_graph.draft.objective,
+        markdown_list(&plan_graph.draft.topology_lock),
+        markdown_list(&plan_graph.draft.must_have),
+        markdown_list(&plan_graph.draft.must_not_have),
         task_lines,
+        markdown_list(&plan_graph.draft.final_acceptance),
         generation_guidance,
         coordinator_model_summary(goal),
         coordinator_brief_summary(goal),
         commands
     )
+}
+
+fn render_plan_task(task: &PlanTaskContract) -> String {
+    let red = task
+        .test
+        .red
+        .as_ref()
+        .map(|command| {
+            format!(
+                "- RED: `{}` -> {} (evidence: `{}`)",
+                command.command, command.expected_observation, command.evidence_path
+            )
+        })
+        .unwrap_or_else(|| "- RED: not required by the selected test strategy".to_string());
+    let green = if task.test.green.is_empty() {
+        "- GREEN: none".to_string()
+    } else {
+        task.test
+            .green
+            .iter()
+            .map(|command| {
+                format!(
+                    "- GREEN: `{}` -> {} (evidence: `{}`)",
+                    command.command, command.expected_observation, command.evidence_path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let references = if task.references.is_empty() {
+        "- none".to_string()
+    } else {
+        task.references
+            .iter()
+            .map(|reference| {
+                format!(
+                    "- `{}`{}: {}",
+                    reference.path,
+                    reference
+                        .symbol
+                        .as_deref()
+                        .map(|symbol| format!("::{symbol}"))
+                        .unwrap_or_default(),
+                    reference.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let artifacts = task
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "- `{}`: {} (required: {})",
+                artifact.path, artifact.description, artifact.required
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let happy_qa = task
+        .qa
+        .happy_path
+        .iter()
+        .map(|scenario| {
+            format!(
+                "- {}: {} -> {} (evidence: `{}`)",
+                scenario.name,
+                scenario.steps.join("; "),
+                scenario.expected_result,
+                scenario.evidence_path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let failure_qa = task
+        .qa
+        .failure_path
+        .iter()
+        .map(|scenario| {
+            format!(
+                "- {}: {} -> {} (evidence: `{}`)",
+                scenario.name,
+                scenario.steps.join("; "),
+                scenario.expected_result,
+                scenario.evidence_path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"### `{}`: {}
+
+- Goal: {}
+- Deliverable: {}
+- Dependencies: {}
+- Parallel wave: {}
+- Preferred phase profile: `{:?}`
+- Required capabilities: {}
+- Allowed files: {}
+- Forbidden files: {}
+- Write scope: {}
+- Max files changed: {}
+- Commit boundary: `{:?}`
+
+Must do:
+{}
+
+Must not do:
+{}
+
+References:
+{}
+
+Test strategy: `{:?}`
+{}
+{}
+
+Happy-path QA:
+{}
+
+Failure-path QA:
+{}
+
+Artifacts:
+{}
+
+Completion predicates:
+{}"#,
+        task.task_id,
+        task.title,
+        task.goal,
+        task.deliverable,
+        comma_list(&task.dependencies),
+        task.parallel_wave,
+        task.preferred_phase_profile,
+        comma_list(&task.required_capabilities),
+        comma_list(&task.scope.allowed_files),
+        comma_list(&task.scope.forbidden_files),
+        comma_list(&task.scope.write_scope),
+        task.scope.max_files_changed,
+        task.commit_boundary,
+        markdown_list(&task.must_do),
+        markdown_list(&task.must_not_do),
+        references,
+        task.test.strategy,
+        red,
+        green,
+        happy_qa,
+        failure_qa,
+        artifacts,
+        markdown_list(&task.completion_predicates),
+    )
+}
+
+fn markdown_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "- none".to_string()
+    } else {
+        values
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn comma_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn coordinator_model_summary(goal: &Goal) -> String {
@@ -136,11 +335,22 @@ fn coordinator_model_summary(goal: &Goal) -> String {
 }
 
 fn coordinator_brief_summary(goal: &Goal) -> String {
-    goal.coordinator_brief
+    let Some(brief) = goal
+        .coordinator_brief
         .as_deref()
         .filter(|brief| !brief.trim().is_empty())
-        .unwrap_or("not generated")
-        .to_string()
+    else {
+        return "not generated".to_string();
+    };
+    crate::plan_graph::parse_planner_draft(brief)
+        .map(|draft| {
+            format!(
+                "Structured PlanGraph draft for `{}` with {} task(s).",
+                draft.objective,
+                draft.tasks.len()
+            )
+        })
+        .unwrap_or_else(|_| brief.to_string())
 }
 
 fn generation_guidance(detection: &LanguageDetection) -> String {
@@ -413,7 +623,8 @@ fn goal_next_step(goal_status: &GoalStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{goal_next_step, goal_summary_text};
+    use super::{goal_next_step, goal_summary_text, render_plan_task};
+    use crate::plan_graph::deterministic_fallback_draft;
     use crate::state::{
         Budget, Goal, GoalStatus, Scope, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
     };
@@ -447,6 +658,23 @@ mod tests {
             goal_next_step(&GoalStatus::NeedsUser),
             "Provide the missing user input or required worker configuration."
         );
+    }
+
+    #[test]
+    fn product_plan_renders_closed_world_task_contract() {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let draft = deterministic_fallback_draft(
+            "Implement feature",
+            &scope,
+            &["cargo test feature".to_string()],
+        );
+        let markdown = render_plan_task(&draft.tasks[0]);
+        assert!(markdown.contains("Must do:"));
+        assert!(markdown.contains("Must not do:"));
+        assert!(markdown.contains("Test strategy:"));
+        assert!(markdown.contains("Happy-path QA:"));
+        assert!(markdown.contains("Failure-path QA:"));
+        assert!(markdown.contains("Completion predicates:"));
     }
 
     #[test]

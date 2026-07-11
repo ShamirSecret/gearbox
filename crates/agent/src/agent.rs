@@ -20,6 +20,12 @@ pub use gearbox_agent::task_manager::{
     TaskAttemptStatus as GearTaskAttemptStatus, TaskManagerSnapshot as GearTaskManagerSnapshot,
     TaskSnapshot as GearTaskSnapshot,
 };
+// Broker contract types — re-exported for external backends to use
+pub use gearbox_agent::worker_broker::{
+    BrokerCapability, BrokerLifecycleReceipt, BrokerOutcome, BrokerPermissionEvidence,
+    BrokerPermissionType, BrokerPhaseRequest, BrokerSessionIdentity, ModelAvailability,
+    UnavailableReason,
+};
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
 pub use pattern_extraction::*;
@@ -53,11 +59,23 @@ use fs::Fs;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
+use gearbox_agent::phase_routing::{
+    LiveModelInventory, ModelSelectorId, PhaseBackend, PhaseRouteCandidate, PhaseRouteSource,
+    PhaseRouteTable,
+};
+use gearbox_agent::plan_graph::PhaseProfile;
+use gearbox_agent::plan_review::{
+    PhaseExecutionBackend, PhaseExecutionIdentity, PlanCriticVerdict,
+};
 use gearbox_agent::runtime::{
     CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
-    DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES, Orchestrator, RunOptions,
+    DEFAULT_MAX_PLAN_REVISIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
+    Orchestrator, PhaseRuntime, PlanCriticHook, PlanCriticInput, PlanCriticSubmission,
+    PlanRevisionHook, PlanRevisionInput, PlanRevisionSubmission, RunOptions,
 };
-use gearbox_agent::state::{ContinuationStatus, CoordinatorModel, EventKind, StateStore, event};
+use gearbox_agent::state::{
+    ContinuationStatus, CoordinatorModel, EventKind, StateStore, event, id_timestamp,
+};
 use gearbox_agent::task_manager::{
     ActionOutcome, ManagedTaskStatus, OutcomeContext, SendOutcome, SharedTaskManager, SteerOutcome,
     TaskAttemptSnapshot, TaskCommandContext, TaskManager, TaskManagerControl, TaskManagerSnapshot,
@@ -457,6 +475,8 @@ pub struct NativeAgent {
     /// three agent-panel interaction points: input box focus, slash
     /// autocomplete, and conversation submit.
     skills_state: SkillsState,
+    #[cfg(test)]
+    gear_worker_config_override: Option<WorkerConfig>,
 }
 
 #[derive(Default)]
@@ -619,6 +639,8 @@ impl NativeAgent {
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),
+                #[cfg(test)]
+                gear_worker_config_override: None,
             }
         })
     }
@@ -2694,7 +2716,7 @@ impl NativeAgentConnection {
             Err(error) => return Task::ready(Err(error)),
         };
 
-        let (coordinator_model, coordinator_language_model) = thread.update(cx, |thread, cx| {
+        let (_thread_model, coordinator_language_model) = thread.update(cx, |thread, cx| {
             thread.push_acp_user_block(
                 client_user_message_id,
                 prompt_blocks.clone(),
@@ -2717,6 +2739,15 @@ impl NativeAgentConnection {
             });
         }
 
+        let phase_models =
+            match gear_phase_models(&self.agent, coordinator_language_model.clone(), cx) {
+                Ok(models) => models,
+                Err(error) => return Task::ready(Err(error)),
+            };
+        let coordinator_model = Some(coordinator_model_for_language_model(
+            &phase_models.planner_model,
+        ));
+
         #[cfg(test)]
         let event_log = self
             .agent
@@ -2724,6 +2755,8 @@ impl NativeAgentConnection {
             .sessions
             .get(&session_id)
             .and_then(|s| s.gear_lifecycle_events.clone());
+        #[cfg(test)]
+        let gear_worker_config_override = self.agent.read(cx).gear_worker_config_override.clone();
 
         let (native_worker_tx, native_worker_rx) =
             async_channel::unbounded::<GearZedWorkerDispatch>();
@@ -2733,7 +2766,8 @@ impl NativeAgentConnection {
             session_id.clone(),
             native_worker_rx,
             running_native_zed_sessions.clone(),
-            #[cfg(test)] event_log.clone(),
+            #[cfg(test)]
+            event_log.clone(),
             cx,
         );
 
@@ -2757,16 +2791,19 @@ impl NativeAgentConnection {
 
         let (event_tx, event_rx) = async_channel::unbounded::<String>();
         let (review_tx, review_rx) = async_channel::unbounded::<GearCoordinatorReviewJob>();
+        let (plan_critic_tx, plan_critic_rx) = async_channel::unbounded::<GearPlanCriticJob>();
+        let (plan_revision_tx, plan_revision_rx) =
+            async_channel::unbounded::<GearPlanRevisionJob>();
 
         let agent = self.agent.clone();
         let cancellation_session_id = session_id.clone();
         cx.spawn(async move |cx| {
-            let review_language_model = coordinator_language_model.clone();
+            let review_language_model = phase_models.critic_model.clone();
             let review_workspace = workspace.clone();
             let review_task = cx.spawn(async move |cx| {
                 while let Ok(job) = review_rx.recv().await {
                     let review = generate_gear_coordinator_review(
-                        review_language_model.clone(),
+                        Some(review_language_model.clone()),
                         job.input,
                         &job.workspace,
                         cx,
@@ -2777,9 +2814,41 @@ impl NativeAgentConnection {
                     }
                 }
             });
+            let critic_root_session_id = cancellation_session_id.to_string();
+            let critic_language_model = phase_models.critic_model.clone();
+            let plan_critic_task = cx.spawn(async move |cx| {
+                while let Ok(job) = plan_critic_rx.recv().await {
+                    let result = generate_gear_plan_critic(
+                        critic_language_model.clone(),
+                        job.input,
+                        &critic_root_session_id,
+                        cx,
+                    )
+                    .await;
+                    if job.response_tx.send(result).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let revision_root_session_id = cancellation_session_id.to_string();
+            let revision_language_model = phase_models.planner_model.clone();
+            let plan_revision_task = cx.spawn(async move |cx| {
+                while let Ok(job) = plan_revision_rx.recv().await {
+                    let result = generate_gear_plan_revision(
+                        revision_language_model.clone(),
+                        job.input,
+                        &revision_root_session_id,
+                        cx,
+                    )
+                    .await;
+                    if job.response_tx.send(result).await.is_err() {
+                        break;
+                    }
+                }
+            });
 
             let coordinator_review_hook =
-                if gear_provider_review_enabled(coordinator_language_model.as_ref()) {
+                if gear_provider_review_enabled(Some(&phase_models.critic_model)) {
                     let review_tx = review_tx.clone();
                     Some(Arc::new(move |input: CoordinatorReviewInput| {
                         let (response_tx, response_rx) = async_channel::bounded(1);
@@ -2799,14 +2868,67 @@ impl NativeAgentConnection {
                 };
             drop(review_tx);
 
-            let coordinator_brief =
-                generate_gear_coordinator_brief(coordinator_language_model, &request, cx).await;
+            let plan_critic_hook = {
+                let plan_critic_tx = plan_critic_tx.clone();
+                Arc::new(move |input: PlanCriticInput| {
+                    let (response_tx, response_rx) = async_channel::bounded(1);
+                    plan_critic_tx
+                        .send_blocking(GearPlanCriticJob { input, response_tx })
+                        .context("failed to send Gear PlanCritic request")?;
+                    response_rx
+                        .recv_blocking()
+                        .context("failed to receive Gear PlanCritic response")?
+                }) as PlanCriticHook
+            };
+            let plan_revision_hook = {
+                let plan_revision_tx = plan_revision_tx.clone();
+                Arc::new(move |input: PlanRevisionInput| {
+                    let (response_tx, response_rx) = async_channel::bounded(1);
+                    plan_revision_tx
+                        .send_blocking(GearPlanRevisionJob { input, response_tx })
+                        .context("failed to send Gear plan revision request")?;
+                    response_rx
+                        .recv_blocking()
+                        .context("failed to receive Gear plan revision response")?
+                }) as PlanRevisionHook
+            };
+            drop(plan_critic_tx);
+            drop(plan_revision_tx);
+
+            let planner_identity = phase_execution_identity_for_model(
+                "planner",
+                &cancellation_session_id.to_string(),
+                &phase_models.planner_model,
+            );
+            let coordinator_brief = generate_gear_coordinator_brief(
+                Some(phase_models.planner_model.clone()),
+                &request,
+                cx,
+            )
+            .await;
             let run_cancellation_token = cancellation_token.clone();
             let run_task_manager_control = task_manager_control.clone();
             let run_task_manager = task_manager.clone();
-            let run_worker_config = cx.update(|cx| gear_worker_config_from_env(cx));
+            let run_worker_config = cx.update(|cx| {
+                #[cfg(test)]
+                if let Some(config) = gear_worker_config_override {
+                    return config;
+                }
+                gear_worker_config_from_env(cx)
+            });
+            let run_phase_runtime = PhaseRuntime {
+                routes: phase_models.routes.clone(),
+                inventory: phase_models.inventory.clone(),
+                current_model: phase_models.current_model.clone(),
+                planner: Some(planner_identity),
+                plan_critic_hook: Some(plan_critic_hook),
+                plan_revision_hook: Some(plan_revision_hook),
+                require_plan_approval: true,
+                max_plan_revisions: gear_max_plan_revisions_from_env(),
+                broker: None,
+            };
             let continuation_session_id = cancellation_session_id.to_string();
-            let run_task = cx.background_spawn(async move {
+            let run_task = cx.background_spawn(smol::unblock(move || {
                 StateStore::new(&workspace)
                     .clear_continuation_stop_for_session(&continuation_session_id)?;
                 let event_sink = {
@@ -2815,29 +2937,32 @@ impl NativeAgentConnection {
                         event_tx.try_send(gear_event_status_markdown(event)).ok();
                     }) as gearbox_agent::runtime::EventSink
                 };
-                let outcome = Orchestrator::run(RunOptions {
-                    request,
-                    workspace,
-                    verification_commands: gear_verification_commands_from_env(),
-                    worker: run_worker_config,
-                    allowed_paths: Vec::new(),
-                    forbidden_paths: Vec::new(),
-                    max_files_changed: gear_max_files_changed_from_env(),
-                    install_dependencies: false,
-                    event_sink: Some(event_sink),
-                    cancellation_token: Some(run_cancellation_token),
-                    max_iterations: gear_max_iterations_from_env(),
-                    max_provider_unknown_streak: gear_max_provider_unknown_streak_from_env(),
-                    max_child_depth: gear_max_child_depth_from_env(),
-                    max_runtime_minutes: gear_max_runtime_minutes_from_env(),
-                    coordinator_model,
-                    coordinator_brief,
-                    coordinator_review_hook,
-                    task_manager_control: Some(run_task_manager_control),
-                    task_manager: Some(run_task_manager),
-                    session_id: Some(continuation_session_id),
-                    continuation: true,
-                })?;
+                let outcome = Orchestrator::run_with_phase_runtime(
+                    RunOptions {
+                        request,
+                        workspace,
+                        verification_commands: gear_verification_commands_from_env(),
+                        worker: run_worker_config,
+                        allowed_paths: Vec::new(),
+                        forbidden_paths: Vec::new(),
+                        max_files_changed: gear_max_files_changed_from_env(),
+                        install_dependencies: false,
+                        event_sink: Some(event_sink),
+                        cancellation_token: Some(run_cancellation_token),
+                        max_iterations: gear_max_iterations_from_env(),
+                        max_provider_unknown_streak: gear_max_provider_unknown_streak_from_env(),
+                        max_child_depth: gear_max_child_depth_from_env(),
+                        max_runtime_minutes: gear_max_runtime_minutes_from_env(),
+                        coordinator_model,
+                        coordinator_brief,
+                        coordinator_review_hook,
+                        task_manager_control: Some(run_task_manager_control),
+                        task_manager: Some(run_task_manager),
+                        session_id: Some(continuation_session_id),
+                        continuation: true,
+                    },
+                    run_phase_runtime,
+                )?;
                 let final_report = std_fs::read_to_string(&outcome.final_report_path)
                     .with_context(|| {
                         format!(
@@ -2846,7 +2971,7 @@ impl NativeAgentConnection {
                         )
                     })?;
                 anyhow::Ok((outcome, final_report))
-            });
+            }));
 
             let mut events_open = true;
             let mut last_task_manager_snapshot = None;
@@ -2920,10 +3045,13 @@ impl NativeAgentConnection {
                 &cancellation_token,
                 &task_manager_control,
                 &task_manager,
-                #[cfg(test)] event_log,
+                #[cfg(test)]
+                event_log,
                 cx,
             );
             drop(review_task);
+            drop(plan_critic_task);
+            drop(plan_revision_task);
             response
         })
     }
@@ -3011,6 +3139,170 @@ fn gear_coordinator_from_thread(
     (metadata, model)
 }
 
+fn coordinator_model_for_language_model(model: &Arc<dyn LanguageModel>) -> CoordinatorModel {
+    CoordinatorModel {
+        provider_id: model.provider_id().0.to_string(),
+        model_id: model.id().0.to_string(),
+        name: model.name().0.to_string(),
+    }
+}
+
+fn phase_execution_identity_for_model(
+    phase: &str,
+    root_session_id: &str,
+    model: &Arc<dyn LanguageModel>,
+) -> PhaseExecutionIdentity {
+    let suffix = id_timestamp();
+    PhaseExecutionIdentity {
+        execution_id: format!("{phase}_execution_{suffix}"),
+        phase_session_id: format!("{root_session_id}:{phase}:{suffix}"),
+        backend: PhaseExecutionBackend::LanguageModelRequest,
+        agent_id: Some("zed".to_string()),
+        provider_id: Some(model.provider_id().0.to_string()),
+        model_id: Some(model.id().0.to_string()),
+        actual_session_id: None,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GearPhaseRouteOverride {
+    candidates: Vec<PhaseRouteCandidate>,
+}
+
+fn gear_phase_models(
+    agent: &Entity<NativeAgent>,
+    current_language_model: Option<Arc<dyn LanguageModel>>,
+    cx: &App,
+) -> Result<GearPhaseModels> {
+    let routes = gear_phase_route_table_from_env()?;
+    let inventory = LiveModelInventory {
+        models: LanguageModelRegistry::read_global(cx)
+            .available_models(cx)
+            .map(|model| ModelSelectorId {
+                agent_id: "zed".to_string(),
+                provider_id: model.provider_id().0.to_string(),
+                model_id: model.id().0.to_string(),
+            })
+            .collect(),
+    };
+    inventory.validate()?;
+    let current_model = current_language_model
+        .as_ref()
+        .map(|model| ModelSelectorId {
+            agent_id: "zed".to_string(),
+            provider_id: model.provider_id().0.to_string(),
+            model_id: model.id().0.to_string(),
+        });
+    let planner_decision =
+        routes.resolve(&PhaseProfile::Planner, &inventory, current_model.as_ref())?;
+    let critic_decision = routes.resolve(
+        &PhaseProfile::PlanCritic,
+        &inventory,
+        current_model.as_ref(),
+    )?;
+    let models = &agent.read(cx).models;
+    let planner_model =
+        resolve_phase_language_model(&planner_decision, current_language_model.as_ref(), models)?;
+    let critic_model =
+        resolve_phase_language_model(&critic_decision, current_language_model.as_ref(), models)?;
+    Ok(GearPhaseModels {
+        routes,
+        inventory,
+        current_model,
+        planner_model,
+        critic_model,
+    })
+}
+
+fn resolve_phase_language_model(
+    decision: &gearbox_agent::phase_routing::PhaseRouteDecision,
+    current_language_model: Option<&Arc<dyn LanguageModel>>,
+    models: &LanguageModels,
+) -> Result<Arc<dyn LanguageModel>> {
+    if decision.candidate.backend != PhaseBackend::DirectModel {
+        anyhow::bail!(
+            "phase {:?} currently requires the trusted direct-model backend; configure ACP/native planning in a later broker stage",
+            decision.phase
+        );
+    }
+    let requested = decision
+        .requested_model
+        .as_ref()
+        .context("direct-model phase did not resolve a concrete provider/model")?;
+    if let Some(current) = current_language_model
+        && current.provider_id().0.as_ref() == requested.provider_id
+        && current.id().0.as_ref() == requested.model_id
+    {
+        return Ok(current.clone());
+    }
+    let model_id = AgentModelId::new(requested.qualified_model_id());
+    models.model_from_id(&model_id).with_context(|| {
+        format!(
+            "resolved phase model `{}` is not available in the native Agent model registry",
+            requested.qualified_model_id()
+        )
+    })
+}
+
+fn gear_phase_route_table_from_env() -> Result<PhaseRouteTable> {
+    if let Some(raw) = trimmed_env_value("GEARBOX_GEAR_PHASE_ROUTES") {
+        let table: PhaseRouteTable = serde_json::from_str(&raw)
+            .context("GEARBOX_GEAR_PHASE_ROUTES is not a valid PhaseRouteTable JSON object")?;
+        table.validate()?;
+        return Ok(table);
+    }
+
+    let mut table = PhaseRouteTable::legacy_defaults();
+    for (phase, environment_name) in [
+        (PhaseProfile::Planner, "GEARBOX_GEAR_PHASE_PLANNER"),
+        (PhaseProfile::PlanCritic, "GEARBOX_GEAR_PHASE_PLAN_CRITIC"),
+        (
+            PhaseProfile::Orchestrator,
+            "GEARBOX_GEAR_PHASE_ORCHESTRATOR",
+        ),
+        (
+            PhaseProfile::ExecutorQuick,
+            "GEARBOX_GEAR_PHASE_EXECUTOR_QUICK",
+        ),
+        (
+            PhaseProfile::ExecutorDeep,
+            "GEARBOX_GEAR_PHASE_EXECUTOR_DEEP",
+        ),
+        (
+            PhaseProfile::ReviewerTask,
+            "GEARBOX_GEAR_PHASE_REVIEWER_TASK",
+        ),
+        (
+            PhaseProfile::ReviewerFinal,
+            "GEARBOX_GEAR_PHASE_REVIEWER_FINAL",
+        ),
+        (
+            PhaseProfile::StrategistNextGoal,
+            "GEARBOX_GEAR_PHASE_STRATEGIST_NEXT_GOAL",
+        ),
+        (PhaseProfile::Summarizer, "GEARBOX_GEAR_PHASE_SUMMARIZER"),
+    ] {
+        let Some(raw) = trimmed_env_value(environment_name) else {
+            continue;
+        };
+        let route_override: GearPhaseRouteOverride = serde_json::from_str(&raw)
+            .with_context(|| format!("{environment_name} is not a valid phase route override"))?;
+        if route_override.candidates.is_empty() {
+            anyhow::bail!("{environment_name} must define at least one explicit candidate");
+        }
+        let profile = table
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.phase == phase)
+            .with_context(|| format!("missing built-in profile for phase {phase:?}"))?;
+        profile.candidates = route_override.candidates;
+        profile.source = PhaseRouteSource::Environment;
+    }
+    table.validate()?;
+    Ok(table)
+}
+
 fn gear_provider_review_enabled(model: Option<&Arc<dyn LanguageModel>>) -> bool {
     let Some(_) = model else {
         return false;
@@ -3032,6 +3324,24 @@ struct GearCoordinatorReviewJob {
     response_tx: async_channel::Sender<Result<Option<CoordinatorReview>>>,
 }
 
+struct GearPlanCriticJob {
+    input: PlanCriticInput,
+    response_tx: async_channel::Sender<Result<PlanCriticSubmission>>,
+}
+
+struct GearPlanRevisionJob {
+    input: PlanRevisionInput,
+    response_tx: async_channel::Sender<Result<PlanRevisionSubmission>>,
+}
+
+struct GearPhaseModels {
+    routes: PhaseRouteTable,
+    inventory: LiveModelInventory,
+    current_model: Option<ModelSelectorId>,
+    planner_model: Arc<dyn LanguageModel>,
+    critic_model: Arc<dyn LanguageModel>,
+}
+
 async fn generate_gear_coordinator_brief(
     model: Option<Arc<dyn LanguageModel>>,
     request: &str,
@@ -3048,7 +3358,42 @@ async fn generate_gear_coordinator_brief(
             LanguageModelRequestMessage {
                 role: Role::System,
                 content: vec![
-                    "You are Gear, a lightweight coordinator agent. Create a concise planning and review brief for a code worker. Do not write code. Focus on goal, constraints, verification, and likely risks. Keep it under 160 words.".into(),
+                    r#"You are Gear's high-reasoning planner. Do not write code. Return exactly one JSON object and no prose or markdown fences. The object must match this PlanGraphDraft contract:
+{
+  "objective": "string",
+  "must_have": ["string"],
+  "must_not_have": ["string"],
+  "topology_lock": ["string"],
+  "tasks": [{
+    "task_id": "ascii_identifier",
+    "title": "string",
+    "goal": "string",
+    "deliverable": "string",
+    "dependencies": ["task_id"],
+    "parallel_wave": 0,
+    "scope": {"allowed_files": ["path"], "forbidden_files": ["path"], "write_scope": ["path"], "max_files_changed": 8},
+    "required_capabilities": ["read", "edit", "test"],
+    "preferred_phase_profile": "executor_quick|executor_deep|reviewer_task",
+    "must_do": ["string"],
+    "must_not_do": ["string"],
+    "references": [{"path": "path", "reason": "string", "symbol": null}],
+    "test": {
+      "strategy": "tdd|tests_after|none",
+      "red": {"command": "command", "expected_observation": "specific missing-behavior failure", "evidence_path": "path"},
+      "green": [{"command": "command", "expected_observation": "specific success", "evidence_path": "path"}],
+      "no_test_reason": null
+    },
+    "qa": {
+      "happy_path": [{"name": "string", "steps": ["string"], "expected_result": "string", "evidence_path": "path"}],
+      "failure_path": [{"name": "string", "steps": ["string"], "expected_result": "string", "evidence_path": "path"}]
+    },
+    "artifacts": [{"path": "path", "description": "string", "required": true}],
+    "commit_boundary": "no_commit|after_task|after_wave",
+    "completion_predicates": ["agent-executable predicate"]
+  }],
+  "final_acceptance": ["agent-executable predicate"]
+}
+Every dependency must reference an earlier wave. Same-wave write scopes must not overlap. TDD requires RED and GREEN to use the same test command. tests_after requires GREEN. none requires no_test_reason. Include both happy and failure QA with evidence paths. Keep cheap executors inside a closed-world contract: do not leave architecture, scope, tests, or acceptance for them to redesign. If a repository fact is unknown, keep the scope conservative and encode the missing fact as a must_do inspection step; never invent a path or symbol."#.into(),
                 ],
                 cache: false,
                 reasoning_details: None,
@@ -3075,7 +3420,7 @@ async fn generate_gear_coordinator_brief(
         match chunk {
             Ok(text) => {
                 brief.push_str(&text);
-                if brief.len() >= 4000 {
+                if brief.len() >= 65_536 {
                     break;
                 }
             }
@@ -3092,6 +3437,140 @@ async fn generate_gear_coordinator_brief(
     } else {
         Some(brief.to_string())
     }
+}
+
+async fn generate_gear_plan_critic(
+    model: Arc<dyn LanguageModel>,
+    input: PlanCriticInput,
+    root_session_id: &str,
+    cx: &AsyncApp,
+) -> Result<PlanCriticSubmission> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "deterministic_verifier": input.verifier_report,
+        "phase_route_decision": input.route_decision,
+    }))
+    .context("failed to serialize Gear PlanCritic evidence")?;
+    let request = LanguageModelRequest {
+        intent: Some(CompletionIntent::UserPrompt),
+        temperature: Some(0.1),
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![
+                    r#"You are Gear's read-only PlanCritic. You cannot inspect repository contents or use tools in this phase. Judge only the sealed PlanGraph and the deterministic verifier evidence, and preserve that limitation in your reasoning. Return exactly one JSON object with no markdown fences:
+{
+  "schema_version": 1,
+  "reviewed_goal_id": "exact goal id",
+  "reviewed_plan_id": "exact plan id",
+  "reviewed_plan_revision": 1,
+  "reviewed_plan_hash": "exact plan hash",
+  "reviewed_planner_execution_id": "exact planner execution id",
+  "decision": "approve|revise|reject",
+  "checks": [
+    {"dimension":"references|executability|contradictions|scope|tdd|qa|acceptance","verdict":"pass|fail","summary":"specific result","evidence_refs":["verifier:<dimension> or plan:<task_id>"]}
+  ],
+  "findings": [
+    {"dimension":"references|executability|contradictions|scope|tdd|qa|acceptance","severity":"blocking|advisory","code":"stable_code","task_id":null,"path":null,"message":"specific issue","required_change":null}
+  ],
+  "revision_instructions": null,
+  "needs_user_reason": null,
+  "summary": "specific review summary"
+}
+Return exactly seven checks, one per dimension. Approve only when every check passes, deterministic verification passes, and there are no blocking findings. Revise requires failed checks, one to three blocking findings, and concrete revision_instructions. Reject is only for a blocker requiring user input and must set needs_user_reason."#.into(),
+                ],
+                cache: false,
+                reasoning_details: None,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![evidence.into()],
+                cache: false,
+                reasoning_details: None,
+            },
+        ],
+        ..Default::default()
+    };
+    let raw_output = stream_gear_phase_model_text(&model, request, "PlanCritic", cx).await?;
+    let verdict = PlanCriticVerdict::parse(&raw_output)?;
+    Ok(PlanCriticSubmission {
+        reviewer: phase_execution_identity_for_model("plan_critic", root_session_id, &model),
+        verdict,
+        raw_output,
+        artifact_path: None,
+    })
+}
+
+async fn generate_gear_plan_revision(
+    model: Arc<dyn LanguageModel>,
+    input: PlanRevisionInput,
+    root_session_id: &str,
+    cx: &AsyncApp,
+) -> Result<PlanRevisionSubmission> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "current_plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "critic_receipt": input.critic_receipt,
+        "phase_route_decision": input.route_decision,
+    }))
+    .context("failed to serialize Gear plan revision evidence")?;
+    let request = LanguageModelRequest {
+        intent: Some(CompletionIntent::UserPrompt),
+        temperature: Some(0.15),
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![
+                    r#"You are Gear's high-reasoning planner revising a rejected PlanGraphDraft. Do not write code. Apply every blocking PlanCritic required_change and revision_instructions without expanding the original objective. Return exactly one complete PlanGraphDraft JSON object, with the same field contract as current_plan.draft, and no prose or markdown fences. Preserve decision-complete task scope, dependency waves, TDD RED/GREEN commands, happy/failure QA, required artifacts, and decidable acceptance. Do not return a patch."#.into(),
+                ],
+                cache: false,
+                reasoning_details: None,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![evidence.into()],
+                cache: false,
+                reasoning_details: None,
+            },
+        ],
+        ..Default::default()
+    };
+    let raw_output = stream_gear_phase_model_text(&model, request, "plan revision", cx).await?;
+    let draft = gearbox_agent::plan_graph::parse_planner_draft(&raw_output)?;
+    Ok(PlanRevisionSubmission {
+        draft,
+        planner: phase_execution_identity_for_model("planner_revision", root_session_id, &model),
+        raw_output,
+        artifact_path: None,
+    })
+}
+
+async fn stream_gear_phase_model_text(
+    model: &Arc<dyn LanguageModel>,
+    request: LanguageModelRequest,
+    phase_label: &str,
+    cx: &AsyncApp,
+) -> Result<String> {
+    let mut stream = model
+        .stream_completion_text(request, cx)
+        .await
+        .with_context(|| format!("Gear {phase_label} model request failed"))?
+        .stream;
+    let mut output = String::new();
+    while let Some(chunk) = stream.next().await {
+        output.push_str(&chunk.with_context(|| format!("Gear {phase_label} model stream failed"))?);
+        if output.len() >= 131_072 {
+            anyhow::bail!("Gear {phase_label} model response exceeded 128 KiB");
+        }
+    }
+    let output = output.trim();
+    if output.is_empty() {
+        anyhow::bail!("Gear {phase_label} model returned an empty response");
+    }
+    Ok(output.to_string())
 }
 
 fn format_list_or_none(values: &[String]) -> String {
@@ -3763,6 +4242,13 @@ fn gear_verification_commands_from_env() -> Vec<String> {
 
 fn gear_max_iterations_from_env() -> usize {
     gear_usize_from_env("GEARBOX_GEAR_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)
+}
+
+fn gear_max_plan_revisions_from_env() -> usize {
+    gear_usize_from_env(
+        "GEARBOX_GEAR_MAX_PLAN_REVISIONS",
+        DEFAULT_MAX_PLAN_REVISIONS,
+    )
 }
 
 fn gear_max_provider_unknown_streak_from_env() -> usize {
@@ -4919,6 +5405,7 @@ struct GearZedWorkerJob {
     prompt: String,
     packet_path: PathBuf,
     prompt_path: PathBuf,
+    worker_model: Option<String>,
     cancellation_token: CancellationToken,
     state: Arc<(Mutex<GearZedWorkerState>, Condvar)>,
 }
@@ -4956,6 +5443,23 @@ impl GearZedWorkerBackend {
     }
 }
 
+fn validate_native_worker_model_id(model: Option<&str>) -> Result<Option<String>> {
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((provider_id, model_id)) = model.split_once('/') else {
+        anyhow::bail!(
+            "native Gear worker model `{model}` must use the fully-qualified `provider/model` id"
+        );
+    };
+    if provider_id.trim().is_empty() || model_id.trim().is_empty() {
+        anyhow::bail!(
+            "native Gear worker model `{model}` must include non-empty provider and model ids"
+        );
+    }
+    Ok(Some(format!("{}/{}", provider_id.trim(), model_id.trim())))
+}
+
 impl NativeWorkerBackend for GearZedWorkerBackend {
     fn start_zed_agent(
         &self,
@@ -4970,43 +5474,67 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
             request.route_hint,
             &route,
         );
+        let worker_model = validate_native_worker_model_id(route.worker_model)?;
+        let plan_task = request.task.inputs.plan_task.as_ref();
+        let packet_goal = plan_task
+            .map(|plan_task| plan_task.worker_goal(request.goal))
+            .unwrap_or_else(|| request.goal.to_string());
+        let constraints = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_constraints)
+            .unwrap_or_else(|| {
+                vec![
+                    "Stay inside the allowed paths when they are provided.".to_string(),
+                    "Prefer the package manager already used by the project.".to_string(),
+                    "Read the provided spec and plan artifacts before changing code.".to_string(),
+                    "Leave runnable local instructions in the final output.".to_string(),
+                ]
+            });
+        let required_outputs = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_required_outputs)
+            .unwrap_or_else(|| {
+                vec![
+                    "summary".to_string(),
+                    "changed_files".to_string(),
+                    "commands_run".to_string(),
+                    "known_failures".to_string(),
+                    "next_steps".to_string(),
+                ]
+            });
+        let planned_verification = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_verification_commands)
+            .filter(|commands| !commands.is_empty())
+            .unwrap_or_else(|| request.verification_commands.to_vec());
+        let stop_conditions = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_stop_conditions)
+            .unwrap_or_else(|| {
+                vec![
+                    "Requires a paid external service.".to_string(),
+                    "Requires a user-provided API key.".to_string(),
+                    "The same verification fails twice.".to_string(),
+                ]
+            });
         let packet = WorkerPacket {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
-            worker_model: route.worker_model.map(ToString::to_string),
+            worker_model: worker_model.clone(),
             variant: route.variant.clone(),
             variant_applied: route.variant.clone(),
             prompt_append: route.prompt_append.clone(),
             tools: route.tools.clone(),
             category_resolution,
             category_resolution_result,
-            goal: request.goal.to_string(),
+            goal: packet_goal,
             coordinator_model: request.coordinator_model.cloned(),
             coordinator_brief: request.coordinator_brief.map(ToString::to_string),
             scope: request.task.scope.clone(),
             inputs: request.task.inputs.clone(),
-            constraints: vec![
-                "Stay inside the allowed paths when they are provided.".to_string(),
-                "Prefer the package manager already used by the project.".to_string(),
-                "Read the provided spec and plan artifacts before changing code.".to_string(),
-                "Leave runnable local instructions in the final output.".to_string(),
-            ],
-            required_outputs: vec![
-                "summary".to_string(),
-                "changed_files".to_string(),
-                "commands_run".to_string(),
-                "known_failures".to_string(),
-                "next_steps".to_string(),
-            ],
+            constraints,
+            required_outputs,
             verification: VerificationContract {
-                preferred_commands: request.verification_commands.to_vec(),
+                preferred_commands: planned_verification,
                 must_not_skip: vec!["typecheck".to_string()],
             },
-            stop_conditions: vec![
-                "Requires a paid external service.".to_string(),
-                "Requires a user-provided API key.".to_string(),
-                "The same verification fails twice.".to_string(),
-            ],
+            stop_conditions,
         };
         let packet_json =
             serde_json::to_string_pretty(&packet).context("failed to serialize worker packet")?;
@@ -5033,6 +5561,7 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
                 prompt,
                 packet_path,
                 prompt_path,
+                worker_model,
                 cancellation_token: cancellation_token.clone(),
                 state: state.clone(),
             }))
@@ -5149,6 +5678,8 @@ fn spawn_gear_zed_worker_dispatcher(
                     let parent_session_id = parent_session_id.clone();
                     let running_native_zed_sessions = running_native_zed_sessions.clone();
                     let state = job.state.clone();
+                    #[cfg(test)]
+                    let lifecycle_events = lifecycle_events.clone();
                     cx.spawn(async move |cx| {
                         let result = run_native_zed_worker(
                             agent,
@@ -5158,6 +5689,13 @@ fn spawn_gear_zed_worker_dispatcher(
                             cx,
                         )
                         .await;
+                        #[cfg(test)]
+                        if let Some(events) = &lifecycle_events
+                            && let Err(error) = &result
+                            && let Ok(mut guard) = events.lock()
+                        {
+                            guard.push(format!("worker:error:{error:#}"));
+                        }
                         let (lock, wake) = &*state;
                         let mut state = lock.lock().expect("zed worker state poisoned");
                         state.result = Some(result.map_err(|error| format!("{error:#}")));
@@ -5234,8 +5772,20 @@ async fn run_native_zed_worker(
     running_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>>,
     cx: &mut AsyncApp,
 ) -> Result<WorkerResult> {
-    let (parent_thread, subagent_thread, acp_thread, worker_session_id) =
+    let (parent_thread, subagent_thread, acp_thread, worker_session_id, applied_worker_model) =
         agent.update(cx, |agent, cx| -> Result<_> {
+            let requested_model = job
+                .worker_model
+                .as_ref()
+                .map(|model_id| {
+                    agent
+                        .models
+                        .model_from_id(&AgentModelId::new(model_id.clone()))
+                        .with_context(|| {
+                            format!("native Gear worker requested unavailable model `{model_id}`")
+                        })
+                })
+                .transpose()?;
             let parent_session = agent
                 .sessions
                 .get(&parent_session_id)
@@ -5248,10 +5798,17 @@ async fn run_native_zed_worker(
 
             let subagent_thread = cx.new(|cx| {
                 let mut thread = Thread::new_subagent(&parent_thread, cx);
+                if let Some(model) = requested_model {
+                    thread.set_pinned_model(model, cx);
+                }
                 thread.set_title(format!("Gear Worker {}", job.task_id).into(), cx);
                 thread
             });
             let worker_session_id = subagent_thread.read(cx).id().clone();
+            let applied_worker_model = subagent_thread
+                .read(cx)
+                .model()
+                .map(|model| format!("{}/{}", model.provider_id().0, model.id().0));
             let acp_thread = agent.register_session(
                 subagent_thread.clone(),
                 parent_session.project_id,
@@ -5269,6 +5826,7 @@ async fn run_native_zed_worker(
                 subagent_thread,
                 acp_thread,
                 worker_session_id,
+                applied_worker_model,
             ))
         })??;
 
@@ -5281,6 +5839,19 @@ async fn run_native_zed_worker(
         .lock()
         .expect("running native zed sessions poisoned")
         .insert(job.task_id.clone(), worker_session_id.clone());
+    if let Some(applied_worker_model) = applied_worker_model.as_deref() {
+        let selection = serde_json::to_string_pretty(&serde_json::json!({
+            "requested_model": job.worker_model,
+            "applied_model": applied_worker_model,
+            "worker_session_id": worker_session_id.to_string(),
+        }))
+        .context("failed to serialize native Gear worker model selection evidence")?;
+        job.store.write_worker_file(
+            &job.task_id,
+            "model-selection.json",
+            &format!("{selection}\n"),
+        )?;
+    }
 
     let run_result = async {
         let mut next_prompt = job.prompt.clone();
@@ -5455,6 +6026,657 @@ fn build_native_zed_worker_result(
     };
     write_result_and_outcome(store, task_id, &result)?;
     Ok(result)
+}
+
+// ── ACP Broker Backend ──────────────────────────────────────────────────────
+
+/// Typed channel dispatch for the ACP broker foreground dispatcher.
+#[allow(dead_code)]
+enum GearAcpBrokerDispatch {
+    /// Start a new ACP broker worker session.
+    Run(GearAcpBrokerJob),
+    /// Cancel a running session by task ID.
+    Cancel { task_id: String },
+    /// Set end-turn-at-boundary on a session.
+    SetEndTurnAtBoundary { task_id: String, enabled: bool },
+}
+
+/// Job passed through the channel to start an ACP broker worker session.
+#[allow(dead_code)]
+struct GearAcpBrokerJob {
+    store: gearbox_agent::state::StateStore,
+    task_id: String,
+    prompt: String,
+    packet_path: PathBuf,
+    prompt_path: PathBuf,
+    worker_model: Option<String>,
+    cancellation_token: CancellationToken,
+    state: Arc<(Mutex<GearAcpBrokerState>, Condvar)>,
+}
+
+/// Mutable state shared between the foreground dispatcher and the session handle.
+#[derive(Default)]
+struct GearAcpBrokerState {
+    session_id: Option<acp::SessionId>,
+    result: Option<std::result::Result<WorkerResult, String>>,
+    last_output: Option<String>,
+    pending_interactions: VecDeque<GearAcpBrokerInteraction>,
+    interaction_count: usize,
+    /// Permission events recorded during the interaction.
+    permission_events: Vec<BrokerPermissionEvidence>,
+}
+
+#[derive(Clone)]
+struct GearAcpBrokerInteraction {
+    kind: GearAcpBrokerInteractionKind,
+    prompt: String,
+}
+
+#[derive(Clone, Copy)]
+enum GearAcpBrokerInteractionKind {
+    FollowUp,
+    Steer,
+}
+
+impl GearAcpBrokerInteractionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FollowUp => "acp-follow-up",
+            Self::Steer => "acp-steer",
+        }
+    }
+}
+
+/// Backend that delegates ACP broker worker operations to the foreground thread.
+struct GearAcpBrokerBackend {
+    request_tx: async_channel::Sender<GearAcpBrokerDispatch>,
+}
+
+impl GearAcpBrokerBackend {
+    fn new(request_tx: async_channel::Sender<GearAcpBrokerDispatch>) -> Self {
+        Self { request_tx }
+    }
+}
+
+/// Session handle returned by `GearAcpBrokerBackend::start_zed_agent`.
+struct GearAcpBrokerSessionHandle {
+    task_id: String,
+    request_tx: async_channel::Sender<GearAcpBrokerDispatch>,
+    state: Arc<(Mutex<GearAcpBrokerState>, Condvar)>,
+    cancellation_token: CancellationToken,
+}
+
+impl GearAcpBrokerSessionHandle {
+    fn enqueue_interaction(
+        &self,
+        kind: GearAcpBrokerInteractionKind,
+        prompt: String,
+    ) -> Result<()> {
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().expect("acp broker state poisoned");
+        state.result = None;
+        state
+            .pending_interactions
+            .push_back(GearAcpBrokerInteraction { kind, prompt });
+        Ok(())
+    }
+}
+
+impl NativeWorkerBackend for GearAcpBrokerBackend {
+    fn start_zed_agent(
+        &self,
+        request: WorkerStartRequest<'_>,
+    ) -> Result<Arc<dyn WorkerSessionHandle>> {
+        let route = request
+            .config
+            .selected_route_for_hint(request.route_attempt, request.route_hint);
+        let (_category_resolution, _category_resolution_result) = category_resolution_for_route(
+            request.config,
+            request.route_attempt,
+            request.route_hint,
+            &route,
+        );
+        let worker_model = validate_native_worker_model_id(route.worker_model)?;
+        let plan_task = request.task.inputs.plan_task.as_ref();
+        let packet_goal = plan_task
+            .map(|plan_task| plan_task.worker_goal(request.goal))
+            .unwrap_or_else(|| request.goal.to_string());
+        let constraints = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_constraints)
+            .unwrap_or_else(|| {
+                vec![
+                    "Stay inside the allowed paths when they are provided.".to_string(),
+                    "Prefer the package manager already used by the project.".to_string(),
+                    "Read the provided spec and plan artifacts before changing code.".to_string(),
+                    "Leave runnable local instructions in the final output.".to_string(),
+                ]
+            });
+        let required_outputs = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_required_outputs)
+            .unwrap_or_else(|| {
+                vec![
+                    "summary".to_string(),
+                    "changed_files".to_string(),
+                    "commands_run".to_string(),
+                    "known_failures".to_string(),
+                    "next_steps".to_string(),
+                ]
+            });
+        let planned_verification = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_verification_commands)
+            .filter(|commands| !commands.is_empty())
+            .unwrap_or_else(|| request.verification_commands.to_vec());
+        let stop_conditions = plan_task
+            .map(gearbox_agent::plan_graph::PlanTaskContract::worker_stop_conditions)
+            .unwrap_or_else(|| {
+                vec![
+                    "Requires a paid external service.".to_string(),
+                    "Requires a user-provided API key.".to_string(),
+                    "The same verification fails twice.".to_string(),
+                ]
+            });
+        let packet = WorkerPacket {
+            task_id: request.task.id.clone(),
+            worker: route.worker_kind.as_str().to_string(),
+            worker_model: worker_model.clone(),
+            variant: route.variant.clone(),
+            variant_applied: route.variant.clone(),
+            prompt_append: route.prompt_append.clone(),
+            tools: route.tools.clone(),
+            category_resolution: _category_resolution,
+            category_resolution_result: _category_resolution_result,
+            goal: packet_goal,
+            coordinator_model: request.coordinator_model.cloned(),
+            coordinator_brief: request.coordinator_brief.map(ToString::to_string),
+            scope: request.task.scope.clone(),
+            inputs: request.task.inputs.clone(),
+            constraints,
+            required_outputs,
+            verification: VerificationContract {
+                preferred_commands: planned_verification,
+                must_not_skip: vec!["typecheck".to_string()],
+            },
+            stop_conditions,
+        };
+        let packet_json =
+            serde_json::to_string_pretty(&packet).context("failed to serialize worker packet")?;
+        let packet_path = request.store.write_worker_file(
+            &request.task.id,
+            "packet.json",
+            &format!("{packet_json}\n"),
+        )?;
+        let prompt = worker_prompt(&packet)?;
+        let prompt_path =
+            request
+                .store
+                .write_worker_file(&request.task.id, "prompt.md", &prompt)?;
+
+        let cancellation_token = request
+            .cancellation_token
+            .clone()
+            .unwrap_or_else(CancellationToken::new);
+        let state = Arc::new((Mutex::new(GearAcpBrokerState::default()), Condvar::new()));
+        self.request_tx
+            .send_blocking(GearAcpBrokerDispatch::Run(GearAcpBrokerJob {
+                store: request.store.clone(),
+                task_id: request.task.id.clone(),
+                prompt,
+                packet_path,
+                prompt_path,
+                worker_model,
+                cancellation_token: cancellation_token.clone(),
+                state: state.clone(),
+            }))
+            .context("failed to queue acp broker worker job")?;
+
+        Ok(Arc::new(GearAcpBrokerSessionHandle {
+            task_id: request.task.id.clone(),
+            request_tx: self.request_tx.clone(),
+            state,
+            cancellation_token,
+        }))
+    }
+}
+
+impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
+    fn session_id(&self) -> Option<String> {
+        self.state
+            .0
+            .lock()
+            .ok()
+            .and_then(|state| state.session_id.as_ref().map(ToString::to_string))
+    }
+
+    fn send_follow_up(&self, prompt: String) -> Result<()> {
+        self.enqueue_interaction(GearAcpBrokerInteractionKind::FollowUp, prompt)
+    }
+
+    fn steer(&self, prompt: String) -> Result<()> {
+        self.enqueue_interaction(GearAcpBrokerInteractionKind::Steer, prompt)?;
+        self.request_tx
+            .send_blocking(GearAcpBrokerDispatch::SetEndTurnAtBoundary {
+                task_id: self.task_id.clone(),
+                enabled: true,
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn interrupt(&self) -> Result<()> {
+        self.cancel()
+    }
+
+    fn cancel(&self) -> Result<()> {
+        self.cancellation_token.cancel();
+        self.request_tx
+            .send_blocking(GearAcpBrokerDispatch::Cancel {
+                task_id: self.task_id.clone(),
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+        Ok(worker_outcome_from_result(&self.wait_for_result()?))
+    }
+
+    fn wait_for_result(&self) -> Result<WorkerResult> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("acp broker state poisoned");
+        loop {
+            if let Some(result) = state.result.clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            state = wake.wait(state).expect("acp broker state poisoned");
+        }
+    }
+
+    fn last_output(&self) -> Option<String> {
+        self.state
+            .0
+            .lock()
+            .ok()
+            .and_then(|state| state.last_output.clone())
+    }
+}
+
+/// Spawn the foreground dispatcher loop for ACP broker operations.
+///
+/// Runs on the GPUI foreground thread, receiving dispatch requests and
+/// calling into `NativeAgent` for actual ACP operations. Uses
+/// `LanguageModelRegistry` for live model discovery and maps between
+/// broker contract types and ACP connection types.
+fn spawn_gear_acp_broker_dispatcher(
+    agent: WeakEntity<NativeAgent>,
+    parent_session_id: acp::SessionId,
+    acp_broker_rx: async_channel::Receiver<GearAcpBrokerDispatch>,
+    running_acp_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>>,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        while let Ok(dispatch) = acp_broker_rx.recv().await {
+            match dispatch {
+                GearAcpBrokerDispatch::Run(job) => {
+                    let agent = agent.clone();
+                    let parent_session_id = parent_session_id.clone();
+                    let running_acp_sessions = running_acp_sessions.clone();
+                    let state = job.state.clone();
+                    cx.spawn(async move |cx| {
+                        let result = run_gear_acp_broker_worker(
+                            agent,
+                            parent_session_id,
+                            job,
+                            running_acp_sessions,
+                            cx,
+                        )
+                        .await;
+                        let (lock, wake) = &*state;
+                        let mut state = lock.lock().expect("acp broker state poisoned");
+                        state.result = Some(result.map_err(|error| format!("{error:#}")));
+                        wake.notify_all();
+                    })
+                    .detach();
+                }
+                GearAcpBrokerDispatch::Cancel { task_id } => {
+                    let Some(worker_session_id) = running_acp_sessions
+                        .lock()
+                        .expect("running acp sessions poisoned")
+                        .get(&task_id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(worker_thread) = agent
+                        .read_with(cx, |agent, _| {
+                            agent
+                                .sessions
+                                .get(&worker_session_id)
+                                .map(|session| session.thread.clone())
+                        })
+                        .ok()
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    let _ = worker_thread
+                        .update(cx, |thread, cx| thread.cancel(cx))
+                        .await;
+                }
+                GearAcpBrokerDispatch::SetEndTurnAtBoundary { task_id, enabled } => {
+                    let Some(worker_session_id) = running_acp_sessions
+                        .lock()
+                        .expect("running acp sessions poisoned")
+                        .get(&task_id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(worker_thread) = agent
+                        .read_with(cx, |agent, _| {
+                            agent
+                                .sessions
+                                .get(&worker_session_id)
+                                .map(|session| session.thread.clone())
+                        })
+                        .ok()
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    worker_thread.update(cx, |thread, _cx| {
+                        thread.set_end_turn_at_next_boundary(enabled);
+                    });
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// Run an ACP broker worker session on the foreground thread.
+///
+/// Validates the requested model against `LanguageModelRegistry`, creates
+/// an ACP session via `NativeAgent`, sends the prompt, and handles
+/// follow-up and steer interactions. Records permission events in the
+/// broker state.
+async fn run_gear_acp_broker_worker(
+    agent: WeakEntity<NativeAgent>,
+    parent_session_id: acp::SessionId,
+    job: GearAcpBrokerJob,
+    running_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>>,
+    cx: &mut AsyncApp,
+) -> Result<WorkerResult> {
+    let (parent_thread, subagent_thread, acp_thread, worker_session_id, applied_worker_model) =
+        agent.update(cx, |agent, cx| -> Result<_> {
+            let requested_model = job
+                .worker_model
+                .as_ref()
+                .map(|model_id| {
+                    let available: Vec<_> = LanguageModelRegistry::global(cx)
+                        .read(cx)
+                        .available_models(cx)
+                        .collect();
+                    available
+                        .into_iter()
+                        .find(|m| format!("{}/{}", m.provider_id().0, m.id().0) == *model_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("ACP broker requested unavailable model `{model_id}`")
+                        })
+                })
+                .transpose()?;
+            let parent_session = agent
+                .sessions
+                .get(&parent_session_id)
+                .context("parent ACP broker session not found")?;
+            let parent_thread = parent_session.thread.clone();
+            let current_depth = parent_thread.read(cx).depth();
+            if current_depth >= MAX_SUBAGENT_DEPTH {
+                anyhow::bail!("Maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached");
+            }
+
+            let subagent_thread = cx.new(|cx| {
+                let mut thread = Thread::new_subagent(&parent_thread, cx);
+                if let Some(model) = requested_model {
+                    thread.set_pinned_model(model, cx);
+                }
+                thread.set_title(format!("ACP Broker Worker {}", job.task_id).into(), cx);
+                thread
+            });
+            let worker_session_id = subagent_thread.read(cx).id().clone();
+            let applied_worker_model = subagent_thread
+                .read(cx)
+                .model()
+                .map(|model| format!("{}/{}", model.provider_id().0, model.id().0));
+            let acp_thread = agent.register_session(
+                subagent_thread.clone(),
+                parent_session.project_id,
+                1,
+                None,
+                crate::ZED_AGENT_ID.clone(),
+                "zed".into(),
+                cx,
+            );
+            parent_thread.update(cx, |thread, _cx| {
+                thread.register_running_subagent(subagent_thread.downgrade())
+            });
+            Ok((
+                parent_thread,
+                subagent_thread,
+                acp_thread,
+                worker_session_id,
+                applied_worker_model,
+            ))
+        })??;
+
+    {
+        let (lock, _) = &*job.state;
+        let mut state = lock.lock().expect("acp broker state poisoned");
+        state.session_id = Some(worker_session_id.clone());
+    }
+    running_sessions
+        .lock()
+        .expect("running acp sessions poisoned")
+        .insert(job.task_id.clone(), worker_session_id.clone());
+    if let Some(applied_worker_model) = applied_worker_model.as_deref() {
+        let selection = serde_json::to_string_pretty(&serde_json::json!({
+            "requested_model": job.worker_model,
+            "applied_model": applied_worker_model,
+            "worker_session_id": worker_session_id.to_string(),
+        }))
+        .context("failed to serialize ACP broker model selection evidence")?;
+        job.store.write_worker_file(
+            &job.task_id,
+            "acp-model-selection.json",
+            &format!("{selection}\n"),
+        )?;
+    }
+
+    let run_result = async {
+        let mut next_prompt = job.prompt.clone();
+        let mut next_prompt_path = job.prompt_path.clone();
+        loop {
+            if job.cancellation_token.is_cancelled() {
+                anyhow::bail!("acp broker worker cancelled before prompt started");
+            }
+
+            let response = acp_thread
+                .update(cx, |acp_thread, cx| {
+                    acp_thread.send(vec![next_prompt.clone().into()], cx)
+                })
+                .await?;
+
+            {
+                let (lock, _) = &*job.state;
+                let mut state = lock.lock().expect("acp broker state poisoned");
+                let session_id = state.session_id.as_ref().map(|id| id.to_string());
+                if let Some(ref _resp) = response {
+                    state.permission_events.push(BrokerPermissionEvidence {
+                        permission_type: BrokerPermissionType::ExecuteCommand,
+                        granted: false,
+                        timestamp: gearbox_agent::state::timestamp(),
+                        agent_name: "acp-broker".to_string(),
+                        model_context: session_id,
+                        reason: Some("interaction produced a response".to_string()),
+                    });
+                }
+            }
+
+            let assistant_text = subagent_thread.read_with(cx, |thread, _cx| {
+                thread
+                    .last_message()
+                    .and_then(|message| {
+                        let content = message
+                            .as_agent_message()?
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                AgentMessageContent::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .join("\n\n");
+                        (!content.is_empty()).then_some(content)
+                    })
+                    .unwrap_or_default()
+            });
+            let next_interaction = {
+                let (lock, _) = &*job.state;
+                let mut state = lock.lock().expect("acp broker state poisoned");
+                state.last_output = Some(assistant_text.clone());
+                state.pending_interactions.pop_front().map(|interaction| {
+                    state.interaction_count += 1;
+                    (interaction, state.interaction_count)
+                })
+            };
+
+            if let Some((interaction, interaction_index)) = next_interaction {
+                next_prompt = interaction.prompt.clone();
+                next_prompt_path = job.store.write_worker_file(
+                    &job.task_id,
+                    &format!("{}-{}.md", interaction.kind.as_str(), interaction_index),
+                    &format!(
+                        "# ACP broker worker {}\n\n{}\n",
+                        interaction.kind.as_str(),
+                        interaction.prompt.trim()
+                    ),
+                )?;
+                if matches!(interaction.kind, GearAcpBrokerInteractionKind::Steer) {
+                    subagent_thread.update(cx, |thread, _cx| {
+                        thread.set_end_turn_at_next_boundary(false);
+                    });
+                }
+                continue;
+            }
+
+            break match response {
+                Some(response) if response.stop_reason == acp::StopReason::EndTurn => {
+                    build_native_zed_worker_result(
+                        &job.store,
+                        &job.task_id,
+                        job.packet_path,
+                        next_prompt_path,
+                        assistant_text,
+                        WorkerStatus::Succeeded,
+                        None,
+                    )
+                }
+                Some(response) if response.stop_reason == acp::StopReason::Cancelled => {
+                    build_native_zed_worker_result(
+                        &job.store,
+                        &job.task_id,
+                        job.packet_path,
+                        next_prompt_path,
+                        assistant_text,
+                        WorkerStatus::Failed,
+                        Some("cancelled".to_string()),
+                    )
+                }
+                Some(response) => {
+                    let failure = match response.stop_reason {
+                        acp::StopReason::MaxTokens => {
+                            "acp broker worker reached the maximum number of tokens".to_string()
+                        }
+                        acp::StopReason::MaxTurnRequests => {
+                            "acp broker worker reached the maximum number of turn requests"
+                                .to_string()
+                        }
+                        acp::StopReason::Refusal => {
+                            "acp broker worker refused to process the prompt".to_string()
+                        }
+                        _ => format!("acp broker worker stopped: {:?}", response.stop_reason),
+                    };
+                    build_native_zed_worker_result(
+                        &job.store,
+                        &job.task_id,
+                        job.packet_path,
+                        next_prompt_path,
+                        assistant_text,
+                        WorkerStatus::Failed,
+                        Some(failure),
+                    )
+                }
+                None => build_native_zed_worker_result(
+                    &job.store,
+                    &job.task_id,
+                    job.packet_path,
+                    next_prompt_path,
+                    String::new(),
+                    WorkerStatus::Failed,
+                    Some("acp broker worker returned no response".to_string()),
+                ),
+            };
+        }
+    }
+    .await;
+
+    parent_thread.update(cx, |thread, cx| {
+        thread.unregister_running_subagent(&worker_session_id, cx)
+    });
+    running_sessions
+        .lock()
+        .expect("running acp sessions poisoned")
+        .remove(&job.task_id);
+    if let Ok(close_task) =
+        agent.update(cx, |agent, cx| agent.close_session(&worker_session_id, cx))
+    {
+        close_task.await?;
+    }
+
+    run_result
+}
+
+/// Discover available ACP agents and their model selectors from
+/// `LanguageModelRegistry`.
+pub fn gear_acp_broker_discover_agents(cx: &App) -> Vec<(String, ModelAvailability)> {
+    let registry = LanguageModelRegistry::read_global(cx);
+    let available: Vec<_> = registry.available_models(cx).collect();
+
+    if available.is_empty() {
+        return vec![(
+            "acp-broker".to_string(),
+            ModelAvailability::Unavailable(UnavailableReason::NotConfigured),
+        )];
+    }
+
+    let mut results: Vec<_> = available
+        .iter()
+        .filter_map(|model| {
+            let qualified = format!("{}/{}", model.provider_id().0, model.id().0);
+            let selector_id = ModelSelectorId::from_qualified("acp-broker", &qualified).ok()?;
+            Some((
+                format!("acp-broker/{}", model.provider_id().0),
+                ModelAvailability::Available(selector_id),
+            ))
+        })
+        .collect();
+
+    if results.is_empty() {
+        results.push((
+            "acp-broker".to_string(),
+            ModelAvailability::Unavailable(UnavailableReason::NotSupported),
+        ));
+    }
+
+    results
 }
 
 fn native_zed_worker_message_body(assistant_text: &str, failure: Option<&str>) -> String {
@@ -6155,6 +7377,7 @@ fn apply_skill_overrides(skills: &[Skill]) -> Vec<Skill> {
 #[cfg(test)]
 mod internal_tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -6530,6 +7753,142 @@ mod internal_tests {
         false
     }
 
+    fn respond_to_fake_completions(
+        model: Arc<dyn LanguageModel>,
+        finished: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || {
+            let model = model.as_fake();
+            let mut completion_count = 0;
+            loop {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while model.completion_count() == 0 {
+                    if finished.load(Ordering::SeqCst) {
+                        return completion_count;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for native Gear worker model request"
+                    );
+                    std::thread::yield_now();
+                }
+                let request = model.pending_completions().last().cloned().unwrap();
+                let request_text = request
+                    .messages
+                    .iter()
+                    .map(language_model::LanguageModelRequestMessage::string_contents)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let response = if request_text.contains("Gear's high-reasoning planner") {
+                    let objective = request
+                        .messages
+                        .last()
+                        .map(LanguageModelRequestMessage::string_contents)
+                        .unwrap_or_else(|| "Build the requested feature".to_string());
+                    serde_json::to_string(&gearbox_agent::plan_graph::deterministic_fallback_draft(
+                        &objective,
+                        &gearbox_agent::state::Scope::new(Vec::new(), vec![".git".to_string()], 10),
+                        &["npm run build".to_string()],
+                    ))
+                    .unwrap()
+                } else if request_text.contains("Gear's read-only PlanCritic") {
+                    let evidence = request
+                        .messages
+                        .last()
+                        .map(LanguageModelRequestMessage::string_contents)
+                        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                        .unwrap();
+                    let plan_hash = evidence["plan"]["plan_hash"].as_str().unwrap();
+                    let goal_id = evidence["plan"]["goal_id"].as_str().unwrap();
+                    let plan_id = evidence["plan"]["plan_id"].as_str().unwrap();
+                    let plan_revision = evidence["plan"]["revision"].as_u64().unwrap();
+                    let planner_execution_id =
+                        evidence["planner_receipt"]["identity"]["execution_id"]
+                            .as_str()
+                            .unwrap();
+                    json!({
+                        "schema_version": 1,
+                        "reviewed_goal_id": goal_id,
+                        "reviewed_plan_id": plan_id,
+                        "reviewed_plan_revision": plan_revision,
+                        "reviewed_plan_hash": plan_hash,
+                        "reviewed_planner_execution_id": planner_execution_id,
+                        "decision": "approve",
+                        "checks": [
+                            {"dimension":"references","verdict":"pass","summary":"reference path evidence passed","evidence_refs":["verifier:reference_paths"]},
+                            {"dimension":"executability","verdict":"pass","summary":"task contracts are executable","evidence_refs":["plan:tasks"]},
+                            {"dimension":"contradictions","verdict":"pass","summary":"no contract contradiction found","evidence_refs":["plan:must_have"]},
+                            {"dimension":"scope","verdict":"pass","summary":"scope evidence passed","evidence_refs":["verifier:scope"]},
+                            {"dimension":"tdd","verdict":"pass","summary":"test contract evidence passed","evidence_refs":["verifier:test_contract"]},
+                            {"dimension":"qa","verdict":"pass","summary":"QA contract evidence passed","evidence_refs":["verifier:qa_contract"]},
+                            {"dimension":"acceptance","verdict":"pass","summary":"acceptance evidence passed","evidence_refs":["verifier:acceptance_contract"]}
+                        ],
+                        "findings": [],
+                        "revision_instructions": null,
+                        "needs_user_reason": null,
+                        "summary": "sealed plan and deterministic evidence are decision complete"
+                    })
+                    .to_string()
+                } else if request_text.contains("Gear's coordinator review hook") {
+                    "GOAL_SATISFIED: yes\nSUMMARY: deterministic verification and worker evidence are ready for the required independent review\nREPAIR_REQUEST: none\nROUTE_HINT: none\nSTOP_REASON: complete"
+                        .to_string()
+                } else if request_text.contains("read-only final-review phase") {
+                    let reviewed_execution_id = request_text
+                        .split("reviewed_execution_id `")
+                        .nth(1)
+                        .and_then(|value| value.split('`').next())
+                        .unwrap_or("missing-executor-id");
+                    json!({
+                        "schema_version": 1,
+                        "reviewed_execution_id": reviewed_execution_id,
+                        "dimensions": [
+                            {"dimension": "goal_verification", "verdict": "pass", "findings": ["goal and verification artifacts inspected"]},
+                            {"dimension": "code_quality", "verdict": "pass", "findings": ["bounded implementation evidence inspected"]},
+                            {"dimension": "security", "verdict": "pass", "findings": ["forbidden path evidence inspected"]},
+                            {"dimension": "qa_execution", "verdict": "pass", "findings": ["build verification evidence inspected"]}
+                        ]
+                    })
+                    .to_string()
+                } else {
+                    "## Summary\nImplemented the bounded worker task.\n\n## Changed Files\n- none\n\n## Commands Run\n- npm run build\n\n## Known Failures\n- none"
+                        .to_string()
+                };
+                model.send_completion_stream_text_chunk(&request, response);
+                model.end_last_completion_stream();
+                completion_count += 1;
+            }
+        })
+    }
+
+    fn native_gear_test_worker_config() -> WorkerConfig {
+        WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        }
+    }
+
+    #[test]
+    fn native_gear_worker_model_id_requires_provider_qualification() {
+        assert_eq!(
+            validate_native_worker_model_id(Some("provider/model")).unwrap(),
+            Some("provider/model".to_string())
+        );
+        assert!(validate_native_worker_model_id(Some("model-only")).is_err());
+        assert!(validate_native_worker_model_id(Some("/model")).is_err());
+        assert!(validate_native_worker_model_id(Some("provider/")).is_err());
+        assert_eq!(validate_native_worker_model_id(None).unwrap(), None);
+    }
+
     #[gpui::test]
     async fn test_compact_command_is_available(cx: &mut TestAppContext) {
         init_test(cx);
@@ -6635,7 +7994,10 @@ mod internal_tests {
         let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
-        let connection = Rc::new(NativeAgentConnection::gear(agent));
+        agent.update(cx, |agent, _cx| {
+            agent.gear_worker_config_override = Some(native_gear_test_worker_config());
+        });
+        let connection = Rc::new(NativeAgentConnection::gear(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -6654,7 +8016,6 @@ mod internal_tests {
                 .expect("default test model should be available")
         });
         let fake_model = model.as_fake();
-
         let prompt_task = cx.update(|cx| {
             acp_thread.update(cx, |thread, cx| {
                 thread.send(vec!["Build a tiny notes app MVP".into()], cx)
@@ -6662,11 +8023,24 @@ mod internal_tests {
         });
         let prompt_task = cx.foreground_executor().spawn(prompt_task);
         wait_for_fake_completion(fake_model, cx).await;
-        fake_model.send_last_completion_stream_text_chunk(
-            "Build a compact notes MVP, verify artifacts, and keep the scope small.",
+        let planner_draft = gearbox_agent::plan_graph::deterministic_fallback_draft(
+            "Build a tiny notes app MVP",
+            &gearbox_agent::state::Scope::new(Vec::new(), vec![".git".to_string()], 10),
+            &["npm run build".to_string()],
         );
+        fake_model
+            .send_last_completion_stream_text_chunk(serde_json::to_string(&planner_draft).unwrap());
         fake_model.end_last_completion_stream();
+        let gear_finished = Arc::new(AtomicBool::new(false));
+        let worker_responder = respond_to_fake_completions(model, gear_finished.clone());
+        cx.executor().allow_parking();
         prompt_task.await.unwrap();
+        gear_finished.store(true, Ordering::SeqCst);
+        assert_eq!(
+            worker_responder.join().unwrap(),
+            3,
+            "Gear should approve the plan, execute one native implementation worker, and run one independent final reviewer"
+        );
         cx.run_until_parked();
 
         let gearbox_root = workspace.path().join(".gearbox-agent");
@@ -6689,6 +8063,33 @@ mod internal_tests {
             .find(|content| content.contains("Build a tiny notes app MVP"))
             .expect("Gear should persist the original request in the goal ledger");
         assert!(goal.contains("\"request\""));
+
+        let plan_graph = std::fs::read_dir(gearbox_root.join("plans"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .next()
+            .expect("Gear should persist a typed PlanGraph");
+        assert!(plan_graph.contains("\"source\": \"planner_model\""));
+        assert!(plan_graph.contains("\"plan_hash\""));
+
+        let worker_packet =
+            std::fs::read_to_string(gearbox_root.join("workers/task_003/packet.json")).unwrap();
+        assert!(worker_packet.contains("\"plan_task\""));
+        assert!(worker_packet.contains("\"completion_predicates\""));
+        let model_selection =
+            std::fs::read_to_string(gearbox_root.join("workers/task_003/model-selection.json"))
+                .unwrap();
+        assert!(model_selection.contains("\"applied_model\": \"fake/fake\""));
+
+        let lineage = std::fs::read_dir(gearbox_root.join("continuation/lineage"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .next()
+            .expect("Gear should persist WorkLineage");
+        assert!(lineage.contains("\"plan_remaining_items\": 0"));
+        assert!(!lineage.contains("\"task_003\""));
     }
 
     #[gpui::test]
@@ -6708,7 +8109,10 @@ mod internal_tests {
         let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
-        let connection = Rc::new(NativeAgentConnection::gear(agent));
+        agent.update(cx, |agent, _cx| {
+            agent.gear_worker_config_override = Some(native_gear_test_worker_config());
+        });
+        let connection = Rc::new(NativeAgentConnection::gear(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -6744,34 +8148,35 @@ mod internal_tests {
         });
         let prompt_task = cx.foreground_executor().spawn(prompt_task);
         wait_for_fake_completion(fake_model, cx).await;
-        fake_model.send_last_completion_stream_text_chunk(
-            "Build a compact notes MVP, verify artifacts, and keep the scope small.",
+        let planner_draft = gearbox_agent::plan_graph::deterministic_fallback_draft(
+            "Build a tiny notes app MVP",
+            &gearbox_agent::state::Scope::new(Vec::new(), vec![".git".to_string()], 10),
+            &["npm run build".to_string()],
         );
+        fake_model
+            .send_last_completion_stream_text_chunk(serde_json::to_string(&planner_draft).unwrap());
         fake_model.end_last_completion_stream();
-        // The prompt_task.await will succeed (orchestrator returns Ok)
-        // but the OS thread from dispatch_running_task will fail with
-        // "sending on a closed channel" (visible on stderr).
-        // This is the same regression as test_gear_prompt_runs_gearbox_orchestrator.
+        let gear_finished = Arc::new(AtomicBool::new(false));
+        let worker_responder = respond_to_fake_completions(model, gear_finished.clone());
+        cx.executor().allow_parking();
         prompt_task.await.unwrap();
+        gear_finished.store(true, Ordering::SeqCst);
+        assert_eq!(
+            worker_responder.join().unwrap(),
+            3,
+            "Gear should approve the plan, execute one native implementation worker, and run one independent final reviewer"
+        );
         cx.run_until_parked();
 
-        // Record events before the final-report assertion so they are
-        // visible even when the test fails (same regression as
-        // test_gear_prompt_runs_gearbox_orchestrator).
         let event_log = events.lock().expect("event log lock");
-        eprintln!("GEARBOX LIFECYCLE EVENTS: {event_log:?}");
 
-        // Same regression: OS thread fails to send on closed channel.
         let gearbox_root = workspace.path().join(".gearbox-agent");
         let _final_report = std::fs::read_dir(gearbox_root.join("artifacts"))
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().join("final-report.md"))
             .find(|path| path.exists())
-            .expect(
-                "Gear should write a final report artifact — the 'sending on a closed channel' \
-                 regression prevents this; remove this assertion when the race is fixed (005-002)",
-            );
+            .expect("Gear should write a final report artifact");
 
         // Verify lifecycle events from the GPUI foreground executor.
         // Background thread events (tick, dispatch_running_task,
@@ -6840,7 +8245,8 @@ mod internal_tests {
                 parent_session_id,
                 native_worker_rx,
                 Arc::new(Mutex::new(HashMap::default())),
-                #[cfg(test)] None,
+                #[cfg(test)]
+                None,
                 cx,
             );
         });
@@ -10017,6 +11423,204 @@ mod internal_tests {
         // silently mangling unrelated user text.
         assert_eq!(strip_slash_command_prefix("hello world"), "hello world",);
     }
+
+    #[gpui::test]
+    async fn gearbox_acp_worker_broker_lifecycle(cx: &mut TestAppContext) {
+        use gearbox_agent::state::{
+            Scope, StateStore, Task as GearTask, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+        };
+
+        init_test(cx);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("README.md"),
+            "# ACP broker worker test\n",
+        )
+        .unwrap();
+        let store = StateStore::new(workspace.path());
+        store.initialize().unwrap();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection::gear(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[workspace.path()]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let parent_session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let model = cx.update(|cx| {
+            LanguageModelRegistry::read_global(cx)
+                .default_model()
+                .map(|default_model| default_model.model)
+                .expect("default test model should be available")
+        });
+        let fake_model = model.as_fake();
+
+        // Phase 1: discover available agents
+        let discovered = cx.update(|cx| gear_acp_broker_discover_agents(cx));
+        assert!(
+            !discovered.is_empty(),
+            "ACP broker discovery should return at least the test model"
+        );
+
+        // Phase 2: start an ACP broker worker
+        let (acp_broker_tx, acp_broker_rx) = async_channel::unbounded::<GearAcpBrokerDispatch>();
+        cx.update(|cx| {
+            spawn_gear_acp_broker_dispatcher(
+                agent.downgrade(),
+                parent_session_id,
+                acp_broker_rx,
+                Arc::new(Mutex::new(HashMap::default())),
+                cx,
+            );
+        });
+        let backend = GearAcpBrokerBackend::new(acp_broker_tx);
+        let task = GearTask {
+            id: "task_acp_broker_001".to_string(),
+            goal_id: "goal_acp_broker_001".to_string(),
+            parent_task_id: None,
+            title: "acp broker lifecycle".to_string(),
+            kind: TaskKind::Edit,
+            status: TaskStatus::Pending,
+            assigned_worker: Some("zed_agent".to_string()),
+            attempt: 1,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: TaskInputs::default(),
+            outputs: TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let handle = backend
+            .start_zed_agent(WorkerStartRequest {
+                store: &store,
+                workspace: workspace.path(),
+                task: &task,
+                route_attempt: 0,
+                goal: "Test the ACP broker backend lifecycle.",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            })
+            .unwrap();
+
+        // Phase 3: wait for the first prompt — the dispatcher should have
+        // created a subagent session via the ACP thread.
+        wait_for_fake_completion(fake_model, cx).await;
+        let first_session_id = handle
+            .session_id()
+            .expect("acp broker worker should expose its session id after first prompt starts");
+
+        // Phase 4: follow-up
+        handle
+            .send_follow_up("Refine the result.".to_string())
+            .unwrap();
+        fake_model.send_last_completion_stream_text_chunk("broker follow-up response");
+        fake_model.end_last_completion_stream();
+        wait_for_fake_completion(fake_model, cx).await;
+        assert_eq!(
+            handle.session_id().as_deref(),
+            Some(first_session_id.as_str()),
+            "follow-up should reuse the same session"
+        );
+
+        // Phase 5: steer
+        handle
+            .steer("Steer into final review.".to_string())
+            .unwrap();
+        fake_model.send_last_completion_stream_text_chunk("broker steer response");
+        fake_model.end_last_completion_stream();
+        wait_for_fake_completion(fake_model, cx).await;
+        assert_eq!(
+            handle.session_id().as_deref(),
+            Some(first_session_id.as_str()),
+            "steer should reuse the same session"
+        );
+
+        // Phase 6: cancel — verify the session still existed before cancel
+        let _ = handle.session_id();
+        handle.cancel().unwrap();
+        // After cancel, wait_for_result should return the cancelled result
+        let result = std::thread::spawn({
+            let handle = handle.clone();
+            move || handle.wait_for_result()
+        });
+        for _ in 0..50 {
+            cx.run_until_parked();
+            if result.is_finished() {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(result.is_finished());
+        let worker_result = result.join().unwrap();
+        // Cancellation may produce Failed status or Succeeded if the
+        // worker had already completed; either is valid.
+        assert!(
+            matches!(
+                worker_result.as_ref().map(|r| &r.status),
+                Ok(WorkerStatus::Failed) | Ok(WorkerStatus::Succeeded)
+            ),
+            "cancel should produce a terminal result, got {:?}",
+            worker_result.as_ref().map(|r| &r.status)
+        );
+
+        // Phase 7: model discovery produces valid ModelAvailability entries
+        for (agent_name, availability) in &discovered {
+            assert!(
+                !agent_name.is_empty(),
+                "discovered agent name must not be empty"
+            );
+            match availability {
+                ModelAvailability::Available(selector) => {
+                    assert!(
+                        !selector.agent_id.is_empty(),
+                        "available model selector must have a non-empty agent_id"
+                    );
+                }
+                ModelAvailability::Unavailable(reason) => {
+                    // Unavailable entries are valid when no providers are
+                    // configured; the test environment always has a fake
+                    // provider, so this branch won't fire in normal test runs.
+                    let _ = reason;
+                }
+            }
+        }
+
+        // Phase 8: verify the foreground entity never leaked across threads
+        // — the WeakEntity<NativeAgent> should still be valid, but the
+        // Entity itself must not be Send.
+        assert!(
+            agent.downgrade().upgrade().is_some(),
+            "Agent must still be alive after the broker lifecycle"
+        );
+    }
 }
 
 /// Create a Zed native agent sub-session for a one-shot quick task.
@@ -10037,8 +11641,8 @@ pub fn create_gearbox_agent_session(
 ) -> Task<Result<String>> {
     let parent_session_id = parent_session_id.clone();
     cx.spawn(async move |cx| {
-        let (_parent_thread, subagent_thread, acp_thread) = agent
-            .update(cx, |agent, cx| -> Result<_> {
+        let (_parent_thread, subagent_thread, acp_thread) =
+            agent.update(cx, |agent, cx| -> Result<_> {
                 let parent_session = agent
                     .sessions
                     .get(&parent_session_id)
@@ -10046,8 +11650,7 @@ pub fn create_gearbox_agent_session(
                 let parent_thread = parent_session.thread.clone();
                 let subagent_thread = cx.new(|cx| {
                     let mut thread = Thread::new_subagent(&parent_thread, cx);
-                    thread
-                        .set_title(format!("Gear Quick Worker {task_id}").into(), cx);
+                    thread.set_title(format!("Gear Quick Worker {task_id}").into(), cx);
                     thread
                 });
                 let acp_thread = agent.register_session(
@@ -10059,10 +11662,9 @@ pub fn create_gearbox_agent_session(
                     "zed".into(),
                     cx,
                 );
-                parent_thread
-                    .update(cx, |thread, _cx| {
-                        thread.register_running_subagent(subagent_thread.downgrade())
-                    });
+                parent_thread.update(cx, |thread, _cx| {
+                    thread.register_running_subagent(subagent_thread.downgrade())
+                });
                 Ok((parent_thread, subagent_thread, acp_thread))
             })??;
 

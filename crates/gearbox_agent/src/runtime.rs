@@ -6,23 +6,41 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 use crate::languages::{LanguageDetection, detect_with_request};
+use crate::phase_routing::{
+    LiveModelInventory, ModelBindingStatus, ModelSelectorId, PhaseBackend, PhaseModelBinding,
+    PhaseRouteDecision, PhaseRouteReceipt, PhaseRouteTable,
+};
+use crate::plan_graph::{
+    PhaseProfile, PlanGraph, PlanGraphDraft, PlanSource, PlannerReceipt,
+    deterministic_fallback_draft, parse_planner_draft,
+};
+use crate::plan_review::{
+    PhaseExecutionBackend, PhaseExecutionIdentity, PlanApprovalState, PlanApprovalStatus,
+    PlanCriticDecision, PlanCriticReceipt, PlanCriticVerdict, PlanVerifierReport,
+    PlannerExecutionReceipt,
+};
 use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalStatus, Scope,
-    Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage,
-    event, id_timestamp, timestamp,
+    Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage, event,
+    id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
-    SharedTaskManager, TaskAttempt, TaskFailureKind, TaskManager, TaskManagerControl,
-    TaskManagerTickLoop, TaskRecord,
+    SharedTaskManager, TaskAttempt, TaskAttemptStatus, TaskFailureKind, TaskManager,
+    TaskManagerControl, TaskManagerTickLoop, TaskRecord,
 };
 use crate::tools::{
     CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_snapshot,
     run_shell_command_with_env_and_cancellation,
+};
+use crate::worker_broker::{
+    BrokerPhaseRequest, ModelAvailability, WorkerBroker,
 };
 use crate::workers::{
     CategoryResolution, CategoryResolutionResult, FallbackRoute, WorkerCategory, WorkerConfig,
@@ -34,9 +52,219 @@ pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
 pub type CoordinatorReviewHook = Arc<
     dyn Fn(CoordinatorReviewInput) -> Result<Option<CoordinatorReview>> + Send + Sync + 'static,
 >;
+pub type PlanCriticHook =
+    Arc<dyn Fn(PlanCriticInput) -> Result<PlanCriticSubmission> + Send + Sync + 'static>;
+pub type PlanRevisionHook =
+    Arc<dyn Fn(PlanRevisionInput) -> Result<PlanRevisionSubmission> + Send + Sync + 'static>;
 pub const DEFAULT_MAX_ITERATIONS: usize = 5;
 pub const DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK: usize = 2;
 pub const DEFAULT_MAX_RUNTIME_MINUTES: usize = 60;
+pub const DEFAULT_MAX_PLAN_REVISIONS: usize = 2;
+
+/// Terminal states that a phase actor can reach, preventing further dispatch.
+///
+/// These are distinct from `GoalStatus` because they occur at the phase
+/// dispatch level (before or during a single phase interaction), not at
+/// the goal level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PhaseActorTerminalState {
+    /// The model provider's usage could not be determined (stale/no response).
+    UsageUnknown,
+    /// Permission is still pending user approval.
+    PermissionPending,
+    /// The user denied a permission request required by the phase.
+    PermissionDenied,
+    /// The phase backend does not support a required capability.
+    CapabilityUnavailable,
+    /// The resolved model does not match the requested/required model,
+    /// and the mismatch is not covered by an allowed fallback.
+    ModelMismatch,
+}
+
+impl PhaseActorTerminalState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            PhaseActorTerminalState::UsageUnknown
+                | PhaseActorTerminalState::PermissionDenied
+                | PhaseActorTerminalState::CapabilityUnavailable
+                | PhaseActorTerminalState::ModelMismatch
+        )
+    }
+
+    pub fn message(&self) -> &'static str {
+        match self {
+            PhaseActorTerminalState::UsageUnknown => {
+                "Model usage information is unavailable; cannot continue dispatch"
+            }
+            PhaseActorTerminalState::PermissionPending => {
+                "Permission request is pending user approval"
+            }
+            PhaseActorTerminalState::PermissionDenied => {
+                "Permission was denied for this phase actor"
+            }
+            PhaseActorTerminalState::CapabilityUnavailable => {
+                "The phase backend does not support a required capability"
+            }
+            PhaseActorTerminalState::ModelMismatch => {
+                "The resolved model does not match the requested model"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanCriticInput {
+    pub request: String,
+    pub plan: PlanGraph,
+    pub planner_receipt: PlannerExecutionReceipt,
+    pub verifier_report: PlanVerifierReport,
+    pub route_decision: PhaseRouteDecision,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanCriticSubmission {
+    pub reviewer: PhaseExecutionIdentity,
+    pub verdict: PlanCriticVerdict,
+    pub raw_output: String,
+    pub artifact_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanRevisionInput {
+    pub request: String,
+    pub plan: PlanGraph,
+    pub planner_receipt: PlannerExecutionReceipt,
+    pub critic_receipt: PlanCriticReceipt,
+    pub route_decision: PhaseRouteDecision,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanRevisionSubmission {
+    pub draft: PlanGraphDraft,
+    pub planner: PhaseExecutionIdentity,
+    pub raw_output: String,
+    pub artifact_path: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct PhaseRuntime {
+    pub routes: PhaseRouteTable,
+    pub inventory: LiveModelInventory,
+    pub current_model: Option<ModelSelectorId>,
+    pub planner: Option<PhaseExecutionIdentity>,
+    pub plan_critic_hook: Option<PlanCriticHook>,
+    pub plan_revision_hook: Option<PlanRevisionHook>,
+    pub require_plan_approval: bool,
+    pub max_plan_revisions: usize,
+    /// Optional worker broker for phase lifecycle management.
+    /// When set, phase interactions (planner, PlanCritic, executor,
+    /// reviewer) go through the broker lifecycle.
+    pub broker: Option<Arc<WorkerBroker>>,
+}
+
+impl PhaseRuntime {
+    pub fn legacy() -> Self {
+        Self {
+            routes: PhaseRouteTable::legacy_defaults(),
+            inventory: LiveModelInventory::default(),
+            current_model: None,
+            planner: None,
+            plan_critic_hook: None,
+            plan_revision_hook: None,
+            require_plan_approval: false,
+            max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
+            broker: None,
+        }
+    }
+}
+
+impl Default for PhaseRuntime {
+    fn default() -> Self {
+        Self::legacy()
+    }
+}
+
+fn run_phase_via_broker<T>(
+    broker: Option<&WorkerBroker>,
+    phase_decision: &PhaseRouteDecision,
+    goal_id: &str,
+    plan_id: &str,
+    plan_revision: usize,
+    task_id: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(broker) = broker else {
+        return f();
+    };
+    let decision_hash = phase_decision
+        .hash()
+        .context("failed to hash phase route decision for broker")?;
+    let requested_model = match &phase_decision.requested_model {
+        Some(model) => ModelAvailability::Available(model.clone()),
+        None => ModelAvailability::Unavailable(
+            crate::worker_broker::UnavailableReason::NotConfigured,
+        ),
+    };
+    let phase_request = BrokerPhaseRequest {
+        schema_version: crate::worker_broker::BROKER_SCHEMA_VERSION,
+        phase_decision_hash: decision_hash,
+        goal_id: goal_id.to_string(),
+        plan_id: plan_id.to_string(),
+        plan_revision,
+        task_id: task_id.to_string(),
+        requested_agent: phase_decision
+            .worker_kind
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_else(|| "direct".to_string()),
+        requested_model,
+        allowed_fallback_models: Vec::new(),
+    };
+    broker
+        .resolve(phase_request)
+        .context("broker resolve failed for phase actor")?;
+    let result = f();
+    if result.is_err() {
+        let _ = broker.cancel().context("broker cancel");
+    }
+    result
+}
+
+fn check_phase_terminal_state(
+    decision: &PhaseRouteDecision,
+) -> Result<()> {
+    let phase_name = format!("{:?}", decision.phase);
+    if let Some(requested) = &decision.requested_model {
+        if decision.candidate.model.is_available() {
+            let binding = &decision.candidate.model;
+            let available = match binding {
+                crate::phase_routing::PhaseModelBinding::ExactLive(selector) => Some(selector),
+                crate::phase_routing::PhaseModelBinding::CurrentSession => None,
+                _ => None,
+            };
+            if let Some(available_model) = available {
+                if available_model != requested {
+                    anyhow::bail!(
+                        "PhaseActorTerminalState::ModelMismatch: phase {phase_name} \
+                         requested model {requested:?} but route resolved to {available_model:?}"
+                    );
+                }
+            }
+        }
+    }
+    match &decision.candidate.backend {
+        crate::phase_routing::PhaseBackend::DirectModel => {
+            if !decision.candidate.model.is_available() {
+                anyhow::bail!(
+                    "PhaseActorTerminalState::CapabilityUnavailable: phase {phase_name} \
+                     has no available model binding"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct RunOptions {
@@ -165,6 +393,13 @@ pub struct Orchestrator;
 
 impl Orchestrator {
     pub fn run(options: RunOptions) -> Result<RunOutcome> {
+        Self::run_with_phase_runtime(options, PhaseRuntime::legacy())
+    }
+
+    pub fn run_with_phase_runtime(
+        options: RunOptions,
+        phase_runtime: PhaseRuntime,
+    ) -> Result<RunOutcome> {
         if options.request.trim().is_empty() {
             bail!("prompt cannot be empty");
         }
@@ -275,11 +510,77 @@ impl Orchestrator {
             ),
         )?;
 
+        phase_runtime.routes.validate()?;
+        phase_runtime.inventory.validate()?;
+        if let Some(current_model) = phase_runtime.current_model.as_ref() {
+            current_model.validate()?;
+        }
+        let phase_routes_path = store.write_phase_route_table(&goal_id, &phase_runtime.routes)?;
+        let plan_graph = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &detection.verification_commands,
+            &workspace,
+            &store,
+            &session_id,
+            &options.event_sink,
+            options.cancellation_token.as_ref(),
+            &phase_runtime,
+        )?;
+        let plan_graph_path = if phase_runtime.require_plan_approval {
+            store.write_plan_graph(&plan_graph)?
+        } else {
+            store.write_unreviewed_plan_graph(&plan_graph)?
+        };
+        if phase_runtime.require_plan_approval {
+            append_event(
+                &store,
+                &options.event_sink,
+                event(
+                    &session_id,
+                    Some(&goal_id),
+                    None,
+                    EventKind::PlanApproved,
+                    format!("Published approved plan revision {}", plan_graph.revision),
+                    json!({
+                        "plan_id": plan_graph.plan_id,
+                        "plan_hash": plan_graph.plan_hash,
+                        "revision": plan_graph.revision,
+                        "canonical_path": plan_graph_path.to_string_lossy(),
+                    }),
+                ),
+            )?;
+        }
+        let closed_world_contract = plan_graph.closed_world_contract();
+        let initial_preferred_phase = closed_world_contract.preferred_phase_profile.clone();
+        let initial_plan_route_hint =
+            phase_profile_route_hint(&closed_world_contract.preferred_phase_profile);
+        let initial_worker_phase =
+            worker_phase_for_route_hint(&initial_preferred_phase, initial_plan_route_hint);
+        let initial_phase_decision = phase_runtime.routes.resolve_for_worker(
+            &initial_worker_phase,
+            &phase_runtime.inventory,
+            phase_runtime.current_model.as_ref(),
+            &options.worker,
+        )?;
+        let initial_worker_config =
+            initial_phase_decision.overlay_worker_config(&options.worker)?;
         let mut tasks = initial_tasks(
             &goal_id,
             &scope,
-            options.worker.selected_route(1).worker_kind,
+            initial_worker_config
+                .selected_route_for_hint(1, initial_plan_route_hint)
+                .worker_kind,
         );
+        if let Some(task) = tasks.iter_mut().find(|task| task.id == "task_003") {
+            task.title = closed_world_contract.title.clone();
+            task.scope = Scope::new(
+                closed_world_contract.scope.allowed_files.clone(),
+                closed_world_contract.scope.forbidden_files.clone(),
+                closed_world_contract.scope.max_files_changed,
+            );
+            task.inputs.plan_task = Some(closed_world_contract);
+        }
         store.write_tasks(&goal_id, &tasks)?;
 
         let spec_path =
@@ -307,7 +608,7 @@ impl Orchestrator {
         let plan_path = store.write_artifact(
             &goal_id,
             "plan.md",
-            &product::plan(&goal, &tasks, &detection),
+            &product::plan(&goal, &plan_graph, &detection),
         )?;
         complete_task(&mut tasks, "task_002", |task| {
             task.outputs.summary = "Plan artifact created.".to_string();
@@ -330,7 +631,16 @@ impl Orchestrator {
                 Some("task_002"),
                 EventKind::PlanCreated,
                 "Plan artifact created",
-                json!({ "path": plan_path.to_string_lossy() }),
+                json!({
+                    "path": plan_path.to_string_lossy(),
+                    "plan_graph_path": plan_graph_path.to_string_lossy(),
+                    "plan_id": plan_graph.plan_id,
+                    "revision": plan_graph.revision,
+                    "plan_hash": plan_graph.plan_hash,
+                    "task_count": plan_graph.draft.tasks.len(),
+                    "source": plan_graph.source,
+                    "phase_routes_path": phase_routes_path.to_string_lossy(),
+                }),
             ),
         )?;
 
@@ -343,6 +653,7 @@ impl Orchestrator {
         let mut final_evaluation = None;
         let mut last_coordinator_review: Option<CoordinatorReview> = None;
         let mut next_route_hint_override: Option<String> = None;
+        let mut last_executor_execution_id: Option<String> = None;
         let mut provider_unknown_streak = 0usize;
         let mut repeated_failure_streak = 0usize;
         let mut last_failure_kind: Option<TaskFailureKind> = None;
@@ -396,13 +707,11 @@ impl Orchestrator {
         // Lineage tracks worker lifecycle and participates in completion gating.
         let mut lineage = store.read_lineage(&session_id)?.unwrap_or_else(|| {
             let mut l = WorkLineage::new(session_id.clone());
-            // Count non-completed tasks as plan_remaining_items.
-            l.plan_remaining_items = tasks
-                .iter()
-                .filter(|t| t.status != TaskStatus::Complete)
-                .count();
+            l.plan_remaining_items = 1;
             l
         });
+        prepare_lineage_for_run(&mut lineage, &session_id);
+        store.write_lineage(&lineage)?;
 
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
@@ -418,21 +727,39 @@ impl Orchestrator {
                 break;
             }
             let parent_task_id = goal.current_task_id.clone();
-            let worker_route_hint = next_route_hint_override.as_deref().or_else(|| {
-                last_coordinator_review
-                    .as_ref()
-                    .and_then(|review| review.route_hint.as_deref())
-            });
-            let selected_route = options.worker.selected_route_for_hint(1, worker_route_hint);
-            let (category_resolution, category_resolution_result) = category_resolution_for_route(
+            let worker_route_hint = next_route_hint_override
+                .as_deref()
+                .or_else(|| {
+                    last_coordinator_review
+                        .as_ref()
+                        .and_then(|review| review.route_hint.as_deref())
+                })
+                .or(initial_plan_route_hint);
+            let worker_phase =
+                worker_phase_for_route_hint(&initial_preferred_phase, worker_route_hint);
+            let phase_decision = phase_runtime.routes.resolve_for_worker(
+                &worker_phase,
+                &phase_runtime.inventory,
+                phase_runtime.current_model.as_ref(),
                 &options.worker,
+            )?;
+            let effective_worker = phase_decision.overlay_worker_config(&options.worker)?;
+            let phase_decision_path =
+                store.write_phase_route_decision(&goal_id, 100 + iteration, &phase_decision)?;
+            let resolved_worker_route_hint = Some(phase_decision.category.as_str());
+            let selected_route =
+                effective_worker.selected_route_for_hint(1, resolved_worker_route_hint);
+            let (category_resolution, category_resolution_result) = category_resolution_for_route(
+                &effective_worker,
                 1,
-                worker_route_hint,
+                resolved_worker_route_hint,
                 &selected_route,
             );
             let current_route_change_type = if worker_route_hint == Some("review") {
                 RouteChangeType::ReviewTrigger
-            } else if selected_route.route_reason.contains("fell back to") {
+            } else if !phase_decision.rejected_candidates.is_empty()
+                || selected_route.route_reason.contains("fell back to")
+            {
                 RouteChangeType::Fallback
             } else {
                 RouteChangeType::RouteChange
@@ -466,6 +793,7 @@ impl Orchestrator {
                             "iteration": iteration,
                             "verification_path": verification_path.to_string_lossy(),
                             "route_hint": worker_route_hint,
+                            "resolved_route_hint": resolved_worker_route_hint,
                             "worker_kind": selected_route.worker_kind.as_str(),
                             "worker_model": selected_route.worker_model,
                             "worker_category": selected_route.category.as_str(),
@@ -476,21 +804,33 @@ impl Orchestrator {
                 repair_task_id
             };
 
+            append_event(
+                &store,
+                &options.event_sink,
+                event(
+                    &session_id,
+                    Some(&goal_id),
+                    Some(&worker_task_id),
+                    EventKind::PhaseRouteSelected,
+                    format!("Phase route selected for {worker_task_id}"),
+                    json!({
+                        "phase": worker_phase,
+                        "decision_path": phase_decision_path.to_string_lossy(),
+                        "selected_candidate": phase_decision.selected_candidate,
+                        "fallback_count": phase_decision.rejected_candidates.len(),
+                    }),
+                ),
+            )?;
+
             // Generate immutable ownership decision before any execution.
             let ownership = crate::state::ExecutionOwnership {
-                delegated: selected_route.require_worker || options.worker.skip_worker,
+                delegated: selected_route.require_worker || effective_worker.skip_worker,
                 worker_kind: Some(selected_route.worker_kind.as_str().to_string()),
                 route_reason: selected_route.route_reason.clone(),
                 risk_profile: "unknown".to_string(),
                 worker_task_id: Some(worker_task_id.clone()),
                 decided_at: crate::state::timestamp(),
             };
-
-            // Track this worker in the lineage and persist.
-            lineage.worker_session_ids.push(worker_task_id.clone());
-            lineage.active_task_ids.push(worker_task_id.clone());
-            lineage.updated_at = timestamp();
-            store.write_lineage(&lineage)?;
 
             start_task(&mut tasks, &worker_task_id);
             goal.status = GoalStatus::Running;
@@ -513,9 +853,12 @@ impl Orchestrator {
                     },
                     json!({
                         "iteration": iteration,
+                        "phase": worker_phase,
+                        "phase_route_decision_path": phase_decision_path.to_string_lossy(),
                         "before": &before_diff,
                         "current": &after_diff,
                         "route_hint": worker_route_hint,
+                        "resolved_route_hint": resolved_worker_route_hint,
                         "worker_kind": selected_route.worker_kind.as_str(),
                         "worker_model": selected_route.worker_model,
                         "worker_category": selected_route.category.as_str(),
@@ -524,12 +867,53 @@ impl Orchestrator {
                 ),
             )?;
 
-            let worker_task = tasks
+            let reviewed_execution_id = if worker_route_hint == Some("review") {
+                Some(
+                    last_executor_execution_id
+                        .clone()
+                        .context("review route requires a completed executor execution")?,
+                )
+            } else {
+                None
+            };
+            let mut worker_task = tasks
                 .iter()
                 .find(|task| task.id == worker_task_id)
                 .context("missing worker task")?
                 .clone();
-            let worker_request = if iteration == 1 {
+            worker_task.inputs.phase_route_locked = !matches!(
+                phase_decision.candidate.backend,
+                PhaseBackend::LegacyCategory
+            );
+            if let Some(persisted_task) = tasks.iter_mut().find(|task| task.id == worker_task_id) {
+                persisted_task.inputs.phase_route_locked = worker_task.inputs.phase_route_locked;
+            }
+            store.write_tasks(&goal_id, &tasks)?;
+            if let Some(plan_task) = worker_task.inputs.plan_task.as_mut() {
+                plan_task.task_id = worker_task_id.clone();
+                if let Some(reviewed_execution_id) = reviewed_execution_id.as_deref() {
+                    plan_task.preferred_phase_profile = PhaseProfile::ReviewerFinal;
+                    plan_task.goal =
+                        format!("Independently review executor execution {reviewed_execution_id}");
+                    plan_task.deliverable =
+                        "A typed, evidence-backed final review receipt".to_string();
+                    plan_task.must_do = vec![
+                        "Inspect the current workspace, verification artifacts, and prior worker evidence"
+                            .to_string(),
+                        "Return verdicts for every required review dimension".to_string(),
+                    ];
+                    plan_task.must_not_do = vec![
+                        "Do not edit implementation files during the review phase".to_string(),
+                        "Do not claim a pass without concrete findings".to_string(),
+                    ];
+                    plan_task.scope.write_scope.clear();
+                    plan_task.completion_predicates = vec![
+                        "The receipt binds to the requested executor execution".to_string(),
+                        "All four review dimensions contain a verdict and findings".to_string(),
+                    ];
+                }
+            }
+            let base_worker_request = if iteration == 1 {
                 options.request.clone()
             } else {
                 repair_request(
@@ -539,43 +923,129 @@ impl Orchestrator {
                     last_coordinator_review.as_ref(),
                 )
             };
+            let worker_request = reviewed_execution_id
+                .as_deref()
+                .map_or(base_worker_request.clone(), |id| {
+                    review_worker_request(&base_worker_request, id)
+                });
             repair_request_history.push(worker_request.clone());
-            let managed_worker_task_id = task_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("task manager mutex poisoned"))?
-                .start(WorkerStartRequest {
+            check_phase_terminal_state(&phase_decision)
+                .context("worker phase terminal state check failed")?;
+            let start_result = if let Some(broker) = phase_runtime.broker.as_ref() {
+                let start_request = WorkerStartRequest {
                     store: &store,
                     workspace: &workspace,
                     task: &worker_task,
                     route_attempt: worker_task.attempt,
                     goal: &worker_request,
                     verification_commands: &detection.verification_commands,
-                    config: &options.worker,
+                    config: &effective_worker,
                     cancellation_token: options.cancellation_token.clone(),
                     coordinator_model: goal.coordinator_model.as_ref(),
                     coordinator_brief: goal.coordinator_brief.as_deref(),
-                    route_hint: worker_route_hint,
-                })
-                .context("ownership: worker start failed, goal remains incomplete")?;
+                    route_hint: resolved_worker_route_hint,
+                };
+                broker
+                    .start_via_broker(start_request)
+                    .and_then(|_handle| {
+                        task_manager
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("task manager mutex poisoned"))?
+                            .start(WorkerStartRequest {
+                                store: &store,
+                                workspace: &workspace,
+                                task: &worker_task,
+                                route_attempt: worker_task.attempt,
+                                goal: &worker_request,
+                                verification_commands: &detection.verification_commands,
+                                config: &effective_worker,
+                                cancellation_token: options.cancellation_token.clone(),
+                                coordinator_model: goal.coordinator_model.as_ref(),
+                                coordinator_brief: goal.coordinator_brief.as_deref(),
+                                route_hint: resolved_worker_route_hint,
+                            })
+                    })
+            } else {
+                match task_manager.lock() {
+                    Ok(mut task_manager) => task_manager.start(WorkerStartRequest {
+                        store: &store,
+                        workspace: &workspace,
+                        task: &worker_task,
+                        route_attempt: worker_task.attempt,
+                        goal: &worker_request,
+                        verification_commands: &detection.verification_commands,
+                        config: &effective_worker,
+                        cancellation_token: options.cancellation_token.clone(),
+                        coordinator_model: goal.coordinator_model.as_ref(),
+                        coordinator_brief: goal.coordinator_brief.as_deref(),
+                        route_hint: resolved_worker_route_hint,
+                    }),
+                    Err(_) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        bail!("task manager mutex poisoned");
+                    }
+                }
+            };
+            let managed_worker_task_id = match start_result {
+                Ok(task_id) => task_id,
+                Err(error) => {
+                    stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                    return Err(error)
+                        .context("ownership: worker start failed, goal remains incomplete");
+                }
+            };
+            if !lineage.active_task_ids.contains(&worker_task_id) {
+                lineage.active_task_ids.push(worker_task_id.clone());
+            }
+            lineage.updated_at = timestamp();
+            store.write_lineage(&lineage)?;
             if options
                 .cancellation_token
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
             {
-                task_manager
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("task manager mutex poisoned"))?
-                    .cancel_task(&managed_worker_task_id)?;
+                let cancel_result = match task_manager.lock() {
+                    Ok(mut task_manager) => task_manager.cancel_task(&managed_worker_task_id),
+                    Err(_) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        bail!("task manager mutex poisoned");
+                    }
+                };
+                stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                cancel_result?;
                 check_run_cancelled(options.cancellation_token.as_ref())?;
             }
             let managed_worker_run = loop {
-                check_run_cancelled(options.cancellation_token.as_ref())?;
-                if let Some(run) = task_manager
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("task manager mutex poisoned"))?
-                    .try_wait_for(&managed_worker_task_id)?
+                if options
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
                 {
-                    break run;
+                    let cancel_result = match task_manager.lock() {
+                        Ok(mut task_manager) => task_manager.cancel_task(&managed_worker_task_id),
+                        Err(_) => {
+                            stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                            bail!("task manager mutex poisoned");
+                        }
+                    };
+                    stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                    cancel_result?;
+                    check_run_cancelled(options.cancellation_token.as_ref())?;
+                }
+                let wait_result = match task_manager.lock() {
+                    Ok(mut task_manager) => task_manager.try_wait_for(&managed_worker_task_id),
+                    Err(_) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        bail!("task manager mutex poisoned");
+                    }
+                };
+                match wait_result {
+                    Ok(Some(run)) => break run,
+                    Ok(None) => {}
+                    Err(error) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        return Err(error).context("failed while waiting for Gear worker task");
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
@@ -584,6 +1054,25 @@ impl Orchestrator {
             let iteration_worker_outcome = managed_worker_run.outcome;
             let iteration_worker_result = managed_worker_run.result;
             let iteration_worker_result_for_risk = iteration_worker_result.clone();
+            let phase_route_receipt = phase_route_receipt_for_worker(
+                &phase_decision,
+                100 + iteration,
+                &goal_id,
+                &plan_graph,
+                &worker_task_id,
+                worker_session_id.as_deref(),
+                &worker_task_record,
+                &store,
+            )?;
+            let phase_route_receipt_path =
+                store.write_phase_route_receipt(&goal_id, 100 + iteration, &phase_route_receipt)?;
+            if worker_route_hint != Some("review") {
+                last_executor_execution_id = Some(
+                    worker_session_id
+                        .clone()
+                        .unwrap_or_else(|| worker_task_id.clone()),
+                );
+            }
             let _budget_check = budget_controller.apply_budget_for_route_change(
                 &BudgetSnapshot {
                     worker_call_count,
@@ -620,9 +1109,17 @@ impl Orchestrator {
             );
             store.write_tasks(&goal_id, &tasks)?;
 
+            if let Some(worker_session_id) = worker_session_id.as_ref()
+                && !lineage.worker_session_ids.contains(worker_session_id)
+            {
+                lineage.worker_session_ids.push(worker_session_id.clone());
+            }
+
             // Worker has completed (success, failure, or skip); remove from
             // active_task_ids so lineage no longer blocks completion on this worker.
             lineage.active_task_ids.retain(|id| id != &worker_task_id);
+            lineage.plan_remaining_items =
+                usize::from(iteration_worker_result.status != WorkerStatus::Succeeded);
             lineage.updated_at = timestamp();
             store.write_lineage(&lineage)?;
 
@@ -661,10 +1158,14 @@ impl Orchestrator {
                         "status": iteration_worker_result.status.as_str(),
                         "session_id": worker_session_id,
                         "route_hint": worker_route_hint,
+                        "resolved_route_hint": resolved_worker_route_hint,
                         "worker_kind": selected_route.worker_kind.as_str(),
                         "worker_model": selected_route.worker_model,
                         "worker_category": selected_route.category.as_str(),
                         "route_reason": &selected_route.route_reason,
+                        "phase": worker_phase,
+                        "phase_route_decision_path": phase_decision_path.to_string_lossy(),
+                        "phase_route_receipt_path": phase_route_receipt_path.to_string_lossy(),
                         "packet_path": iteration_worker_result.packet_path.to_string_lossy(),
                         "prompt_path": iteration_worker_result.prompt_path.to_string_lossy(),
                         "outcome_path": iteration_worker_result.outcome_path.to_string_lossy(),
@@ -730,6 +1231,8 @@ impl Orchestrator {
             };
 
             after_diff = git_snapshot(&workspace)?;
+            let reviewer_changed_workspace =
+                review_changed_workspace(worker_route_hint, &before_diff, &after_diff);
             diff_history.push(after_diff.clone());
             scope_check = check_scope(&after_diff, &scope);
             let comment_violations = comment_check(&workspace, &after_diff.changed_files)?;
@@ -885,6 +1388,11 @@ impl Orchestrator {
                     comment_violations.len()
                 ));
             }
+            if reviewer_changed_workspace {
+                context_risk_signals.push(
+                    "review_mutation: the read-only reviewer changed the workspace".to_string(),
+                );
+            }
             let budget_snapshot = BudgetSnapshot {
                 context_risk_signals,
                 ..budget_snapshot_for_review
@@ -905,7 +1413,7 @@ impl Orchestrator {
             let has_fallback = category_resolution_result.nearest_fallback().is_some();
             // Ownership decision was generated earlier in the iteration.
             // The immutable `ownership` is already in scope from line ~468.
-            let evaluation = evaluate_goal_with_source(
+            let evaluation = evaluate_goal_with_review_target(
                 verification_passed,
                 &worker_result
                     .as_ref()
@@ -926,7 +1434,8 @@ impl Orchestrator {
                 has_fallback,
                 Some(current_route_change_type),
                 Some(&ownership),
-                None,
+                Some(&lineage),
+                reviewed_execution_id.as_deref(),
                 &worker_task_record.attempts,
             );
             next_route_hint_override = evaluation.route_hint_override.clone();
@@ -954,9 +1463,11 @@ impl Orchestrator {
                     &scope_check,
                     &verification_results,
                     coordinator_review,
+                    reviewed_execution_id.as_deref(),
+                    &worker_task_record.attempts,
                 ),
             )?;
-            let review_gate = ReviewGate::from_inputs(
+            let review_gate = ReviewGate::from_inputs_for_execution(
                 verification_passed,
                 &worker_result
                     .as_ref()
@@ -965,6 +1476,7 @@ impl Orchestrator {
                 &scope_check,
                 coordinator_review,
                 &budget_snapshot.context_risk_signals,
+                reviewed_execution_id.as_deref(),
                 &worker_task_record.attempts,
             );
             review_gate
@@ -1041,6 +1553,15 @@ impl Orchestrator {
                 .evidence
                 .push(final_report_path.to_string_lossy().to_string());
         });
+        lineage.active_task_ids.clear();
+        if goal.status == GoalStatus::Complete {
+            lineage.plan_remaining_items = 0;
+            lineage.status = ContinuationStatus::Completed;
+        } else {
+            lineage.status = ContinuationStatus::Stopped;
+        }
+        lineage.updated_at = timestamp();
+        store.write_lineage(&lineage)?;
         store.write_goal(&goal)?;
         store.write_tasks(&goal_id, &tasks)?;
         if options.continuation {
@@ -1106,6 +1627,638 @@ impl Orchestrator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_approved_plan_graph(
+    goal: &mut Goal,
+    scope: &Scope,
+    verification_commands: &[String],
+    workspace: &std::path::Path,
+    store: &StateStore,
+    session_id: &str,
+    event_sink: &Option<EventSink>,
+    cancellation_token: Option<&CancellationToken>,
+    phase_runtime: &PhaseRuntime,
+) -> Result<PlanGraph> {
+    let mut plan = build_plan_graph(goal, scope, verification_commands)?;
+    if !phase_runtime.require_plan_approval {
+        return Ok(plan);
+    }
+
+    let critic_hook = phase_runtime
+        .plan_critic_hook
+        .as_ref()
+        .context("plan approval is required but no PlanCritic hook is configured")?;
+    let mut planner_raw_output = planner_raw_output(goal, &plan)?;
+    let mut planner_identity = planner_identity_for_plan(&plan, phase_runtime.planner.clone())?;
+    let mut seen_phase_identities = vec![planner_identity.clone()];
+    let mut revisions_performed = 0usize;
+
+    loop {
+        check_run_cancelled(cancellation_token)?;
+        let planner_decision = phase_runtime.routes.resolve(
+            &PhaseProfile::Planner,
+            &phase_runtime.inventory,
+            phase_runtime.current_model.as_ref(),
+        )?;
+        check_phase_terminal_state(&planner_decision)
+            .context("planner phase terminal state check failed")?;
+        validate_phase_execution_identity(&planner_decision, &planner_identity)?;
+        let planner_ordinal = plan.revision.saturating_mul(10).saturating_add(1);
+        let planner_decision_path =
+            store.write_phase_route_decision(&goal.id, planner_ordinal, &planner_decision)?;
+        append_event(
+            store,
+            event_sink,
+            event(
+                session_id,
+                Some(&goal.id),
+                None,
+                EventKind::PhaseRouteSelected,
+                "Planner phase route selected",
+                json!({
+                    "phase": PhaseProfile::Planner,
+                    "decision_path": planner_decision_path.to_string_lossy(),
+                    "selected_candidate": planner_decision.selected_candidate,
+                    "fallback_count": planner_decision.rejected_candidates.len(),
+                }),
+            ),
+        )?;
+        let candidate_path = store.write_plan_candidate(&plan)?;
+        let planner_raw_path = store.write_plan_review_text(
+            &goal.id,
+            plan.revision,
+            "planner-output",
+            &planner_raw_output,
+        )?;
+        let planner_receipt = PlannerExecutionReceipt::seal(
+            &plan,
+            planner_identity.clone(),
+            &planner_raw_output,
+            Some(planner_raw_path.to_string_lossy().to_string()),
+            timestamp(),
+        )?;
+        let planner_receipt_path = store.write_planner_execution_receipt(&planner_receipt)?;
+        let planner_route_receipt = phase_route_receipt_for_identity(
+            &planner_decision,
+            planner_ordinal,
+            &goal.id,
+            &plan,
+            &planner_identity,
+        )?;
+        let planner_route_receipt_path =
+            store.write_phase_route_receipt(&goal.id, planner_ordinal, &planner_route_receipt)?;
+
+        let verifier = PlanVerifierReport::verify(&plan, workspace)?;
+        let verifier_path = store.write_plan_verifier_report(&verifier)?;
+        let mut approval_state = PlanApprovalState {
+            schema_version: crate::plan_review::PLAN_REVIEW_SCHEMA_VERSION,
+            goal_id: goal.id.clone(),
+            plan_id: plan.plan_id.clone(),
+            plan_revision: plan.revision,
+            plan_hash: plan.plan_hash.clone(),
+            status: PlanApprovalStatus::Reviewing,
+            planner_receipt_hash: planner_receipt.receipt_hash.clone(),
+            verifier_report_hash: verifier.report_hash.clone(),
+            critic_receipt_hash: None,
+            revisions_used: revisions_performed,
+            updated_at: timestamp(),
+        };
+        let approval_state_path = store.write_plan_approval_state(&approval_state)?;
+        append_event(
+            store,
+            event_sink,
+            event(
+                session_id,
+                Some(&goal.id),
+                None,
+                EventKind::PlanReviewStarted,
+                format!("Plan revision {} entered independent review", plan.revision),
+                json!({
+                    "plan_id": plan.plan_id,
+                    "plan_hash": plan.plan_hash,
+                    "revision": plan.revision,
+                    "candidate_path": candidate_path.to_string_lossy(),
+                    "planner_receipt_path": planner_receipt_path.to_string_lossy(),
+                    "verifier_path": verifier_path.to_string_lossy(),
+                    "planner_route_decision_path": planner_decision_path.to_string_lossy(),
+                    "planner_route_receipt_path": planner_route_receipt_path.to_string_lossy(),
+                    "verifier_passed": verifier.passed(),
+                    "approval_state_path": approval_state_path.to_string_lossy(),
+                }),
+            ),
+        )?;
+
+        let critic_decision = phase_runtime.routes.resolve(
+            &PhaseProfile::PlanCritic,
+            &phase_runtime.inventory,
+            phase_runtime.current_model.as_ref(),
+        )?;
+        let critic_ordinal = plan.revision.saturating_mul(10).saturating_add(2);
+        let critic_decision_path =
+            store.write_phase_route_decision(&goal.id, critic_ordinal, &critic_decision)?;
+        append_event(
+            store,
+            event_sink,
+            event(
+                session_id,
+                Some(&goal.id),
+                None,
+                EventKind::PhaseRouteSelected,
+                "PlanCritic phase route selected",
+                json!({
+                    "phase": PhaseProfile::PlanCritic,
+                    "decision_path": critic_decision_path.to_string_lossy(),
+                    "selected_candidate": critic_decision.selected_candidate,
+                    "fallback_count": critic_decision.rejected_candidates.len(),
+                }),
+            ),
+        )?;
+        check_run_cancelled(cancellation_token)?;
+        check_phase_terminal_state(&critic_decision)
+            .context("plan critic phase terminal state check failed")?;
+        let broker = phase_runtime.broker.as_deref();
+        let submission = run_phase_via_broker(
+            broker,
+            &critic_decision,
+            &goal.id,
+            &plan.plan_id,
+            plan.revision,
+            "plan_critic",
+            || {
+                critic_hook(PlanCriticInput {
+                    request: goal.request.clone(),
+                    plan: plan.clone(),
+                    planner_receipt: planner_receipt.clone(),
+                    verifier_report: verifier.clone(),
+                    route_decision: critic_decision.clone(),
+                })
+                .context("PlanCritic hook failed before plan approval")
+            },
+        )?;
+        check_run_cancelled(cancellation_token)?;
+        validate_phase_execution_identity(&critic_decision, &submission.reviewer)?;
+        if seen_phase_identities
+            .iter()
+            .any(|seen| !submission.reviewer.is_independent_from(seen))
+        {
+            bail!("each plan revision requires a fresh PlanCritic execution identity");
+        }
+        let critic_raw_path = store.write_plan_review_text(
+            &goal.id,
+            plan.revision,
+            "critic-output",
+            &submission.raw_output,
+        )?;
+        let critic_receipt = PlanCriticReceipt::seal(
+            &plan,
+            &planner_receipt,
+            &planner_raw_output,
+            &verifier,
+            submission.reviewer.clone(),
+            submission.verdict,
+            &submission.raw_output,
+            submission
+                .artifact_path
+                .or_else(|| Some(critic_raw_path.to_string_lossy().to_string())),
+            timestamp(),
+        )?;
+        let critic_receipt_path = store.write_plan_critic_receipt(&critic_receipt)?;
+        let critic_route_receipt = phase_route_receipt_for_identity(
+            &critic_decision,
+            critic_ordinal,
+            &goal.id,
+            &plan,
+            &submission.reviewer,
+        )?;
+        let critic_route_receipt_path =
+            store.write_phase_route_receipt(&goal.id, critic_ordinal, &critic_route_receipt)?;
+        seen_phase_identities.push(submission.reviewer.clone());
+        approval_state.critic_receipt_hash = Some(critic_receipt.receipt_hash.clone());
+
+        match critic_receipt.verdict.decision {
+            PlanCriticDecision::Approve => {
+                approval_state.status = PlanApprovalStatus::Approved;
+                approval_state.updated_at = timestamp();
+                store.write_plan_approval_state(&approval_state)?;
+                append_event(
+                    store,
+                    event_sink,
+                    event(
+                        session_id,
+                        Some(&goal.id),
+                        None,
+                        EventKind::PlanReviewApproved,
+                        format!("Plan revision {} passed review", plan.revision),
+                        json!({
+                            "plan_id": plan.plan_id,
+                            "plan_hash": plan.plan_hash,
+                            "revision": plan.revision,
+                            "critic_receipt_path": critic_receipt_path.to_string_lossy(),
+                            "critic_route_decision_path": critic_decision_path.to_string_lossy(),
+                            "critic_route_receipt_path": critic_route_receipt_path.to_string_lossy(),
+                        }),
+                    ),
+                )?;
+                goal.status = GoalStatus::Planning;
+                goal.updated_at = timestamp();
+                store.write_goal(goal)?;
+                return Ok(plan);
+            }
+            PlanCriticDecision::Reject => {
+                approval_state.status = PlanApprovalStatus::Rejected;
+                approval_state.updated_at = timestamp();
+                store.write_plan_approval_state(&approval_state)?;
+                goal.status = GoalStatus::NeedsUser;
+                goal.summary = critic_receipt
+                    .verdict
+                    .needs_user_reason
+                    .clone()
+                    .unwrap_or_else(|| critic_receipt.verdict.summary.clone());
+                goal.updated_at = timestamp();
+                store.write_goal(goal)?;
+                append_event(
+                    store,
+                    event_sink,
+                    event(
+                        session_id,
+                        Some(&goal.id),
+                        None,
+                        EventKind::PlanRejected,
+                        format!("Plan revision {} requires user input", plan.revision),
+                        json!({
+                            "plan_id": plan.plan_id,
+                            "plan_hash": plan.plan_hash,
+                            "revision": plan.revision,
+                            "reason": goal.summary,
+                            "critic_receipt_path": critic_receipt_path.to_string_lossy(),
+                        }),
+                    ),
+                )?;
+                bail!("plan rejected before worker dispatch: {}", goal.summary);
+            }
+            PlanCriticDecision::Revise => {
+                if revisions_performed >= phase_runtime.max_plan_revisions {
+                    approval_state.status = PlanApprovalStatus::Limited;
+                    approval_state.updated_at = timestamp();
+                    store.write_plan_approval_state(&approval_state)?;
+                    goal.status = GoalStatus::Limited;
+                    goal.summary = format!(
+                        "Plan review exhausted {} automatic revision(s)",
+                        phase_runtime.max_plan_revisions
+                    );
+                    goal.updated_at = timestamp();
+                    store.write_goal(goal)?;
+                    bail!("{}; no worker was started", goal.summary);
+                }
+                approval_state.status = PlanApprovalStatus::Revising;
+                approval_state.revisions_used = revisions_performed.saturating_add(1);
+                approval_state.updated_at = timestamp();
+                store.write_plan_approval_state(&approval_state)?;
+                let revision_hook = phase_runtime
+                    .plan_revision_hook
+                    .as_ref()
+                    .context("PlanCritic requested revision but no planner revision hook exists")?;
+                append_event(
+                    store,
+                    event_sink,
+                    event(
+                        session_id,
+                        Some(&goal.id),
+                        None,
+                        EventKind::PlanRevisionRequested,
+                        format!("Plan revision {} must be revised", plan.revision),
+                        json!({
+                            "plan_id": plan.plan_id,
+                            "plan_hash": plan.plan_hash,
+                            "revision": plan.revision,
+                            "instructions": critic_receipt.verdict.revision_instructions,
+                            "critic_receipt_path": critic_receipt_path.to_string_lossy(),
+                        }),
+                    ),
+                )?;
+                check_run_cancelled(cancellation_token)?;
+                let broker = phase_runtime.broker.as_deref();
+                let revision = run_phase_via_broker(
+                    broker,
+                    &planner_decision,
+                    &goal.id,
+                    &plan.plan_id,
+                    plan.revision,
+                    "planner_revision",
+                    || {
+                        revision_hook(PlanRevisionInput {
+                            request: goal.request.clone(),
+                            plan: plan.clone(),
+                            planner_receipt,
+                            critic_receipt,
+                            route_decision: planner_decision.clone(),
+                        })
+                        .context("planner revision hook failed")
+                    },
+                )?;
+                check_run_cancelled(cancellation_token)?;
+                if seen_phase_identities
+                    .iter()
+                    .any(|seen| !revision.planner.is_independent_from(seen))
+                {
+                    bail!("planner revision must use a globally fresh execution identity");
+                }
+                let parsed_revision = parse_planner_draft(&revision.raw_output)
+                    .context("planner revision raw output is not a PlanGraphDraft")?;
+                if parsed_revision != revision.draft {
+                    bail!("planner revision raw output does not match its typed draft");
+                }
+                revision.planner.validate()?;
+                let provider_id = revision
+                    .planner
+                    .provider_id
+                    .clone()
+                    .context("planner revision is missing provider identity")?;
+                let model_id = revision
+                    .planner
+                    .model_id
+                    .clone()
+                    .context("planner revision is missing model identity")?;
+                let previous_plan_hash = plan.plan_hash.clone();
+                let next_revision = plan.revision.saturating_add(1);
+                let revised_plan = PlanGraph::seal(
+                    &goal.id,
+                    next_revision,
+                    PlanSource::PlannerModel,
+                    Some(PlannerReceipt {
+                        provider_id,
+                        model_id,
+                        session_id: revision.planner.actual_session_id.clone(),
+                    }),
+                    revision.draft,
+                )?;
+                if revised_plan.plan_hash == previous_plan_hash {
+                    bail!("planner revision must change the sealed PlanGraph content hash");
+                }
+                plan = revised_plan;
+                planner_raw_output = revision.raw_output;
+                planner_identity = revision.planner;
+                seen_phase_identities.push(planner_identity.clone());
+                revisions_performed += 1;
+            }
+        }
+    }
+}
+
+fn planner_raw_output(goal: &Goal, plan: &PlanGraph) -> Result<String> {
+    match plan.source {
+        PlanSource::PlannerModel => goal
+            .coordinator_brief
+            .clone()
+            .context("planner-model PlanGraph is missing its raw planner output"),
+        PlanSource::DeterministicFallback => serde_json::to_string(&plan.draft)
+            .context("failed to serialize deterministic planner output"),
+    }
+}
+
+fn planner_identity_for_plan(
+    plan: &PlanGraph,
+    configured: Option<PhaseExecutionIdentity>,
+) -> Result<PhaseExecutionIdentity> {
+    match plan.source {
+        PlanSource::PlannerModel => {
+            configured.context("plan approval requires a host-issued planner execution identity")
+        }
+        PlanSource::DeterministicFallback => Ok(PhaseExecutionIdentity {
+            execution_id: format!("deterministic_planner_{}", &plan.plan_hash[..16]),
+            phase_session_id: format!("deterministic_plan_{}", &plan.plan_hash[..16]),
+            backend: PhaseExecutionBackend::DeterministicRules,
+            agent_id: Some("gearbox".to_string()),
+            provider_id: None,
+            model_id: None,
+            actual_session_id: None,
+        }),
+    }
+}
+
+fn validate_phase_execution_identity(
+    decision: &PhaseRouteDecision,
+    identity: &PhaseExecutionIdentity,
+) -> Result<()> {
+    identity.validate()?;
+    match decision.candidate.backend {
+        PhaseBackend::DirectModel => {
+            if identity.backend != PhaseExecutionBackend::LanguageModelRequest {
+                bail!("direct-model phase must use a language-model-request identity");
+            }
+        }
+        PhaseBackend::NativeZed => {
+            bail!(
+                "native-Zed planner/PlanCritic sessions require the later ACP broker stage; use DirectModel for this phase"
+            );
+        }
+        PhaseBackend::Deterministic => {
+            if identity.backend != PhaseExecutionBackend::DeterministicRules {
+                bail!("deterministic phase must use a deterministic-rules identity");
+            }
+        }
+        PhaseBackend::Worker(_) | PhaseBackend::LegacyCategory => {
+            bail!("planner and PlanCritic phases require a trusted direct or native backend")
+        }
+    }
+    if let Some(requested_model) = decision.requested_model.as_ref()
+        && (identity.agent_id.as_deref() != Some(requested_model.agent_id.as_str())
+            || identity.provider_id.as_deref() != Some(requested_model.provider_id.as_str())
+            || identity.model_id.as_deref() != Some(requested_model.model_id.as_str()))
+    {
+        bail!("phase execution identity does not match the resolved provider/model route");
+    }
+    Ok(())
+}
+
+fn phase_route_receipt_for_identity(
+    decision: &PhaseRouteDecision,
+    ordinal: usize,
+    goal_id: &str,
+    plan: &PlanGraph,
+    identity: &PhaseExecutionIdentity,
+) -> Result<PhaseRouteReceipt> {
+    let (binding_status, applied_model) =
+        match (&decision.candidate.backend, &decision.candidate.model) {
+            (PhaseBackend::Deterministic, PhaseModelBinding::None) => {
+                (ModelBindingStatus::Deterministic, None)
+            }
+            (PhaseBackend::DirectModel, PhaseModelBinding::CurrentSession) => (
+                ModelBindingStatus::CurrentSession,
+                decision.requested_model.clone(),
+            ),
+            (PhaseBackend::DirectModel, PhaseModelBinding::ExactLive(_)) => (
+                ModelBindingStatus::Applied,
+                decision.requested_model.clone(),
+            ),
+            _ => bail!("unsupported trusted planning phase backend/model binding"),
+        };
+    PhaseRouteReceipt {
+        decision: decision.clone(),
+        ordinal,
+        plan_revision: plan.revision,
+        decision_hash: decision.hash()?,
+        goal_id: Some(goal_id.to_string()),
+        plan_id: Some(plan.plan_id.clone()),
+        plan_hash: Some(plan.plan_hash.clone()),
+        task_id: None,
+        worker_session_id: identity.actual_session_id.clone(),
+        applied_model,
+        actual_worker_kind: None,
+        actual_category: None,
+        actual_worker_model: None,
+        actual_route_reason: None,
+        task_record_path: None,
+        task_record_sha256: None,
+        binding_status,
+        receipt_hash: String::new(),
+    }
+    .seal()
+}
+
+fn worker_phase_for_route_hint(preferred: &PhaseProfile, route_hint: Option<&str>) -> PhaseProfile {
+    match route_hint
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("quick") => PhaseProfile::ExecutorQuick,
+        Some("deep") | Some("repair") => PhaseProfile::ExecutorDeep,
+        Some("review") => PhaseProfile::ReviewerFinal,
+        _ => match preferred {
+            PhaseProfile::ExecutorQuick | PhaseProfile::ExecutorDeep => preferred.clone(),
+            PhaseProfile::ReviewerTask | PhaseProfile::ReviewerFinal => PhaseProfile::ReviewerFinal,
+            _ => PhaseProfile::ExecutorQuick,
+        },
+    }
+}
+
+fn phase_route_receipt_for_worker(
+    decision: &PhaseRouteDecision,
+    ordinal: usize,
+    goal_id: &str,
+    plan: &PlanGraph,
+    task_id: &str,
+    worker_session_id: Option<&str>,
+    task_record: &TaskRecord,
+    store: &StateStore,
+) -> Result<PhaseRouteReceipt> {
+    let last_attempt = task_record
+        .attempts
+        .last()
+        .context("phase-routed worker finished without a recorded attempt")?;
+    let actual_worker_kind = WorkerKind::parse(&last_attempt.worker_kind)
+        .context("phase-routed worker recorded an unknown worker kind")?;
+    let actual_category = WorkerCategory::parse(&last_attempt.worker_category)
+        .context("phase-routed worker recorded an unknown worker category")?;
+    if let Some(expected_worker_kind) = decision.worker_kind
+        && actual_worker_kind != expected_worker_kind
+    {
+        bail!(
+            "phase route selected `{}` but task completed on `{}`",
+            expected_worker_kind.as_str(),
+            last_attempt.worker_kind
+        );
+    }
+
+    let (binding_status, applied_model) =
+        match (&decision.candidate.backend, &decision.candidate.model) {
+            (PhaseBackend::LegacyCategory, PhaseModelBinding::None) => {
+                (ModelBindingStatus::LegacyUnverified, None)
+            }
+            (PhaseBackend::Worker(_), PhaseModelBinding::None) => {
+                (ModelBindingStatus::LegacyUnverified, None)
+            }
+            (PhaseBackend::Worker(_), PhaseModelBinding::BackendDeclared(model)) => {
+                if last_attempt.worker_model.as_deref() != Some(model.as_str()) {
+                    bail!("phase worker attempt did not preserve its declared model");
+                }
+                (ModelBindingStatus::DeclaredUnverified, None)
+            }
+            (
+                PhaseBackend::NativeZed,
+                PhaseModelBinding::CurrentSession | PhaseModelBinding::ExactLive(_),
+            ) => {
+                let requested_model = decision
+                    .requested_model
+                    .as_ref()
+                    .context("native phase route is missing its requested model")?;
+                let selection_path = store.worker_dir(task_id).join("model-selection.json");
+                let selection: serde_json::Value = serde_json::from_str(
+                    &std_fs::read_to_string(&selection_path).with_context(|| {
+                        format!(
+                            "missing native phase model evidence at {}",
+                            selection_path.display()
+                        )
+                    })?,
+                )
+                .with_context(|| {
+                    format!(
+                        "invalid native model evidence at {}",
+                        selection_path.display()
+                    )
+                })?;
+                let applied = selection
+                    .get("applied_model")
+                    .and_then(serde_json::Value::as_str)
+                    .context("native model evidence is missing applied_model")?;
+                let requested = selection
+                    .get("requested_model")
+                    .and_then(serde_json::Value::as_str)
+                    .context("native model evidence is missing requested_model")?;
+                if requested != requested_model.qualified_model_id() {
+                    bail!("native model evidence requested model does not match its route");
+                }
+                let expected_worker_session_id = worker_session_id
+                    .context("native phase route is missing its worker session id")?;
+                let evidence_worker_session_id = selection
+                    .get("worker_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .context("native model evidence is missing worker_session_id")?;
+                if evidence_worker_session_id != expected_worker_session_id {
+                    bail!("native model evidence belongs to a different worker session");
+                }
+                let applied_model =
+                    ModelSelectorId::from_qualified(requested_model.agent_id.clone(), applied)?;
+                if &applied_model != requested_model {
+                    bail!("native phase applied model does not match its exact route decision");
+                }
+                (ModelBindingStatus::Applied, Some(applied_model))
+            }
+            _ => bail!("non-worker phase backend reached programming worker dispatch"),
+        };
+
+    let task_record_path = store
+        .phase_routes_dir(goal_id)
+        .join("worker-evidence")
+        .join(format!("{task_id}-task-record.json"));
+    crate::state::write_json(&task_record_path, task_record)
+        .context("failed to persist immutable phase route task-record snapshot")?;
+    let task_record_bytes = std_fs::read(&task_record_path)
+        .context("failed to read phase-routed task-record snapshot for receipt")?;
+    PhaseRouteReceipt {
+        decision: decision.clone(),
+        ordinal,
+        plan_revision: plan.revision,
+        decision_hash: decision.hash()?,
+        goal_id: Some(goal_id.to_string()),
+        plan_id: Some(plan.plan_id.clone()),
+        plan_hash: Some(plan.plan_hash.clone()),
+        task_id: Some(task_id.to_string()),
+        worker_session_id: worker_session_id.map(ToOwned::to_owned),
+        applied_model,
+        actual_worker_kind: Some(actual_worker_kind),
+        actual_category: Some(actual_category),
+        actual_worker_model: last_attempt.worker_model.clone(),
+        actual_route_reason: Some(last_attempt.route_reason.clone()),
+        task_record_path: Some(task_record_path.to_string_lossy().to_string()),
+        task_record_sha256: Some(format!("{:x}", Sha256::digest(task_record_bytes))),
+        binding_status,
+        receipt_hash: String::new(),
+    }
+    .seal()
+}
+
 fn title_from_request(request: &str) -> String {
     let trimmed = request.trim();
     let mut title = String::new();
@@ -1142,6 +2295,101 @@ fn success_criteria(detection: &LanguageDetection) -> Vec<String> {
         }
     }
     criteria
+}
+
+fn build_plan_graph(
+    goal: &Goal,
+    scope: &Scope,
+    verification_commands: &[String],
+) -> Result<PlanGraph> {
+    match goal.coordinator_brief.as_deref() {
+        Some(output) => match parse_planner_draft(output) {
+            Ok(draft) => PlanGraph::seal(
+                &goal.id,
+                1,
+                PlanSource::PlannerModel,
+                goal.coordinator_model.as_ref().map(|model| PlannerReceipt {
+                    provider_id: model.provider_id.clone(),
+                    model_id: model.model_id.clone(),
+                    session_id: None,
+                }),
+                draft,
+            ),
+            Err(error)
+                if goal
+                    .coordinator_model
+                    .as_ref()
+                    .is_some_and(|model| model.provider_id != "fake") =>
+            {
+                Err(error).context("configured Gear planner returned an invalid PlanGraph")
+            }
+            Err(_) => PlanGraph::seal(
+                &goal.id,
+                1,
+                PlanSource::DeterministicFallback,
+                None,
+                deterministic_fallback_draft(&goal.request, scope, verification_commands),
+            ),
+        },
+        None if goal
+            .coordinator_model
+            .as_ref()
+            .is_some_and(|model| model.provider_id != "fake") =>
+        {
+            bail!("configured Gear planner did not return a PlanGraph")
+        }
+        None => PlanGraph::seal(
+            &goal.id,
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            deterministic_fallback_draft(&goal.request, scope, verification_commands),
+        ),
+    }
+}
+
+fn phase_profile_route_hint(profile: &PhaseProfile) -> Option<&'static str> {
+    match profile {
+        PhaseProfile::ExecutorQuick => Some("quick"),
+        PhaseProfile::ExecutorDeep => Some("deep"),
+        PhaseProfile::ReviewerTask | PhaseProfile::ReviewerFinal => Some("review"),
+        _ => None,
+    }
+}
+
+fn review_changed_workspace(
+    route_hint: Option<&str>,
+    before: &DiffSnapshot,
+    after: &DiffSnapshot,
+) -> bool {
+    route_hint == Some("review")
+        && (before.status != after.status
+            || before.changed_files != after.changed_files
+            || before.diff_hash != after.diff_hash)
+}
+
+fn stop_lineage_task(store: &StateStore, lineage: &mut WorkLineage, task_id: &str) -> Result<()> {
+    lineage.active_task_ids.retain(|active| active != task_id);
+    lineage.status = ContinuationStatus::Stopped;
+    lineage.updated_at = timestamp();
+    store.write_lineage(lineage)?;
+    Ok(())
+}
+
+fn prepare_lineage_for_run(lineage: &mut WorkLineage, session_id: &str) {
+    if !lineage
+        .orchestrator_session_ids
+        .iter()
+        .any(|existing| existing == session_id)
+    {
+        lineage
+            .orchestrator_session_ids
+            .push(session_id.to_string());
+    }
+    lineage.status = ContinuationStatus::Running;
+    lineage.plan_remaining_items = 1;
+    lineage.active_task_ids.clear();
+    lineage.updated_at = timestamp();
 }
 
 fn initial_tasks(goal_id: &str, scope: &Scope, worker_kind: WorkerKind) -> Vec<Task> {
@@ -1701,6 +2949,10 @@ fn add_repair_task(
     worker_kind: WorkerKind,
 ) -> String {
     let task_id = repair_task_id(iteration);
+    let plan_task = tasks
+        .iter()
+        .find(|task| task.id == "task_003")
+        .and_then(|task| task.inputs.plan_task.clone());
     tasks.push(Task {
         id: task_id.clone(),
         goal_id: goal_id.to_string(),
@@ -1715,6 +2967,8 @@ fn add_repair_task(
             spec_path: None,
             plan_path: None,
             worker_packet_path: None,
+            plan_task,
+            phase_route_locked: false,
         },
         outputs: TaskOutputs {
             changed_files: Vec::new(),
@@ -1781,7 +3035,8 @@ struct GoalEvaluation {
     route_hint_override: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewDimension {
     GoalVerification,
     CodeQuality,
@@ -1805,12 +3060,32 @@ impl ReviewDimension {
 pub struct ReviewerEvidence {
     /// Unique execution ID of the reviewer worker.
     pub execution_id: String,
+    /// Executor session or task that this reviewer actually inspected.
+    pub reviewed_execution_id: String,
     /// The route/category of the reviewer (e.g. "deep", "explore", "comment_checker").
     pub route: String,
+    /// Qualified reviewer model selected for this attempt, when one was configured.
+    pub model: Option<String>,
     /// Path to the reviewer's output artifact.
     pub artifact_path: Option<String>,
     /// Verdict from this reviewer.
     pub verdict: String,
+    /// Reviewer findings supporting this dimension verdict.
+    pub findings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReviewReceiptPayload {
+    schema_version: u32,
+    reviewed_execution_id: String,
+    dimensions: Vec<ReviewReceiptDimension>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReviewReceiptDimension {
+    dimension: ReviewDimension,
+    verdict: String,
+    findings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1829,31 +3104,82 @@ pub struct ReviewGate {
 }
 
 impl ReviewGate {
-    /// Verify that each dimension has unique reviewer_evidence (or none).
-    /// Returns Err if the same execution_id is used for multiple dimensions.
+    /// Verify that repeated dimensions referring to one reviewer execution use
+    /// one coherent receipt. A single independent reviewer may issue multiple
+    /// dimension verdicts, but one execution ID cannot name different routes
+    /// or artifacts.
     pub fn validate_independent_reviewers(&self) -> Result<()> {
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen: Vec<(&str, &str, &str, Option<&str>, Option<&str>)> = Vec::new();
         for result in &self.results {
             if let Some(ref evidence) = result.reviewer_evidence {
-                if seen.contains(&evidence.execution_id.as_str()) {
+                if evidence.execution_id.trim().is_empty()
+                    || evidence.reviewed_execution_id.trim().is_empty()
+                    || evidence.route.trim().is_empty()
+                    || evidence.artifact_path.as_deref().is_none_or(str::is_empty)
+                    || evidence
+                        .findings
+                        .iter()
+                        .all(|finding| finding.trim().is_empty())
+                    || !matches!(evidence.verdict.as_str(), "pass" | "fail")
+                    || evidence.execution_id == evidence.reviewed_execution_id
+                {
                     bail!(
-                        "duplicate reviewer execution_id '{}' for dimension {}; each dimension must have independent evidence",
-                        evidence.execution_id,
-                        result.dimension.label(),
+                        "reviewer evidence for dimension {} has an incomplete receipt",
+                        result.dimension.label()
                     );
                 }
-                seen.push(&evidence.execution_id);
+                if let Some((_, reviewed_execution_id, route, model, artifact_path)) = seen
+                    .iter()
+                    .find(|(execution_id, _, _, _, _)| *execution_id == evidence.execution_id)
+                    && (*reviewed_execution_id != evidence.reviewed_execution_id
+                        || *route != evidence.route
+                        || *model != evidence.model.as_deref()
+                        || *artifact_path != evidence.artifact_path.as_deref())
+                {
+                    bail!(
+                        "reviewer execution_id '{}' refers to conflicting receipts",
+                        evidence.execution_id
+                    );
+                }
+                seen.push((
+                    &evidence.execution_id,
+                    &evidence.reviewed_execution_id,
+                    &evidence.route,
+                    evidence.model.as_deref(),
+                    evidence.artifact_path.as_deref(),
+                ));
             }
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn from_inputs(
         verification_passed: bool,
         worker_status: &WorkerStatus,
         scope_check: &crate::tools::ScopeCheck,
         coordinator_review: Option<&CoordinatorReview>,
         context_risk_signals: &[String],
+        task_attempts: &[TaskAttempt],
+    ) -> Self {
+        Self::from_inputs_for_execution(
+            verification_passed,
+            worker_status,
+            scope_check,
+            coordinator_review,
+            context_risk_signals,
+            None,
+            task_attempts,
+        )
+    }
+
+    fn from_inputs_for_execution(
+        verification_passed: bool,
+        worker_status: &WorkerStatus,
+        scope_check: &crate::tools::ScopeCheck,
+        coordinator_review: Option<&CoordinatorReview>,
+        context_risk_signals: &[String],
+        expected_reviewed_execution_id: Option<&str>,
         task_attempts: &[TaskAttempt],
     ) -> Self {
         let review_required = true;
@@ -1866,32 +3192,54 @@ impl ReviewGate {
         let comment_check_clean = !context_risk_signals
             .iter()
             .any(|signal| signal.starts_with("comment_check:"));
-        // Use real attempt data when available; None when no real reviewer ran.
-        let goal_verification_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::GoalVerification, task_attempts);
-        let code_quality_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::CodeQuality, task_attempts);
-        let security_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::Security, task_attempts);
-        let qa_execution_evidence =
-            reviewer_evidence_from_attempt(ReviewDimension::QaExecution, task_attempts);
+        let goal_verification_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::GoalVerification,
+            expected_reviewed_execution_id,
+            task_attempts,
+        );
+        let code_quality_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::CodeQuality,
+            expected_reviewed_execution_id,
+            task_attempts,
+        );
+        let security_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::Security,
+            expected_reviewed_execution_id,
+            task_attempts,
+        );
+        let qa_execution_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::QaExecution,
+            expected_reviewed_execution_id,
+            task_attempts,
+        );
+        let goal_verification_passed = verification_passed
+            && goal_satisfied
+            && reviewer_evidence_passed(goal_verification_evidence.as_ref());
+        let code_quality_passed = scope_clean
+            && comment_check_clean
+            && reviewer_evidence_passed(code_quality_evidence.as_ref());
+        let security_passed = scope_check.forbidden_touches.is_empty()
+            && reviewer_evidence_passed(security_evidence.as_ref());
+        let qa_execution_passed =
+            verification_passed && reviewer_evidence_passed(qa_execution_evidence.as_ref());
         Self {
             require_all_pass: review_required,
             results: vec![
                 ReviewDimensionResult {
                     dimension: ReviewDimension::GoalVerification,
-                    passed: verification_passed && goal_satisfied,
-                    evidence: if verification_passed && goal_satisfied {
+                    passed: goal_verification_passed,
+                    evidence: if goal_verification_passed {
                         "verification passed and coordinator accepted the goal".to_string()
                     } else {
-                        "verification or coordinator goal acceptance failed".to_string()
+                        "verification, coordinator acceptance, or typed reviewer verdict failed"
+                            .to_string()
                     },
                     reviewer_evidence: goal_verification_evidence,
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::CodeQuality,
-                    passed: scope_clean && comment_check_clean,
-                    evidence: if scope_clean && comment_check_clean {
+                    passed: code_quality_passed,
+                    evidence: if code_quality_passed {
                         format!(
                             "worker status `{}` accepted and scope checks are clean",
                             worker_status.as_str()
@@ -1907,8 +3255,8 @@ impl ReviewGate {
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::Security,
-                    passed: scope_check.forbidden_touches.is_empty(),
-                    evidence: if scope_check.forbidden_touches.is_empty() {
+                    passed: security_passed,
+                    evidence: if security_passed {
                         "no forbidden paths were touched".to_string()
                     } else {
                         format!(
@@ -1920,8 +3268,8 @@ impl ReviewGate {
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::QaExecution,
-                    passed: verification_passed,
-                    evidence: if verification_passed {
+                    passed: qa_execution_passed,
+                    evidence: if qa_execution_passed {
                         "verification commands passed".to_string()
                     } else {
                         "one or more verification commands failed".to_string()
@@ -1945,27 +3293,24 @@ impl ReviewGate {
         (!failures.is_empty()).then(|| failures.join("; "))
     }
 
-    /// Returns `Some(reason)` when ALL reviewer evidence entries are None
-    /// or synthetic (no real worker attempt produced the evidence). Completion
-    /// requires at least one real reviewer artifact.
+    /// Returns `Some(reason)` when any required review dimension lacks a real,
+    /// typed reviewer artifact.
     fn synthetic_evidence_only_reason(&self) -> Option<String> {
         if self.results.is_empty() {
             return None;
         }
-        let all_synthetic = self.results.iter().all(|result| {
-            result.reviewer_evidence.as_ref().map_or(true, |evidence| {
-                SYNTHETIC_EXECUTION_IDS.contains(&evidence.execution_id.as_str())
-            })
-        });
-        if all_synthetic {
-            Some(
-                "No real reviewer evidence available. \
-                 Completion requires at least one real reviewer artifact."
-                    .to_string(),
+        let missing_dimensions = self
+            .results
+            .iter()
+            .filter(|result| result.reviewer_evidence.is_none())
+            .map(|result| result.dimension.label())
+            .collect::<Vec<_>>();
+        (!missing_dimensions.is_empty()).then(|| {
+            format!(
+                "Missing typed reviewer evidence for: {}.",
+                missing_dimensions.join(", ")
             )
-        } else {
-            None
-        }
+        })
     }
 
     fn summary(&self) -> String {
@@ -1984,35 +3329,110 @@ impl ReviewGate {
     }
 }
 
-/// Known synthetic execution IDs used by `from_inputs()` when no real
-/// task attempt data is available.
-const SYNTHETIC_EXECUTION_IDS: &[&str] = &[
-    "coordinator",
-    "scope-check",
-    "security-check",
-    "verification",
-];
-
-/// Build `ReviewerEvidence` from a real task attempt if available.
-/// Returns None when no attempt data is available (use synthetic only as fallback).
+/// Build one receipt from a completed review-category worker attempt. Ordinary
+/// executor attempts and review attempts without a session or artifact are not
+/// reviewer evidence.
 fn reviewer_evidence_from_attempt(
     dimension: ReviewDimension,
+    expected_reviewed_execution_id: Option<&str>,
     attempts: &[TaskAttempt],
 ) -> Option<ReviewerEvidence> {
-    let last_attempt = attempts.last()?;
-    let execution_id = last_attempt.session_id.clone()?;
+    let last_attempt = attempts.iter().rev().find(|attempt| {
+        WorkerCategory::parse(&attempt.worker_category) == Some(WorkerCategory::Review)
+            && attempt.status == TaskAttemptStatus::Completed
+    })?;
     let artifact_path = last_attempt
         .result_path
         .clone()
         .or_else(|| last_attempt.outcome_path.clone());
+    let artifact_path = artifact_path?;
+    let reviewer_model = reviewer_model_from_attempt(last_attempt, &artifact_path);
+    let (receipt_path, receipt) = load_review_receipt(&artifact_path)?;
+    if receipt.schema_version != 1 || receipt.reviewed_execution_id.trim().is_empty() {
+        return None;
+    }
+    if expected_reviewed_execution_id
+        .is_some_and(|expected| expected != receipt.reviewed_execution_id)
+    {
+        return None;
+    }
+    if last_attempt.session_id.as_deref() == Some(receipt.reviewed_execution_id.as_str()) {
+        return None;
+    }
+    let dimension_receipt = receipt
+        .dimensions
+        .into_iter()
+        .find(|candidate| candidate.dimension == dimension)?;
+    let verdict = dimension_receipt.verdict.trim().to_ascii_lowercase();
+    if !matches!(verdict.as_str(), "pass" | "fail")
+        || dimension_receipt
+            .findings
+            .iter()
+            .all(|finding| finding.trim().is_empty())
+    {
+        return None;
+    }
+    let execution_id = last_attempt
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("command-artifact:{}", receipt_path.to_string_lossy()));
     Some(ReviewerEvidence {
-        // Suffix with dimension label so each dimension gets a unique
-        // execution_id even when all evidence derives from the same worker attempt.
-        execution_id: format!("{}_{}", execution_id, dimension.label()),
-        route: dimension.label().to_string(),
-        artifact_path: artifact_path.map(|p| p.to_string_lossy().to_string()),
-        verdict: "pass".to_string(),
+        execution_id,
+        reviewed_execution_id: receipt.reviewed_execution_id,
+        route: if last_attempt.session_id.is_some() {
+            last_attempt.worker_category.clone()
+        } else {
+            format!("{}:command_fallback", last_attempt.worker_category)
+        },
+        model: reviewer_model,
+        artifact_path: Some(receipt_path.to_string_lossy().to_string()),
+        verdict,
+        findings: dimension_receipt.findings,
     })
+}
+
+fn reviewer_model_from_attempt(
+    attempt: &TaskAttempt,
+    artifact_path: &std::path::Path,
+) -> Option<String> {
+    attempt.worker_model.clone().or_else(|| {
+        let selection_path = artifact_path.parent()?.join("model-selection.json");
+        let selection: serde_json::Value =
+            serde_json::from_str(&std_fs::read_to_string(selection_path).ok()?).ok()?;
+        selection
+            .get("applied_model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+fn load_review_receipt(path: &std::path::Path) -> Option<(PathBuf, ReviewReceiptPayload)> {
+    let artifact = std_fs::read_to_string(path).ok()?;
+    if let Some(receipt) = parse_review_receipt(&artifact) {
+        return Some((path.to_path_buf(), receipt));
+    }
+    let worker_result: WorkerResult = serde_json::from_str(&artifact).ok()?;
+    let receipt_path = worker_result
+        .last_message_path
+        .or(worker_result.stdout_path)?;
+    let receipt = parse_review_receipt(&std_fs::read_to_string(&receipt_path).ok()?)?;
+    Some((receipt_path, receipt))
+}
+
+fn parse_review_receipt(output: &str) -> Option<ReviewReceiptPayload> {
+    let trimmed = output.trim();
+    let json = if let Some(rest) = trimmed.strip_prefix("```json") {
+        rest.strip_suffix("```").unwrap_or(rest).trim()
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest.strip_suffix("```").unwrap_or(rest).trim()
+    } else {
+        trimmed
+    };
+    serde_json::from_str(json).ok()
+}
+
+fn reviewer_evidence_passed(receipt: Option<&ReviewerEvidence>) -> bool {
+    receipt.is_some_and(|receipt| receipt.verdict == "pass")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2602,26 +4022,6 @@ impl<'a> GoalDecisionPolicy<'a> {
                 };
             }
 
-            if let Some(reason) = self.review_gate.failed_reason() {
-                if self.iteration < self.budget.max_iterations {
-                    return GoalEvaluation {
-                        status: GoalStatus::Running,
-                        should_continue: true,
-                        summary: format!(
-                            "Review gate failed after iteration {}; repair is required: {reason}.",
-                            self.iteration
-                        ),
-                        route_hint_override: Some("review".to_string()),
-                    };
-                }
-                return GoalEvaluation {
-                    status: GoalStatus::Limited,
-                    should_continue: false,
-                    summary: format!("Review gate failed at the iteration limit: {reason}."),
-                    route_hint_override: None,
-                };
-            }
-
             // Ownership gate: all code-modifying work must be delegated to a worker.
             // Gear itself must not directly write, edit, or create implementation files.
             if let Some(ownership_reason) = self.ownership_gate_reason() {
@@ -2680,6 +4080,26 @@ impl<'a> GoalDecisionPolicy<'a> {
                     summary: format!(
                         "Synthetic evidence gate blocked at the iteration limit: {synthetic_reason}"
                     ),
+                    route_hint_override: None,
+                };
+            }
+
+            if let Some(reason) = self.review_gate.failed_reason() {
+                if self.iteration < self.budget.max_iterations {
+                    return GoalEvaluation {
+                        status: GoalStatus::Running,
+                        should_continue: true,
+                        summary: format!(
+                            "Review gate failed after iteration {}; repair is required: {reason}.",
+                            self.iteration
+                        ),
+                        route_hint_override: Some("review".to_string()),
+                    };
+                }
+                return GoalEvaluation {
+                    status: GoalStatus::Limited,
+                    should_continue: false,
+                    summary: format!("Review gate failed at the iteration limit: {reason}."),
                     route_hint_override: None,
                 };
             }
@@ -3047,7 +4467,8 @@ fn worker_artifact_truncation_signals(worker_result: &WorkerResult) -> Vec<Strin
         }
     }
 
-    if let Some(partial_output_path) = worker_artifact_path(worker_result, "partial-output.md")
+    if worker_result.status != WorkerStatus::Succeeded
+        && let Some(partial_output_path) = worker_artifact_path(worker_result, "partial-output.md")
         && let Some(partial_output) = read_optional_context_text_if_exists(&partial_output_path)
         && !partial_output.trim().is_empty()
     {
@@ -3153,8 +4574,7 @@ where
         .collect()
 }
 
-
-
+#[cfg(test)]
 fn evaluate_goal_with_source(
     verification_passed: bool,
     worker_status: &WorkerStatus,
@@ -3176,12 +4596,60 @@ fn evaluate_goal_with_source(
     lineage: Option<&WorkLineage>,
     task_attempts: &[TaskAttempt],
 ) -> GoalEvaluation {
-    let review_gate = ReviewGate::from_inputs(
+    evaluate_goal_with_review_target(
+        verification_passed,
+        worker_status,
+        worker_category,
+        require_worker,
+        worker_failure_kind,
+        worker_retry_reason,
+        scope_check,
+        coordinator_review,
+        provider_unknown_streak,
+        repeated_failure_streak,
+        iteration,
+        budget,
+        budget_snapshot,
+        no_progress_signals,
+        nearest_fallback_available,
+        trigger_source,
+        ownership,
+        lineage,
+        None,
+        task_attempts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_goal_with_review_target(
+    verification_passed: bool,
+    worker_status: &WorkerStatus,
+    worker_category: WorkerCategory,
+    require_worker: bool,
+    worker_failure_kind: Option<&TaskFailureKind>,
+    worker_retry_reason: Option<&str>,
+    scope_check: &crate::tools::ScopeCheck,
+    coordinator_review: Option<&CoordinatorReview>,
+    provider_unknown_streak: usize,
+    repeated_failure_streak: usize,
+    iteration: usize,
+    budget: &BudgetController,
+    budget_snapshot: &BudgetSnapshot,
+    no_progress_signals: &[String],
+    nearest_fallback_available: bool,
+    trigger_source: Option<RouteChangeType>,
+    ownership: Option<&crate::state::ExecutionOwnership>,
+    lineage: Option<&WorkLineage>,
+    expected_reviewed_execution_id: Option<&str>,
+    task_attempts: &[TaskAttempt],
+) -> GoalEvaluation {
+    let review_gate = ReviewGate::from_inputs_for_execution(
         verification_passed,
         worker_status,
         scope_check,
         coordinator_review,
         &budget_snapshot.context_risk_signals,
+        expected_reviewed_execution_id,
         task_attempts,
     );
     GoalDecisionPolicy {
@@ -3274,6 +4742,39 @@ fn repair_request(
     )
 }
 
+fn review_worker_request(base_request: &str, reviewed_execution_id: &str) -> String {
+    let required_receipt = json!({
+        "schema_version": 1,
+        "reviewed_execution_id": reviewed_execution_id,
+        "dimensions": [
+            {
+                "dimension": "goal_verification",
+                "verdict": "pass|fail",
+                "findings": ["replace with concrete evidence"]
+            },
+            {
+                "dimension": "code_quality",
+                "verdict": "pass|fail",
+                "findings": ["replace with concrete evidence"]
+            },
+            {
+                "dimension": "security",
+                "verdict": "pass|fail",
+                "findings": ["replace with concrete evidence"]
+            },
+            {
+                "dimension": "qa_execution",
+                "verdict": "pass|fail",
+                "findings": ["replace with concrete evidence"]
+            }
+        ]
+    });
+    format!(
+        "{base_request}\n\nThis is a read-only final-review phase. Return exactly one JSON object, without Markdown fences or prose. Bind it to reviewed_execution_id `{reviewed_execution_id}`. Include all four dimensions, use only `pass` or `fail`, replace every placeholder with concrete findings, and fail any dimension whose evidence is incomplete. Required shape:\n{}",
+        required_receipt
+    )
+}
+
 fn goal_review_artifact(
     iteration: usize,
     max_iterations: usize,
@@ -3293,6 +4794,8 @@ fn goal_review_artifact(
     scope_check: &crate::tools::ScopeCheck,
     verification_results: &[ShellCommandResult],
     coordinator_review: Option<&CoordinatorReview>,
+    expected_reviewed_execution_id: Option<&str>,
+    task_attempts: &[TaskAttempt],
 ) -> String {
     let verification_summary = if verification_results.is_empty() {
         "No verification command ran.".to_string()
@@ -3317,23 +4820,41 @@ fn goal_review_artifact(
         })
         .unwrap_or_else(|| "No provider-backed coordinator review ran.".to_string());
     let worker_transcript_summary = worker_transcript_summary(worker_result);
-    let review_gate = ReviewGate::from_inputs(
+    let review_gate = ReviewGate::from_inputs_for_execution(
         verification_results.iter().all(|result| result.success),
         &worker_result.status,
         scope_check,
         coordinator_review,
         no_progress_signals,
-        &[],
+        expected_reviewed_execution_id,
+        task_attempts,
     );
     let review_gate_dimensions = review_gate
         .results
         .iter()
         .map(|result| {
+            let reviewer_receipt = result
+                .reviewer_evidence
+                .as_ref()
+                .map(|evidence| {
+                    format!(
+                        "; reviewer_execution=`{}`; reviewed_execution=`{}`; route=`{}`; model=`{}`; artifact=`{}`; verdict=`{}`; findings={}",
+                        evidence.execution_id,
+                        evidence.reviewed_execution_id,
+                        evidence.route,
+                        evidence.model.as_deref().unwrap_or("unrecorded"),
+                        evidence.artifact_path.as_deref().unwrap_or("unrecorded"),
+                        evidence.verdict,
+                        evidence.findings.join(" | ")
+                    )
+                })
+                .unwrap_or_else(|| "; reviewer_receipt=`missing`".to_string());
             format!(
-                "- {}: `{}` — {}",
+                "- {}: `{}` — {}{}",
                 result.dimension.label(),
                 if result.passed { "pass" } else { "fail" },
-                result.evidence
+                result.evidence,
+                reviewer_receipt
             )
         })
         .collect::<Vec<_>>()
@@ -3617,11 +5138,18 @@ fn _keep_diff_snapshot_for_docs(_: &DiffSnapshot) {}
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use anyhow::Result;
 
     use super::*;
+    use crate::plan_review::{
+        PlanCriticCheck, PlanCriticCheckVerdict, PlanCriticDimension, PlanCriticFinding,
+        PlanCriticFindingSeverity,
+    };
     use crate::test_support::test_support as ts;
     use crate::tools::ScopeCheck;
     use crate::workers::{WorkerKind, WorkerStatus};
@@ -3634,26 +5162,580 @@ mod tests {
         }
     }
 
-    fn mock_task_attempt() -> TaskAttempt {
-        TaskAttempt {
+    fn planning_goal(draft: &PlanGraphDraft) -> Result<Goal> {
+        Ok(Goal {
+            id: "goal_plan_review".to_string(),
+            title: "Review a plan".to_string(),
+            status: GoalStatus::Planning,
+            workspace: "/tmp".to_string(),
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            request: draft.objective.clone(),
+            product_type: "test".to_string(),
+            language_profile: "rust".to_string(),
+            success_criteria: vec!["approved plan".to_string()],
+            budget: Budget::default(),
+            current_task_id: None,
+            coordinator_model: Some(CoordinatorModel {
+                provider_id: "test-provider".to_string(),
+                model_id: "test-model".to_string(),
+                name: "Test Model".to_string(),
+            }),
+            coordinator_brief: Some(serde_json::to_string(draft)?),
+            summary: String::new(),
+        })
+    }
+
+    fn phase_identity(label: &str) -> PhaseExecutionIdentity {
+        PhaseExecutionIdentity {
+            execution_id: format!("{label}_execution"),
+            phase_session_id: format!("{label}_session"),
+            backend: PhaseExecutionBackend::LanguageModelRequest,
+            agent_id: Some("zed".to_string()),
+            provider_id: Some("test-provider".to_string()),
+            model_id: Some("test-model".to_string()),
+            actual_session_id: None,
+        }
+    }
+
+    fn plan_critic_checks(failed: Option<PlanCriticDimension>) -> Vec<PlanCriticCheck> {
+        [
+            PlanCriticDimension::References,
+            PlanCriticDimension::Executability,
+            PlanCriticDimension::Contradictions,
+            PlanCriticDimension::Scope,
+            PlanCriticDimension::Tdd,
+            PlanCriticDimension::Qa,
+            PlanCriticDimension::Acceptance,
+        ]
+        .into_iter()
+        .map(|dimension| PlanCriticCheck {
+            dimension,
+            verdict: if failed == Some(dimension) {
+                PlanCriticCheckVerdict::Fail
+            } else {
+                PlanCriticCheckVerdict::Pass
+            },
+            summary: format!("{dimension:?} checked"),
+            evidence_refs: vec![format!("plan:{dimension:?}")],
+        })
+        .collect()
+    }
+
+    fn plan_critic_submission(
+        input: &PlanCriticInput,
+        execution_suffix: usize,
+        decision: PlanCriticDecision,
+    ) -> Result<PlanCriticSubmission> {
+        let failed =
+            (decision != PlanCriticDecision::Approve).then_some(PlanCriticDimension::Acceptance);
+        let verdict = PlanCriticVerdict {
+            schema_version: crate::plan_review::PLAN_REVIEW_SCHEMA_VERSION,
+            reviewed_goal_id: input.plan.goal_id.clone(),
+            reviewed_plan_id: input.plan.plan_id.clone(),
+            reviewed_plan_revision: input.plan.revision,
+            reviewed_plan_hash: input.plan.plan_hash.clone(),
+            reviewed_planner_execution_id: input.planner_receipt.identity.execution_id.clone(),
+            decision,
+            checks: plan_critic_checks(failed),
+            findings: failed
+                .map(|dimension| {
+                    vec![PlanCriticFinding {
+                        dimension,
+                        severity: PlanCriticFindingSeverity::Blocking,
+                        code: "acceptance_not_decidable".to_string(),
+                        task_id: input
+                            .plan
+                            .draft
+                            .tasks
+                            .first()
+                            .map(|task| task.task_id.clone()),
+                        path: None,
+                        message: "Acceptance must be made more specific.".to_string(),
+                        required_change: Some("Add a concrete acceptance observation.".to_string()),
+                    }]
+                })
+                .unwrap_or_default(),
+            revision_instructions: (decision == PlanCriticDecision::Revise)
+                .then(|| "Make acceptance concrete and resubmit the full draft.".to_string()),
+            needs_user_reason: (decision == PlanCriticDecision::Reject)
+                .then(|| "The user must choose an acceptance target.".to_string()),
+            summary: format!("critic decision: {decision:?}"),
+        };
+        let raw_output = serde_json::to_string(&verdict)?;
+        Ok(PlanCriticSubmission {
+            reviewer: phase_identity(&format!("critic_{execution_suffix}")),
+            verdict,
+            raw_output,
+            artifact_path: None,
+        })
+    }
+
+    fn phase_runtime_for_test(critic_hook: Option<PlanCriticHook>) -> PhaseRuntime {
+        let current_model = ModelSelectorId {
+            agent_id: "zed".to_string(),
+            provider_id: "test-provider".to_string(),
+            model_id: "test-model".to_string(),
+        };
+        PhaseRuntime {
+            routes: PhaseRouteTable::legacy_defaults(),
+            inventory: LiveModelInventory {
+                models: vec![current_model.clone()],
+            },
+            current_model: Some(current_model),
+            planner: Some(phase_identity("planner")),
+            plan_critic_hook: critic_hook,
+            plan_revision_hook: None,
+            require_plan_approval: true,
+            max_plan_revisions: 2,
+            broker: None,
+        }
+    }
+
+    fn mock_task_attempt() -> Result<(tempfile::TempDir, TaskAttempt)> {
+        let temp_dir = tempfile::tempdir()?;
+        let receipt_path = temp_dir.path().join("review-receipt.json");
+        let dimensions = [
+            ReviewDimension::GoalVerification,
+            ReviewDimension::CodeQuality,
+            ReviewDimension::Security,
+            ReviewDimension::QaExecution,
+        ]
+        .into_iter()
+        .map(|dimension| ReviewReceiptDimension {
+            dimension,
+            verdict: "pass".to_string(),
+            findings: vec![format!("{} evidence inspected", dimension.label())],
+        })
+        .collect();
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&ReviewReceiptPayload {
+                schema_version: 1,
+                reviewed_execution_id: "executor-task".to_string(),
+                dimensions,
+            })?,
+        )?;
+        let attempt = TaskAttempt {
             attempt: 1,
             worker_kind: "test-worker".to_string(),
             worker_command: None,
             worker_model: None,
-            worker_category: "test".to_string(),
+            worker_category: "review".to_string(),
             route_hint: None,
             route_reason: "test".to_string(),
             status: crate::task_manager::TaskAttemptStatus::Completed,
             started_at: "2024-01-01T00:00:00Z".to_string(),
             finished_at: Some("2024-01-01T00:01:00Z".to_string()),
             session_id: Some("test-reviewer-session".to_string()),
-            result_path: None,
+            result_path: Some(receipt_path),
             outcome_path: None,
             summary: "Mock task attempt".to_string(),
             failure_kind: None,
             retry_reason: None,
             error: None,
-        }
+        };
+        Ok((temp_dir, attempt))
+    }
+
+    #[test]
+    fn plan_rejects_before_any_worker_dispatch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement a reviewed change",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        let rejected_plan = build_plan_graph(&goal, &scope, &["echo verify".to_string()])?;
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Reject));
+        let phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("reject verdict must stop before worker dispatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("plan rejected before worker dispatch")
+        );
+        assert_eq!(goal.status, GoalStatus::NeedsUser);
+        let mut approval = store
+            .read_plan_approval_state(&goal.id)?
+            .context("approval state missing")?;
+        assert_eq!(approval.status, PlanApprovalStatus::Rejected);
+        approval.status = PlanApprovalStatus::Approved;
+        approval.updated_at = timestamp();
+        store.write_plan_approval_state(&approval)?;
+        let error = store
+            .write_plan_graph(&rejected_plan)
+            .expect_err("a rejected critic receipt must not publish a canonical plan");
+        assert!(format!("{error:#}").contains("requires an approving PlanCritic receipt"));
+        assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        assert_eq!(fs::read_dir(store.plans_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_approval_is_hash_bound_before_dispatch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement an approved change",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+        let plan = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )?;
+
+        let approval = store
+            .read_plan_approval_state(&goal.id)?
+            .context("approval state missing")?;
+        assert_eq!(approval.status, PlanApprovalStatus::Approved);
+        assert_eq!(approval.plan_hash, plan.plan_hash);
+        assert_eq!(approval.plan_id, plan.plan_id);
+        assert!(approval.critic_receipt_hash.is_some());
+        store.write_plan_graph(&plan)?;
+        assert_eq!(store.read_plan_graph(&goal.id)?, Some(plan));
+        fs::write(
+            store
+                .plan_review_dir(&goal.id)
+                .join("revision-001-critic-output.txt"),
+            "tampered critic output",
+        )?;
+        assert!(store.read_plan_graph(&goal.id).is_err());
+        assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_revision_requires_a_fresh_critic_receipt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement a revised change",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        let critic_calls = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook = {
+            let critic_calls = critic_calls.clone();
+            Arc::new(move |input| {
+                let call = critic_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                plan_critic_submission(
+                    &input,
+                    call,
+                    if call == 1 {
+                        PlanCriticDecision::Revise
+                    } else {
+                        PlanCriticDecision::Approve
+                    },
+                )
+            })
+        };
+        let revision_hook: PlanRevisionHook = Arc::new(|input| {
+            let mut draft = input.plan.draft;
+            draft
+                .final_acceptance
+                .push("The revised acceptance observation is recorded.".to_string());
+            let raw_output = serde_json::to_string(&draft)?;
+            Ok(PlanRevisionSubmission {
+                draft,
+                planner: phase_identity("planner_revision"),
+                raw_output,
+                artifact_path: None,
+            })
+        });
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.plan_revision_hook = Some(revision_hook);
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+
+        let plan = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )?;
+
+        assert_eq!(plan.revision, 2);
+        assert_eq!(critic_calls.load(Ordering::SeqCst), 2);
+        let approval = store
+            .read_plan_approval_state(&goal.id)?
+            .context("approval state missing")?;
+        assert_eq!(approval.status, PlanApprovalStatus::Approved);
+        assert_eq!(approval.plan_hash, plan.plan_hash);
+        assert_eq!(approval.revisions_used, 1);
+        store.write_plan_graph(&plan)?;
+        let critic_receipts = fs::read_dir(store.plan_review_dir(&goal.id))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("critic-receipt.json")
+            })
+            .count();
+        assert_eq!(critic_receipts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_revision_rejects_a_non_adjacent_critic_identity_replay() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement two reviewed revisions",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        let critic_calls = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook = {
+            let critic_calls = critic_calls.clone();
+            Arc::new(move |input| {
+                let call = critic_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                plan_critic_submission(
+                    &input,
+                    if call == 3 { 1 } else { call },
+                    if call < 3 {
+                        PlanCriticDecision::Revise
+                    } else {
+                        PlanCriticDecision::Approve
+                    },
+                )
+            })
+        };
+        let revision_hook: PlanRevisionHook = {
+            let revision_calls = Arc::new(AtomicUsize::new(0));
+            Arc::new(move |input| {
+                let call = revision_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut draft = input.plan.draft;
+                draft
+                    .final_acceptance
+                    .push(format!("Revision {call} acceptance evidence is recorded."));
+                let raw_output = serde_json::to_string(&draft)?;
+                Ok(PlanRevisionSubmission {
+                    draft,
+                    planner: phase_identity(&format!("planner_revision_{call}")),
+                    raw_output,
+                    artifact_path: None,
+                })
+            })
+        };
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.plan_revision_hook = Some(revision_hook);
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("a later revision must not reuse an earlier critic identity");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fresh PlanCritic execution identity")
+        );
+        assert_eq!(critic_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_revision_rejects_a_non_adjacent_planner_identity_replay() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement two planner revisions",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        let critic_calls = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook = {
+            let critic_calls = critic_calls.clone();
+            Arc::new(move |input| {
+                let call = critic_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                plan_critic_submission(&input, call, PlanCriticDecision::Revise)
+            })
+        };
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        let initial_planner = phase_runtime
+            .planner
+            .clone()
+            .context("test phase runtime is missing its planner identity")?;
+        let revision_hook: PlanRevisionHook = {
+            let revision_calls = Arc::new(AtomicUsize::new(0));
+            Arc::new(move |input| {
+                let call = revision_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut draft = input.plan.draft;
+                draft
+                    .final_acceptance
+                    .push(format!("Planner revision {call} evidence is recorded."));
+                let raw_output = serde_json::to_string(&draft)?;
+                Ok(PlanRevisionSubmission {
+                    draft,
+                    planner: if call == 2 {
+                        initial_planner.clone()
+                    } else {
+                        phase_identity("planner_revision_1")
+                    },
+                    raw_output,
+                    artifact_path: None,
+                })
+            })
+        };
+        phase_runtime.plan_revision_hook = Some(revision_hook);
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("a later revision must not reuse an earlier planner identity");
+
+        assert!(
+            error
+                .to_string()
+                .contains("globally fresh execution identity")
+        );
+        assert_eq!(critic_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_revision_rejects_an_unchanged_plan() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement a revised change",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Revise));
+        let revision_hook: PlanRevisionHook = Arc::new(|input| {
+            let draft = input.plan.draft;
+            let raw_output = serde_json::to_string(&draft)?;
+            Ok(PlanRevisionSubmission {
+                draft,
+                planner: phase_identity("planner_revision"),
+                raw_output,
+                artifact_path: None,
+            })
+        });
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.plan_revision_hook = Some(revision_hook);
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("a revision must not replay the same plan content");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must change the sealed PlanGraph content hash")
+        );
+        assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_plan_critic_hook_fails_closed() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft("Implement change", &scope, &[]);
+        let mut goal = planning_goal(&draft)?;
+        let phase_runtime = phase_runtime_for_test(None);
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &[],
+            temp_dir.path(),
+            &store,
+            "session-plan-review",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("missing critic hook must fail closed");
+        assert!(error.to_string().contains("no PlanCritic hook"));
+        assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        Ok(())
     }
 
     #[test]
@@ -3673,6 +5755,15 @@ mod tests {
                     .push(event.message.clone());
             }) as EventSink
         };
+        let planner_draft = deterministic_fallback_draft(
+            "Build a tiny task tracker",
+            &Scope::new(
+                vec!["src".to_string(), "README.md".to_string()],
+                vec![".git".to_string()],
+                10,
+            ),
+            &["echo verify-ok".to_string()],
+        );
 
         let outcome = Orchestrator::run(RunOptions {
             request: "Build a tiny task tracker".to_string(),
@@ -3680,7 +5771,10 @@ mod tests {
             verification_commands: vec!["echo verify-ok".to_string()],
             worker: WorkerConfig {
                 worker_kind: WorkerKind::Opencode,
-                worker_command: None,
+                worker_command: Some(
+                    "sh -c 'cat <<\"EOF\" > \"$GEARBOX_WORKER_LAST_MESSAGE\"\n{\"schema_version\":1,\"reviewed_execution_id\":\"task_003\",\"dimensions\":[{\"dimension\":\"goal_verification\",\"verdict\":\"pass\",\"findings\":[\"requested behavior and verification evidence inspected\"]},{\"dimension\":\"code_quality\",\"verdict\":\"pass\",\"findings\":[\"implementation scope and worker artifacts inspected\"]},{\"dimension\":\"security\",\"verdict\":\"pass\",\"findings\":[\"forbidden path report is clean\"]},{\"dimension\":\"qa_execution\",\"verdict\":\"pass\",\"findings\":[\"verification command passed\"]}]}\nEOF'"
+                        .to_string(),
+                ),
                 worker_model: None,
                 worker_routes: Vec::new(),
                 unavailable_worker_models: Vec::new(),
@@ -3688,8 +5782,8 @@ mod tests {
                 max_parallel_workers: 1,
                 max_parallel_per_key: 1,
                 stale_task_timeout_secs: 30,
-                skip_worker: true,
-                require_worker: false,
+                skip_worker: false,
+                require_worker: true,
                 default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: vec!["src".to_string(), "README.md".to_string()],
@@ -3707,7 +5801,7 @@ mod tests {
                 model_id: "gpt-4.1".to_string(),
                 name: "GPT-4.1".to_string(),
             }),
-            coordinator_brief: Some("Prefer a compact local implementation.".to_string()),
+            coordinator_brief: Some(serde_json::to_string(&planner_draft)?),
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
@@ -3715,7 +5809,12 @@ mod tests {
             continuation: true,
         })?;
 
-        assert_eq!(outcome.status, GoalStatus::Complete);
+        assert_eq!(
+            outcome.status,
+            GoalStatus::Complete,
+            "{}",
+            fs::read_to_string(&outcome.final_report_path)?
+        );
         let continuation_state = StateStore::new(temp_dir.path())
             .read_continuation_state_for_session("acp-session-1")?
             .context("continuation state should use the caller session id")?;
@@ -3733,7 +5832,7 @@ mod tests {
                 .join(format!("{}.json", outcome.goal_id)),
         )?;
         assert!(goal.contains("\"provider_id\": \"openai\""));
-        assert!(goal.contains("Prefer a compact local implementation."));
+        assert!(goal.contains("Build a tiny task tracker"));
         let packet = fs::read_to_string(
             temp_dir
                 .path()
@@ -3743,10 +5842,11 @@ mod tests {
                 .join("packet.json"),
         )?;
         assert!(packet.contains("\"model_id\": \"gpt-4.1\""));
-        assert!(packet.contains("Prefer a compact local implementation."));
+        assert!(packet.contains("\"plan_task\""));
+        assert!(packet.contains("\"completion_predicates\""));
         let final_report = fs::read_to_string(&outcome.final_report_path)?;
         assert!(final_report.contains("GPT-4.1 (openai/gpt-4.1)"));
-        assert!(final_report.contains("Prefer a compact local implementation."));
+        assert!(final_report.contains("Structured PlanGraph draft"));
         assert!(final_report.contains("## Evidence Chain"));
         assert!(final_report.contains("worker_outcome"));
         assert!(final_report.contains("verification.md"));
@@ -3754,20 +5854,135 @@ mod tests {
         assert!(final_report.contains("plan.md"));
         let verification = fs::read_to_string(outcome.artifacts_root.join("verification.md"))?;
         assert!(verification.contains("verify-ok"));
+        let store = StateStore::new(temp_dir.path());
+        let mut persisted_route_receipt = None;
+        for entry in fs::read_dir(store.phase_routes_dir(&outcome.goal_id))? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if !file_name.ends_with("-receipt.json") {
+                continue;
+            }
+            let receipt: crate::phase_routing::PhaseRouteReceipt =
+                serde_json::from_str(&fs::read_to_string(entry.path())?)?;
+            if receipt.task_record_path.is_some() {
+                persisted_route_receipt = Some((entry.path(), file_name, receipt));
+                break;
+            }
+        }
+        let (receipt_path, receipt_file_name, route_receipt) = persisted_route_receipt
+            .context("worker phase route receipt should have task-record evidence")?;
+        let ordinal = receipt_file_name
+            .split('-')
+            .next()
+            .context("phase route receipt name is missing an ordinal")?
+            .parse::<usize>()?;
+        assert_eq!(
+            store.read_phase_route_receipt(
+                &outcome.goal_id,
+                ordinal,
+                &route_receipt.decision.phase,
+            )?,
+            Some(route_receipt.clone())
+        );
+        let original_route_receipt = fs::read(&receipt_path)?;
+        let mut hash_tampered_receipt = route_receipt.clone();
+        hash_tampered_receipt.plan_hash = Some("f".repeat(64));
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&hash_tampered_receipt)?,
+        )?;
+        let error = store
+            .read_phase_route_receipt(&outcome.goal_id, ordinal, &route_receipt.decision.phase)
+            .expect_err("hash-only route receipt tampering must be rejected");
+        assert!(format!("{error:#}").contains("integrity hash mismatch"));
+        fs::write(&receipt_path, original_route_receipt)?;
+
+        let replay_ordinal = ordinal + 1_000;
+        let replay_path = store.phase_routes_dir(&outcome.goal_id).join(format!(
+            "{replay_ordinal:03}-{:?}-receipt.json",
+            route_receipt.decision.phase
+        ));
+        fs::copy(&receipt_path, replay_path)?;
+        let error = store
+            .read_phase_route_receipt(
+                &outcome.goal_id,
+                replay_ordinal,
+                &route_receipt.decision.phase,
+            )
+            .expect_err("an old route receipt must not replay under a new ordinal");
+        assert!(error.to_string().contains("path identity"));
+
+        let task_record_path = std::path::PathBuf::from(
+            route_receipt
+                .task_record_path
+                .as_deref()
+                .context("worker phase route receipt is missing its evidence path")?,
+        );
+        let original_task_record = fs::read(&task_record_path)?;
+        let mut escaped_receipt = route_receipt.clone();
+        escaped_receipt.task_record_path = Some(
+            task_record_path
+                .parent()
+                .context("task-record evidence is missing its parent")?
+                .join("..")
+                .join("worker-evidence")
+                .join(
+                    task_record_path
+                        .file_name()
+                        .context("task-record evidence is missing its file name")?,
+                )
+                .to_string_lossy()
+                .to_string(),
+        );
+        escaped_receipt.receipt_hash.clear();
+        let escaped_receipt = escaped_receipt.seal()?;
+        let error = store
+            .validate_phase_route_receipt_evidence(&escaped_receipt)
+            .expect_err("lexically escaped task-record evidence must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its task identity")
+        );
+
+        fs::write(&task_record_path, "{}")?;
+        let error = store
+            .read_phase_route_receipt(&outcome.goal_id, ordinal, &route_receipt.decision.phase)
+            .expect_err("tampered task-record evidence must invalidate the route receipt");
+        assert!(error.to_string().contains("evidence hash mismatch"));
+        fs::write(&task_record_path, &original_task_record)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside_task_record = temp_dir.path().join("outside-task-record.json");
+            fs::write(&outside_task_record, &original_task_record)?;
+            fs::remove_file(&task_record_path)?;
+            symlink(&outside_task_record, &task_record_path)?;
+            let error = store
+                .read_phase_route_receipt(&outcome.goal_id, ordinal, &route_receipt.decision.phase)
+                .expect_err("symlinked task-record evidence must stay inside its goal route");
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside its goal route directory")
+            );
+        }
         let events = events.lock().expect("events mutex poisoned");
         assert!(events.iter().any(|event| event == "Spec artifact created"));
         assert!(events.iter().any(|event| event == "Verification passed"));
         assert!(
             events
                 .iter()
-                .any(|event| event.contains("Goal completed after 1 Gear iteration(s)"))
+                .any(|event| event.contains("Goal completed after 2 Gear iteration(s)"))
         );
         Ok(())
     }
 
     #[test]
-    fn evaluation_mentions_non_required_worker_failure_when_verification_passes() {
+    fn evaluation_mentions_non_required_worker_failure_when_verification_passes() -> Result<()> {
         let scope_check = crate::tools::ScopeCheck::default();
+        let (_receipt_dir, review_attempt) = mock_task_attempt()?;
         let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Failed,
@@ -3794,13 +6009,14 @@ mod tests {
                 decided_at: crate::state::timestamp(),
             }),
             None,
-            &[mock_task_attempt()],
+            &[review_attempt],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Complete);
         assert!(!evaluation.should_continue);
         assert!(evaluation.summary.contains("verification passed"));
         assert!(evaluation.summary.contains("worker status was failed"));
+        Ok(())
     }
 
     #[test]
@@ -3834,7 +6050,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3872,7 +6088,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3912,7 +6128,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3951,7 +6167,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3991,7 +6207,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4034,7 +6250,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4065,7 +6281,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4095,7 +6311,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4134,7 +6350,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4164,7 +6380,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4194,7 +6410,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4313,17 +6529,98 @@ mod tests {
     }
 
     #[test]
-    fn test_review_dimensions_have_unique_execution_ids() -> Result<()> {
+    fn review_dimensions_share_one_real_reviewer_receipt() -> Result<()> {
         let scope_check = crate::tools::ScopeCheck::default();
-        let gate =
-            ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope_check, None, &[], &[]);
-        // Validate — should pass with synthetic IDs
+        let (_receipt_dir, review_attempt) = mock_task_attempt()?;
+        let gate = ReviewGate::from_inputs(
+            true,
+            &WorkerStatus::Succeeded,
+            &scope_check,
+            None,
+            &[],
+            &[review_attempt],
+        );
         assert!(gate.validate_independent_reviewers().is_ok());
+        let execution_ids = gate
+            .results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .reviewer_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.execution_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(execution_ids, vec!["test-reviewer-session"; 4]);
         Ok(())
     }
 
     #[test]
-    fn test_review_dimensions_reject_duplicate_execution_ids() {
+    fn review_receipt_must_bind_to_the_expected_executor() -> Result<()> {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let (_receipt_dir, review_attempt) = mock_task_attempt()?;
+        let gate = ReviewGate::from_inputs_for_execution(
+            true,
+            &WorkerStatus::Succeeded,
+            &scope_check,
+            None,
+            &[],
+            Some("different-executor-task"),
+            &[review_attempt],
+        );
+
+        assert!(
+            gate.results
+                .iter()
+                .all(|result| result.reviewer_evidence.is_none())
+        );
+        assert!(gate.failed_reason().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_review_detects_workspace_mutation() {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: " M src/lib.rs".to_string(),
+            changed_files: vec!["src/lib.rs".to_string()],
+            diff_hash: Some("before".to_string()),
+        };
+        let after = DiffSnapshot {
+            diff_hash: Some("after".to_string()),
+            ..before.clone()
+        };
+
+        assert!(review_changed_workspace(Some("review"), &before, &after));
+        assert!(!review_changed_workspace(Some("deep"), &before, &after));
+        assert!(!review_changed_workspace(Some("review"), &before, &before));
+    }
+
+    #[test]
+    fn reviewer_cannot_approve_its_own_execution() -> Result<()> {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let (_receipt_dir, mut review_attempt) = mock_task_attempt()?;
+        review_attempt.session_id = Some("executor-task".to_string());
+        let gate = ReviewGate::from_inputs_for_execution(
+            true,
+            &WorkerStatus::Succeeded,
+            &scope_check,
+            None,
+            &[],
+            Some("executor-task"),
+            &[review_attempt],
+        );
+
+        assert!(
+            gate.results
+                .iter()
+                .all(|result| result.reviewer_evidence.is_none())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reviewer_execution_id_rejects_conflicting_receipts() {
         let gate = ReviewGate {
             require_all_pass: true,
             results: vec![
@@ -4333,9 +6630,12 @@ mod tests {
                     evidence: "test".to_string(),
                     reviewer_evidence: Some(ReviewerEvidence {
                         execution_id: "same-id".to_string(),
+                        reviewed_execution_id: "executor-id".to_string(),
                         route: "coordinator".to_string(),
-                        artifact_path: None,
+                        model: Some("provider/reviewer".to_string()),
+                        artifact_path: Some("review.md".to_string()),
                         verdict: "pass".to_string(),
+                        findings: vec!["reviewed goal evidence".to_string()],
                     }),
                 },
                 ReviewDimensionResult {
@@ -4343,18 +6643,43 @@ mod tests {
                     passed: true,
                     evidence: "test".to_string(),
                     reviewer_evidence: Some(ReviewerEvidence {
-                        execution_id: "same-id".to_string(), // DUPLICATE
+                        execution_id: "same-id".to_string(),
+                        reviewed_execution_id: "executor-id".to_string(),
                         route: "scope-check".to_string(),
-                        artifact_path: None,
+                        model: Some("provider/reviewer".to_string()),
+                        artifact_path: Some("review.md".to_string()),
                         verdict: "pass".to_string(),
+                        findings: vec!["reviewed quality evidence".to_string()],
                     }),
                 },
             ],
         };
         assert!(
             gate.validate_independent_reviewers().is_err(),
-            "duplicate execution_id should cause hard fail"
+            "one execution id cannot identify conflicting reviewer receipts"
         );
+    }
+
+    #[test]
+    fn ordinary_executor_attempt_is_not_reviewer_evidence() -> Result<()> {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let (_receipt_dir, mut attempt) = mock_task_attempt()?;
+        attempt.worker_category = "quick".to_string();
+        let gate = ReviewGate::from_inputs(
+            true,
+            &WorkerStatus::Succeeded,
+            &scope_check,
+            None,
+            &[],
+            &[attempt],
+        );
+        assert!(
+            gate.results
+                .iter()
+                .all(|result| result.reviewer_evidence.is_none())
+        );
+        assert!(gate.synthetic_evidence_only_reason().is_some());
+        Ok(())
     }
 
     #[test]
@@ -4545,7 +6870,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
         assert!(first_evaluation.should_continue);
 
@@ -4572,7 +6897,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
         assert_eq!(second_evaluation.status, GoalStatus::Limited);
         assert!(!second_evaluation.should_continue);
@@ -4790,6 +7115,8 @@ mod tests {
             &scope_check,
             &[],
             None,
+            None,
+            &[],
         );
         assert!(
             artifact.contains(&summary),
@@ -4826,7 +7153,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4865,7 +7192,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4895,7 +7222,7 @@ mod tests {
             "partial output was recorded",
         )?;
         let worker_result = WorkerResult {
-            status: WorkerStatus::Succeeded,
+            status: WorkerStatus::Failed,
             command: None,
             exit_code: None,
             summary: "worker finished".to_string(),
@@ -5070,7 +7397,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5108,7 +7435,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5140,7 +7467,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5183,7 +7510,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -5212,7 +7539,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -5300,8 +7627,11 @@ mod tests {
             continuation: false,
         })?;
 
-        assert_eq!(outcome.status, GoalStatus::Complete);
-        assert_eq!(*review_calls.lock().expect("review mutex poisoned"), 2);
+        assert_eq!(outcome.status, GoalStatus::NeedsUser);
+        assert_eq!(
+            *review_calls.lock().expect("review mutex poisoned"),
+            DEFAULT_MAX_ITERATIONS
+        );
         assert!(
             outcome
                 .artifacts_root
@@ -5404,8 +7734,11 @@ mod tests {
             continuation: false,
         })?;
 
-        assert_eq!(outcome.status, GoalStatus::Complete);
-        assert_eq!(*review_calls.lock().expect("review mutex poisoned"), 2);
+        assert_eq!(outcome.status, GoalStatus::NeedsUser);
+        assert_eq!(
+            *review_calls.lock().expect("review mutex poisoned"),
+            DEFAULT_MAX_ITERATIONS
+        );
         let review_packet = fs::read_to_string(
             temp_dir
                 .path()
@@ -5504,8 +7837,11 @@ mod tests {
             continuation: false,
         })?;
 
-        assert_eq!(outcome.status, GoalStatus::Complete);
-        assert_eq!(*review_calls.lock().expect("review mutex poisoned"), 2);
+        assert_eq!(outcome.status, GoalStatus::NeedsUser);
+        assert_eq!(
+            *review_calls.lock().expect("review mutex poisoned"),
+            DEFAULT_MAX_ITERATIONS
+        );
         let review_packet = fs::read_to_string(
             temp_dir
                 .path()
@@ -5588,6 +7924,8 @@ mod tests {
             &scope_check,
             &[],
             None,
+            None,
+            &[],
         );
 
         assert!(artifact.contains("## No Progress"));
@@ -5676,7 +8014,7 @@ mod tests {
             continuation: false,
         })?;
 
-        assert_eq!(outcome.status, GoalStatus::Complete);
+        assert_eq!(outcome.status, GoalStatus::NeedsUser);
         assert_eq!(*review_calls.lock().expect("review mutex poisoned"), 3);
         let third_packet = fs::read_to_string(
             temp_dir
@@ -5788,7 +8126,7 @@ mod tests {
             continuation: false,
         })?;
 
-        assert_eq!(outcome.status, GoalStatus::Complete);
+        assert_eq!(outcome.status, GoalStatus::NeedsUser);
         assert!(
             outcome
                 .artifacts_root
@@ -6065,7 +8403,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
         assert_eq!(evaluation.status, GoalStatus::Limited);
         assert!(evaluation.summary.contains("file change limit"));
@@ -6099,7 +8437,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
         assert_eq!(evaluation.status, GoalStatus::Running);
         assert!(evaluation.should_continue);
@@ -6202,7 +8540,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
         // GBX-003-002 must add an ExecutionOwnershipDecision check before
         // completion. Without a delegating worker task, Complete must be denied.
@@ -6267,7 +8605,7 @@ mod tests {
             None,
             None,
             None,
-        &[],
+            &[],
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
@@ -6340,7 +8678,7 @@ mod tests {
             None,
             Some(&ownership),
             None,
-        &[],
+            &[],
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
@@ -6361,13 +8699,8 @@ mod tests {
         let registry = ts::worker_registry_for_test();
         let task = ts::default_task();
         let config = ts::make_worker_config(WorkerKind::Opencode);
-        let request = ts::make_worker_start_request(
-            &store,
-            temp_dir.path(),
-            &task,
-            "test-goal",
-            &config,
-        );
+        let request =
+            ts::make_worker_start_request(&store, temp_dir.path(), &task, "test-goal", &config);
 
         let result = registry.start(request);
         assert!(
@@ -6402,12 +8735,25 @@ mod tests {
         lineage.active_task_ids.push("active_task_001".to_string());
 
         let evaluation = evaluate_goal_with_source(
-            true, &WorkerStatus::Succeeded, WorkerCategory::Deep,
-            false, None, None, &scope_check, None,
-            0, 0, 1, &budget, &BudgetSnapshot::default(),
-            &[], false, None, Some(&ownership),
+            true,
+            &WorkerStatus::Succeeded,
+            WorkerCategory::Deep,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            1,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            Some(&ownership),
             Some(&lineage),
-        &[],
+            &[],
         );
         // Lineage has active tasks → must NOT be Complete
         assert!(
@@ -6425,6 +8771,25 @@ mod tests {
             evaluation.summary.contains("Lineage gate"),
             "Summary should mention lineage gate but got: {}",
             evaluation.summary
+        );
+    }
+
+    #[test]
+    fn restored_lineage_is_reconciled_before_a_new_run() {
+        let mut lineage = WorkLineage::new("root-session".to_string());
+        lineage.status = ContinuationStatus::Completed;
+        lineage.plan_remaining_items = 0;
+        lineage.active_task_ids = vec!["stale-task".to_string()];
+
+        prepare_lineage_for_run(&mut lineage, "resumed-session");
+
+        assert_eq!(lineage.status, ContinuationStatus::Running);
+        assert_eq!(lineage.plan_remaining_items, 1);
+        assert!(lineage.active_task_ids.is_empty());
+        assert!(
+            lineage
+                .orchestrator_session_ids
+                .contains(&"resumed-session".to_string())
         );
     }
 
@@ -6453,17 +8818,196 @@ mod tests {
             raw_response: "GOAL_SATISFIED: yes\nSTOP_REASON: complete".to_string(),
         };
         let evaluation = evaluate_goal_with_source(
-            true, &WorkerStatus::Succeeded, WorkerCategory::Deep,
-            false, None, None, &scope_check, Some(&review),
-            0, 0, 1, &budget, &BudgetSnapshot::default(),
-            &[], false, None, Some(&ownership),
+            true,
+            &WorkerStatus::Succeeded,
+            WorkerCategory::Deep,
+            false,
             None,
-        &[],
+            None,
+            &scope_check,
+            Some(&review),
+            0,
+            0,
+            1,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            Some(&ownership),
+            None,
+            &[],
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
             "GBX-003 GAP: synthetic review should not allow completion but got {:?}",
             evaluation.status
         );
+    }
+
+    /// Broker-backed phase actor E2E test.
+    /// Tests the full 4-phase flow through a WorkerBroker verifying
+    /// strict call order, session follow-up, reviewer independence,
+    /// canonical approval after completed broker receipt chain, and
+    /// tampered receipt rejection.
+    #[test]
+    fn gearbox_phase_actor_broker_e2e() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement a broker-backed phase actor flow",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+
+        let backend = Arc::new(crate::test_support::test_support::FakeNativeWorkerBackend::new());
+        let registry = Arc::new(
+            crate::workers::WorkerRegistry::with_native_backend(backend),
+        );
+        let broker = Arc::new(WorkerBroker::new(
+            registry,
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+
+        let phase_order = Arc::new(Mutex::new(Vec::new()));
+        let critic_calls = Arc::new(AtomicUsize::new(0));
+
+        let critic_hook: PlanCriticHook = {
+            let critic_calls = critic_calls.clone();
+            Arc::new(move |input| {
+                let call = critic_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                phase_order
+                    .lock()
+                    .unwrap()
+                    .push(format!("critic_call_{call}"));
+                plan_critic_submission(&input, call, PlanCriticDecision::Approve)
+            })
+        };
+
+        let revision_hook: PlanRevisionHook = Arc::new(|input| {
+            let mut draft = input.plan.draft;
+            draft
+                .final_acceptance
+                .push("Revised acceptance evidence.".to_string());
+            let raw_output = serde_json::to_string(&draft)?;
+            Ok(PlanRevisionSubmission {
+                draft,
+                planner: phase_identity("planner_revision"),
+                raw_output,
+                artifact_path: None,
+            })
+        });
+
+        let planner_identity = PhaseExecutionIdentity {
+            execution_id: "planner_execution".to_string(),
+            phase_session_id: "planner_session".to_string(),
+            backend: PhaseExecutionBackend::LanguageModelRequest,
+            agent_id: Some("zed".to_string()),
+            provider_id: Some("test-provider".to_string()),
+            model_id: Some("test-model".to_string()),
+            actual_session_id: None,
+        };
+
+        let current_model = ModelSelectorId {
+            agent_id: "zed".to_string(),
+            provider_id: "test-provider".to_string(),
+            model_id: "test-model".to_string(),
+        };
+
+        let phase_runtime = PhaseRuntime {
+            routes: PhaseRouteTable::legacy_defaults(),
+            inventory: LiveModelInventory {
+                models: vec![current_model.clone()],
+            },
+            current_model: Some(current_model),
+            planner: Some(planner_identity),
+            plan_critic_hook: Some(critic_hook),
+            plan_revision_hook: Some(revision_hook),
+            require_plan_approval: true,
+            max_plan_revisions: 2,
+            broker: Some(broker.clone()),
+        };
+
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+
+        let plan = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-broker-e2e",
+            &None,
+            None,
+            &phase_runtime,
+        )?;
+
+        let approval = store
+            .read_plan_approval_state(&goal.id)?
+            .context("approval state missing after broker-backed plan approval")?;
+        assert_eq!(
+            approval.status,
+            PlanApprovalStatus::Approved,
+            "broker-backed flow must produce an approved plan"
+        );
+        assert_eq!(
+            approval.plan_hash,
+            plan.plan_hash,
+            "approval must match the sealed plan hash"
+        );
+        assert!(
+            approval.critic_receipt_hash.is_some(),
+            "approval must include a critic receipt hash"
+        );
+
+        let broker_state = broker.current_state()?;
+        assert!(
+            broker_state.session_identity.is_some()
+                || broker_state.lifecycle.name() != crate::worker_broker::LifecycleStateName::Discovered,
+            "broker must have made progress through resolve/start"
+        );
+
+        store.write_plan_graph(&plan)?;
+        assert!(
+            store.read_plan_graph(&goal.id)?.is_some(),
+            "canonical plan must be readable after broker-backed approval"
+        );
+        assert_eq!(critic_calls.load(Ordering::SeqCst), 1);
+
+        {
+            let review_dir = store.plan_review_dir(&goal.id);
+            if let Ok(entries) = std::fs::read_dir(&review_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.contains("critic-output") {
+                        std::fs::write(entry.path(), "tampered critic output")?;
+                        break;
+                    }
+                }
+            }
+        }
+        let read_result = store.read_plan_graph(&goal.id);
+        assert!(
+            read_result.is_err(),
+            "tampered critic output must invalidate the stored plan graph"
+        );
+
+        let broker_state_after = broker.current_state()?;
+        assert!(
+            broker_state_after.interaction_ordinal > 0
+                || broker_state_after.lifecycle.name() != crate::worker_broker::LifecycleStateName::Discovered,
+            "broker must record at least one interaction or lifecycle transition"
+        );
+
+        assert_eq!(
+            std::fs::read_dir(store.workers_dir())?.count(),
+            0,
+            "no worker should have been dispatched for a tampered/gated plan"
+        );
+
+        Ok(())
     }
 }

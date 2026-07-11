@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{CoordinatorModel, Scope, StateStore, Task, TaskInputs, write_json};
 use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation};
+use crate::worker_broker::{BrokerCapability, BrokerSessionIdentity, WorkerBroker, broker_capabilities_for_kind};
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -462,10 +463,7 @@ impl CategoryRouter {
     /// ZedAgent) as the preferred route for Quick-category tasks.
     /// Returns `None` when the preferred kind has no configured route
     /// and does not match the config's default `worker_kind`.
-    fn resolve_small_task<'a>(
-        &self,
-        config: &'a WorkerConfig,
-    ) -> Option<SelectedWorkerRoute<'a>> {
+    fn resolve_small_task<'a>(&self, config: &'a WorkerConfig) -> Option<SelectedWorkerRoute<'a>> {
         let preferred = config.default_worker_for_small_tasks;
 
         // Check configured routes first.
@@ -547,13 +545,12 @@ impl CategoryRouter {
             // small-task worker (defaults to ZedAgent) when no explicit
             // worker command is configured — a configured command means
             // the user has selected a specific worker.
-            let worker_kind = if category == WorkerCategory::Quick
-                && config.worker_command.is_none()
-            {
-                config.default_worker_for_small_tasks
-            } else {
-                config.worker_kind
-            };
+            let worker_kind =
+                if category == WorkerCategory::Quick && config.worker_command.is_none() {
+                    config.default_worker_for_small_tasks
+                } else {
+                    config.worker_kind
+                };
             let worker_command = config.worker_command.as_deref();
             let require_worker = config.require_worker;
             return SelectedWorkerRoute {
@@ -572,9 +569,7 @@ impl CategoryRouter {
                     format!(
                         "attempt {attempt} used `{}` worker{}",
                         worker_kind.as_str(),
-                        if category == WorkerCategory::Quick
-                            && worker_kind != config.worker_kind
-                        {
+                        if category == WorkerCategory::Quick && worker_kind != config.worker_kind {
                             " (small-task default)"
                         } else {
                             ""
@@ -1501,6 +1496,9 @@ pub trait WorkerSessionHandle: Send + Sync {
     fn dispose(&self) -> Result<()> {
         Ok(())
     }
+    fn supports_event_subscriptions(&self) -> bool {
+        false
+    }
     fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
         bail!("worker session does not support event subscriptions")
     }
@@ -1520,17 +1518,31 @@ pub trait WorkerAdapter {
 #[derive(Default)]
 pub struct WorkerRegistry {
     native_backend: Option<Arc<dyn NativeWorkerBackend>>,
+    /// Optional broker for lifecycle-managed worker sessions.
+    broker: Option<Arc<WorkerBroker>>,
 }
 
 impl WorkerRegistry {
     pub fn with_native_backend(native_backend: Arc<dyn NativeWorkerBackend>) -> Self {
         Self {
             native_backend: Some(native_backend),
+            broker: None,
         }
     }
 
     pub fn set_native_backend(&mut self, native_backend: Arc<dyn NativeWorkerBackend>) {
         self.native_backend = Some(native_backend);
+    }
+
+    /// Attach a broker for lifecycle-managed session wrapping.
+    pub fn with_broker(mut self, broker: Arc<WorkerBroker>) -> Self {
+        self.broker = Some(broker);
+        self
+    }
+
+    /// Set or clear the broker reference.
+    pub fn set_broker(&mut self, broker: Option<Arc<WorkerBroker>>) {
+        self.broker = broker;
     }
 
     pub fn start(&self, request: WorkerStartRequest<'_>) -> Result<Arc<dyn WorkerSessionHandle>> {
@@ -1625,6 +1637,48 @@ impl WorkerRegistry {
             );
         }
 
+        // Dispatch to the appropriate adapter, then wrap through broker if active.
+        // Extract needed fields before consuming request in start_direct.
+        let task_id = request.task.id.clone();
+        let handle = self.start_direct(worker_kind, request)?;
+
+        if let Some(broker) = &self.broker {
+            // Only wrap through broker if it has a resolved/active state
+            // (indicating the caller called broker.resolve() first).
+            let state = broker.current_state().ok();
+            if state.map_or(false, |s| !s.lifecycle.is_terminal()) {
+                let identity = BrokerSessionIdentity {
+                    backend_kind: worker_kind,
+                    session_id: handle
+                        .session_id()
+                        .unwrap_or_else(|| format!("{}-{}", worker_kind.as_str(), task_id)),
+                    started_at: crate::state::timestamp(),
+                    capabilities: Some(match worker_kind {
+                        WorkerKind::Opencode => OpencodeCommandWorker {}.broker_capabilities(),
+                        WorkerKind::OpencodeSession => {
+                            OpencodeSessionWorker {}.broker_capabilities()
+                        }
+                        WorkerKind::Codex => CodexCommandWorker {}.broker_capabilities(),
+                        WorkerKind::Claude => ClaudeCommandWorker {}.broker_capabilities(),
+                        WorkerKind::ZedAgent => {
+                            broker_capabilities_for_kind(worker_kind, self.native_backend.is_some())
+                        }
+                        WorkerKind::Custom => CustomCommandWorker {}.broker_capabilities(),
+                    }),
+                };
+                return broker.start(handle, identity);
+            }
+        }
+
+        Ok(handle)
+    }
+
+    /// Internal dispatch: start a worker without broker lifecycle wrapping.
+    pub(crate) fn start_direct(
+        &self,
+        worker_kind: WorkerKind,
+        request: WorkerStartRequest<'_>,
+    ) -> Result<Arc<dyn WorkerSessionHandle>> {
         match worker_kind {
             WorkerKind::Opencode => OpencodeCommandWorker {}.start(request),
             WorkerKind::OpencodeSession => OpencodeSessionWorker {}.start(request),
@@ -1745,6 +1799,74 @@ pub struct CodexCommandWorker {}
 pub struct ClaudeCommandWorker {}
 pub struct ZedAgentCommandWorker {}
 pub struct CustomCommandWorker {}
+
+// ── Broker capability declarations ────────────────────────────────────────
+//
+// Each adapter declares its broker-level capabilities explicitly, matching
+// the capability matrices specified in GBX-006-004.
+
+impl OpencodeCommandWorker {
+    pub fn broker_capabilities(&self) -> Vec<BrokerCapability> {
+        vec![
+            BrokerCapability::DiscoverAgents,
+            BrokerCapability::Start,
+            BrokerCapability::Cancel,
+            BrokerCapability::Wait,
+        ]
+    }
+}
+
+impl OpencodeSessionWorker {
+    pub fn broker_capabilities(&self) -> Vec<BrokerCapability> {
+        vec![
+            BrokerCapability::DiscoverAgents,
+            BrokerCapability::Start,
+            BrokerCapability::FollowUp,
+            BrokerCapability::Steer,
+            BrokerCapability::Cancel,
+            BrokerCapability::Wait,
+            BrokerCapability::SessionResume,
+            // model_selection and usage are backend-declared (not ACP-verified)
+            BrokerCapability::ModelSelection,
+            BrokerCapability::Usage,
+            BrokerCapability::Permission,
+        ]
+    }
+}
+
+impl CodexCommandWorker {
+    pub fn broker_capabilities(&self) -> Vec<BrokerCapability> {
+        vec![
+            BrokerCapability::DiscoverAgents,
+            BrokerCapability::Start,
+            BrokerCapability::Cancel,
+            BrokerCapability::Wait,
+            BrokerCapability::ModelSelection,
+        ]
+    }
+}
+
+impl ClaudeCommandWorker {
+    pub fn broker_capabilities(&self) -> Vec<BrokerCapability> {
+        vec![
+            BrokerCapability::DiscoverAgents,
+            BrokerCapability::Start,
+            BrokerCapability::Cancel,
+            BrokerCapability::Wait,
+        ]
+    }
+}
+
+impl CustomCommandWorker {
+    pub fn broker_capabilities(&self) -> Vec<BrokerCapability> {
+        vec![
+            BrokerCapability::DiscoverAgents,
+            BrokerCapability::Start,
+            BrokerCapability::Cancel,
+            BrokerCapability::Wait,
+        ]
+    }
+}
 
 pub struct CommandWorker {}
 
@@ -1870,6 +1992,44 @@ fn start_command_backed_worker(
     let model_params = adapter
         .model_params()
         .map_err(|error| anyhow::anyhow!(error))?;
+    let plan_task = task.inputs.plan_task.as_ref();
+    let packet_goal = plan_task
+        .map(|plan_task| plan_task.worker_goal(goal))
+        .unwrap_or_else(|| goal.to_string());
+    let constraints = plan_task
+        .map(crate::plan_graph::PlanTaskContract::worker_constraints)
+        .unwrap_or_else(|| {
+            vec![
+                "Stay inside the allowed paths when they are provided.".to_string(),
+                "Prefer the package manager already used by the project.".to_string(),
+                "Read the provided spec and plan artifacts before changing code.".to_string(),
+                "Leave runnable local instructions in the final output.".to_string(),
+            ]
+        });
+    let required_outputs = plan_task
+        .map(crate::plan_graph::PlanTaskContract::worker_required_outputs)
+        .unwrap_or_else(|| {
+            vec![
+                "summary".to_string(),
+                "changed_files".to_string(),
+                "commands_run".to_string(),
+                "known_failures".to_string(),
+                "next_steps".to_string(),
+            ]
+        });
+    let planned_verification = plan_task
+        .map(crate::plan_graph::PlanTaskContract::worker_verification_commands)
+        .filter(|commands| !commands.is_empty())
+        .unwrap_or_else(|| verification_commands.to_vec());
+    let stop_conditions = plan_task
+        .map(crate::plan_graph::PlanTaskContract::worker_stop_conditions)
+        .unwrap_or_else(|| {
+            vec![
+                "Requires a paid external service.".to_string(),
+                "Requires a user-provided API key.".to_string(),
+                "The same verification fails twice.".to_string(),
+            ]
+        });
     let packet = WorkerPacket {
         task_id: task.id.clone(),
         worker: worker_name.to_string(),
@@ -1880,33 +2040,18 @@ fn start_command_backed_worker(
         tools: route.tools.clone(),
         category_resolution,
         category_resolution_result,
-        goal: goal.to_string(),
+        goal: packet_goal,
         coordinator_model: coordinator_model.cloned(),
         coordinator_brief: coordinator_brief.map(ToString::to_string),
         scope: task.scope.clone(),
         inputs: task.inputs.clone(),
-        constraints: vec![
-            "Stay inside the allowed paths when they are provided.".to_string(),
-            "Prefer the package manager already used by the project.".to_string(),
-            "Read the provided spec and plan artifacts before changing code.".to_string(),
-            "Leave runnable local instructions in the final output.".to_string(),
-        ],
-        required_outputs: vec![
-            "summary".to_string(),
-            "changed_files".to_string(),
-            "commands_run".to_string(),
-            "known_failures".to_string(),
-            "next_steps".to_string(),
-        ],
+        constraints,
+        required_outputs,
         verification: VerificationContract {
-            preferred_commands: verification_commands.to_vec(),
+            preferred_commands: planned_verification,
             must_not_skip: vec!["typecheck".to_string()],
         },
-        stop_conditions: vec![
-            "Requires a paid external service.".to_string(),
-            "Requires a user-provided API key.".to_string(),
-            "The same verification fails twice.".to_string(),
-        ],
+        stop_conditions,
     };
 
     let packet_json =
@@ -2548,6 +2693,10 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
             )?;
         }
         Ok(())
+    }
+
+    fn supports_event_subscriptions(&self) -> bool {
+        self.supports_interaction
     }
 
     fn subscribe(&self, listener: WorkerEventListener) -> Result<WorkerSubscription> {
@@ -3525,6 +3674,10 @@ mod tests {
 
         fn dispose(&self) -> Result<()> {
             Ok(())
+        }
+
+        fn supports_event_subscriptions(&self) -> bool {
+            true
         }
 
         fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
@@ -5926,9 +6079,7 @@ mod tests {
         // ZedAgent dispatches through native backend when available.
         // Uses the locally-defined FakeNativeBackend (already in this test module).
         let started = Arc::new(AtomicBool::new(false));
-        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeNativeBackend {
-            started: started.clone(),
-        }));
+        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeNativeBackend { started }));
         let handle = registry.start(WorkerStartRequest {
             store: &store,
             workspace: temp.path(),
@@ -5947,10 +6098,7 @@ mod tests {
             handle.session_id().is_some(),
             "ZedAgent adapter with native backend should return session_id"
         );
-        assert_eq!(
-            handle.session_id().as_deref(),
-            Some("native-zed-session")
-        );
+        assert_eq!(handle.session_id().as_deref(), Some("native-zed-session"));
         Ok(())
     }
 
@@ -6043,7 +6191,10 @@ mod tests {
             resident.supports_artifact_contract,
             "Resident worker supports artifact_contract"
         );
-        assert!(resident.supports_follow_up, "Resident worker supports follow_up");
+        assert!(
+            resident.supports_follow_up,
+            "Resident worker supports follow_up"
+        );
         assert!(
             resident.supports_tool_policy_enforcement,
             "Resident worker supports tool_policy_enforcement"

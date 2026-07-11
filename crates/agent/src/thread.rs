@@ -2001,6 +2001,15 @@ impl Thread {
         cx.notify()
     }
 
+    pub(crate) fn set_pinned_model(
+        &mut self,
+        model: Arc<dyn LanguageModel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.inherits_parent_model_settings = false;
+        self.set_model(model, cx);
+    }
+
     pub fn summarization_model(&self) -> Option<&Arc<dyn LanguageModel>> {
         self.summarization_model.as_ref()
     }

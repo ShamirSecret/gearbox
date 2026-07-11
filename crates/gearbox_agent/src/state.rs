@@ -2,10 +2,11 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::runtime::{DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES};
 
@@ -283,6 +284,10 @@ pub struct TaskInputs {
     pub spec_path: Option<String>,
     pub plan_path: Option<String>,
     pub worker_packet_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_task: Option<crate::plan_graph::PlanTaskContract>,
+    #[serde(default)]
+    pub phase_route_locked: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -320,6 +325,12 @@ pub enum EventKind {
     GoalCreated,
     SpecCreated,
     PlanCreated,
+    PlanReviewStarted,
+    PlanRevisionRequested,
+    PlanReviewApproved,
+    PlanApproved,
+    PlanRejected,
+    PhaseRouteSelected,
     TaskStarted,
     WorkerStarted,
     WorkerOutput,
@@ -361,6 +372,8 @@ impl StateStore {
             self.sessions_dir(),
             self.goals_dir(),
             self.tasks_dir(),
+            self.plans_dir(),
+            self.plan_reviews_dir(),
             self.events_dir(),
             self.artifacts_dir(),
             self.workers_dir(),
@@ -381,6 +394,18 @@ impl StateStore {
 
     pub fn tasks_dir(&self) -> PathBuf {
         self.root.join("tasks")
+    }
+
+    pub fn plans_dir(&self) -> PathBuf {
+        self.root.join("plans")
+    }
+
+    pub fn plan_reviews_dir(&self) -> PathBuf {
+        self.root.join("plan-reviews")
+    }
+
+    pub fn plan_review_dir(&self, goal_id: &str) -> PathBuf {
+        self.plan_reviews_dir().join(goal_id)
     }
 
     pub fn events_dir(&self) -> PathBuf {
@@ -495,6 +520,10 @@ impl StateStore {
         self.workers_dir().join(task_id)
     }
 
+    pub fn phase_routes_dir(&self, goal_id: &str) -> PathBuf {
+        self.artifact_dir(goal_id).join("phase-routes")
+    }
+
     pub fn events_path(&self, session_id: &str) -> PathBuf {
         self.events_dir().join(format!("{session_id}.jsonl"))
     }
@@ -515,6 +544,473 @@ impl StateStore {
         let path = self.tasks_dir().join(format!("{goal_id}.tasks.json"));
         write_json(&path, tasks)?;
         Ok(path)
+    }
+
+    pub fn read_tasks(&self, goal_id: &str) -> Result<Option<Vec<Task>>> {
+        let path = self.tasks_dir().join(format!("{goal_id}.tasks.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse {}", path.display()),
+        )?))
+    }
+
+    pub fn write_plan_graph(&self, plan_graph: &crate::plan_graph::PlanGraph) -> Result<PathBuf> {
+        plan_graph
+            .validate()
+            .context("refusing to persist an invalid PlanGraph")?;
+        self.validate_plan_approval_bundle(plan_graph)
+            .context("refusing to persist a PlanGraph without a valid approval bundle")?;
+        let path = self
+            .plans_dir()
+            .join(format!("{}.plan.json", plan_graph.goal_id));
+        write_json(&path, plan_graph)?;
+        Ok(path)
+    }
+
+    pub fn write_unreviewed_plan_graph(
+        &self,
+        plan_graph: &crate::plan_graph::PlanGraph,
+    ) -> Result<PathBuf> {
+        plan_graph
+            .validate()
+            .context("refusing to persist an invalid unreviewed PlanGraph")?;
+        let path = self
+            .plans_dir()
+            .join(format!("{}.unreviewed.plan.json", plan_graph.goal_id));
+        write_json(&path, plan_graph)?;
+        Ok(path)
+    }
+
+    pub fn write_plan_candidate(
+        &self,
+        plan_graph: &crate::plan_graph::PlanGraph,
+    ) -> Result<PathBuf> {
+        plan_graph
+            .validate()
+            .context("refusing to persist an invalid PlanGraph candidate")?;
+        let path = self.plan_review_dir(&plan_graph.goal_id).join(format!(
+            "revision-{:03}-{}.plan.json",
+            plan_graph.revision,
+            &plan_graph.plan_hash[..16]
+        ));
+        write_json(&path, plan_graph)?;
+        Ok(path)
+    }
+
+    pub fn write_planner_execution_receipt(
+        &self,
+        receipt: &crate::plan_review::PlannerExecutionReceipt,
+    ) -> Result<PathBuf> {
+        let path = self.plan_review_dir(&receipt.goal_id).join(format!(
+            "revision-{:03}-planner-receipt.json",
+            receipt.plan_revision
+        ));
+        write_json(&path, receipt)?;
+        Ok(path)
+    }
+
+    pub fn write_plan_approval_state(
+        &self,
+        state: &crate::plan_review::PlanApprovalState,
+    ) -> Result<PathBuf> {
+        state
+            .validate()
+            .context("refusing to persist an invalid plan approval state")?;
+        let path = self.plan_review_dir(&state.goal_id).join("approval.json");
+        write_json_atomic(&path, state)?;
+        Ok(path)
+    }
+
+    pub fn read_plan_approval_state(
+        &self,
+        goal_id: &str,
+    ) -> Result<Option<crate::plan_review::PlanApprovalState>> {
+        let path = self.plan_review_dir(goal_id).join("approval.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let state: crate::plan_review::PlanApprovalState = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        state
+            .validate()
+            .with_context(|| format!("invalid plan approval state at {}", path.display()))?;
+        Ok(Some(state))
+    }
+
+    pub fn write_plan_verifier_report(
+        &self,
+        report: &crate::plan_review::PlanVerifierReport,
+    ) -> Result<PathBuf> {
+        let path = self.plan_review_dir(&report.goal_id).join(format!(
+            "revision-{:03}-verifier-report.json",
+            report.plan_revision
+        ));
+        write_json(&path, report)?;
+        Ok(path)
+    }
+
+    pub fn write_plan_critic_receipt(
+        &self,
+        receipt: &crate::plan_review::PlanCriticReceipt,
+    ) -> Result<PathBuf> {
+        let path = self.plan_review_dir(&receipt.goal_id).join(format!(
+            "revision-{:03}-critic-receipt.json",
+            receipt.plan_revision
+        ));
+        write_json(&path, receipt)?;
+        Ok(path)
+    }
+
+    pub fn write_plan_review_text(
+        &self,
+        goal_id: &str,
+        revision: usize,
+        label: &str,
+        contents: &str,
+    ) -> Result<PathBuf> {
+        let label = label.trim();
+        if label.is_empty()
+            || !label.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            bail!("plan review artifact label must be a non-empty ASCII identifier");
+        }
+        let path = self
+            .plan_review_dir(goal_id)
+            .join(format!("revision-{revision:03}-{label}.txt"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn write_phase_route_table(
+        &self,
+        goal_id: &str,
+        table: &crate::phase_routing::PhaseRouteTable,
+    ) -> Result<PathBuf> {
+        table
+            .validate()
+            .context("refusing to persist an invalid phase route table")?;
+        let path = self.phase_routes_dir(goal_id).join("config.json");
+        write_json(&path, table)?;
+        Ok(path)
+    }
+
+    pub fn write_phase_route_decision(
+        &self,
+        goal_id: &str,
+        ordinal: usize,
+        decision: &crate::phase_routing::PhaseRouteDecision,
+    ) -> Result<PathBuf> {
+        self.validate_phase_route_decision(goal_id, decision)?;
+        let path = self
+            .phase_routes_dir(goal_id)
+            .join(format!("{:03}-{:?}-decision.json", ordinal, decision.phase));
+        write_json(&path, decision)?;
+        Ok(path)
+    }
+
+    fn validate_phase_route_decision(
+        &self,
+        goal_id: &str,
+        decision: &crate::phase_routing::PhaseRouteDecision,
+    ) -> Result<()> {
+        let table_path = self.phase_routes_dir(goal_id).join("config.json");
+        let table: crate::phase_routing::PhaseRouteTable = read_json_file(&table_path)
+            .with_context(|| format!("failed to load {}", table_path.display()))?;
+        let profile = table.profile(&decision.phase)?;
+        decision.validate_against(profile)
+    }
+
+    fn validate_phase_route_receipt_authority(
+        &self,
+        goal_id: &str,
+        ordinal: usize,
+        receipt: &crate::phase_routing::PhaseRouteReceipt,
+    ) -> Result<()> {
+        if receipt.ordinal != ordinal {
+            bail!("phase route receipt ordinal does not match its storage path");
+        }
+        self.validate_phase_route_decision(goal_id, &receipt.decision)?;
+        let decision_path = self.phase_routes_dir(goal_id).join(format!(
+            "{:03}-{:?}-decision.json",
+            ordinal, receipt.decision.phase
+        ));
+        let persisted: crate::phase_routing::PhaseRouteDecision = read_json_file(&decision_path)
+            .with_context(|| {
+                format!(
+                    "phase route receipt is missing its persisted decision at {}",
+                    decision_path.display()
+                )
+            })?;
+        if persisted != receipt.decision || persisted.hash()? != receipt.decision_hash {
+            bail!("phase route receipt does not match its persisted route decision");
+        }
+        Ok(())
+    }
+
+    fn validate_phase_route_receipt_plan(
+        &self,
+        receipt: &crate::phase_routing::PhaseRouteReceipt,
+    ) -> Result<()> {
+        let goal_id = receipt
+            .goal_id
+            .as_deref()
+            .context("phase route receipt is missing its goal id")?;
+        let plan_id = receipt
+            .plan_id
+            .as_deref()
+            .context("phase route receipt is missing its plan id")?;
+        let plan_hash = receipt
+            .plan_hash
+            .as_deref()
+            .context("phase route receipt is missing its plan hash")?;
+        let candidate_path = self.plan_review_dir(goal_id).join(format!(
+            "revision-{:03}-{}.plan.json",
+            receipt.plan_revision,
+            &plan_hash[..16]
+        ));
+        let paths = [
+            candidate_path,
+            self.plans_dir().join(format!("{goal_id}.plan.json")),
+            self.plans_dir()
+                .join(format!("{goal_id}.unreviewed.plan.json")),
+        ];
+        for path in paths.iter().filter(|path| path.exists()) {
+            let plan: crate::plan_graph::PlanGraph = read_json_file(path)?;
+            plan.validate()?;
+            if plan.goal_id == goal_id
+                && plan.plan_id == plan_id
+                && plan.revision == receipt.plan_revision
+                && plan.plan_hash == plan_hash
+            {
+                return Ok(());
+            }
+        }
+        bail!("phase route receipt does not match a persisted PlanGraph revision")
+    }
+
+    pub fn write_phase_route_receipt(
+        &self,
+        goal_id: &str,
+        ordinal: usize,
+        receipt: &crate::phase_routing::PhaseRouteReceipt,
+    ) -> Result<PathBuf> {
+        receipt
+            .validate()
+            .context("refusing to persist an invalid phase route receipt")?;
+        if receipt.goal_id.as_deref() != Some(goal_id) {
+            bail!("phase route receipt goal does not match its storage path");
+        }
+        self.validate_phase_route_receipt_authority(goal_id, ordinal, receipt)?;
+        self.validate_phase_route_receipt_plan(receipt)?;
+        self.validate_phase_route_receipt_evidence(receipt)?;
+        let path = self.phase_routes_dir(goal_id).join(format!(
+            "{:03}-{:?}-receipt.json",
+            ordinal, receipt.decision.phase
+        ));
+        write_json(&path, receipt)?;
+        Ok(path)
+    }
+
+    pub fn read_phase_route_receipt(
+        &self,
+        goal_id: &str,
+        ordinal: usize,
+        phase: &crate::plan_graph::PhaseProfile,
+    ) -> Result<Option<crate::phase_routing::PhaseRouteReceipt>> {
+        let path = self
+            .phase_routes_dir(goal_id)
+            .join(format!("{ordinal:03}-{phase:?}-receipt.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let receipt: crate::phase_routing::PhaseRouteReceipt = read_json_file(&path)?;
+        receipt
+            .validate()
+            .context("persisted phase route receipt failed integrity validation")?;
+        if receipt.goal_id.as_deref() != Some(goal_id)
+            || receipt.ordinal != ordinal
+            || &receipt.decision.phase != phase
+        {
+            bail!("phase route receipt path identity does not match its contents");
+        }
+        self.validate_phase_route_receipt_authority(goal_id, ordinal, &receipt)?;
+        self.validate_phase_route_receipt_plan(&receipt)?;
+        self.validate_phase_route_receipt_evidence(&receipt)?;
+        Ok(Some(receipt))
+    }
+
+    pub fn validate_phase_route_receipt_evidence(
+        &self,
+        receipt: &crate::phase_routing::PhaseRouteReceipt,
+    ) -> Result<()> {
+        receipt.validate()?;
+        let Some(task_id) = receipt.task_id.as_deref() else {
+            return Ok(());
+        };
+        let goal_id = receipt
+            .goal_id
+            .as_deref()
+            .context("worker phase receipt is missing goal id")?;
+        let evidence_path = PathBuf::from(
+            receipt
+                .task_record_path
+                .as_deref()
+                .context("worker phase receipt is missing task record path")?,
+        );
+        let expected_path = self
+            .phase_routes_dir(goal_id)
+            .join("worker-evidence")
+            .join(format!("{task_id}-task-record.json"));
+        if evidence_path != expected_path {
+            bail!("worker phase task-record evidence path does not match its task identity");
+        }
+        let canonical_root = self
+            .phase_routes_dir(goal_id)
+            .canonicalize()
+            .context("failed to canonicalize phase route evidence root")?;
+        let canonical_goal_root = self
+            .artifact_dir(goal_id)
+            .canonicalize()
+            .context("failed to canonicalize goal artifact root")?;
+        if !canonical_root.starts_with(&canonical_goal_root) {
+            bail!("phase route evidence root escaped its goal artifact directory");
+        }
+        let canonical_evidence = evidence_path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", evidence_path.display()))?;
+        if !canonical_evidence.starts_with(canonical_root) {
+            bail!("worker phase task-record evidence is outside its goal route directory");
+        }
+        let evidence = fs::read(&evidence_path)
+            .with_context(|| format!("failed to read {}", evidence_path.display()))?;
+        let evidence_hash = format!("{:x}", Sha256::digest(&evidence));
+        if receipt.task_record_sha256.as_deref() != Some(evidence_hash.as_str()) {
+            bail!("worker phase task-record evidence hash mismatch");
+        }
+        let record: crate::task_manager::TaskRecord = serde_json::from_slice(&evidence)
+            .with_context(|| format!("failed to parse {}", evidence_path.display()))?;
+        if record.task_id != task_id {
+            bail!("worker phase task-record evidence belongs to another task");
+        }
+        let last_attempt = record
+            .attempts
+            .last()
+            .context("worker phase task-record evidence has no attempts")?;
+        if receipt.actual_worker_kind.map(|kind| kind.as_str())
+            != Some(last_attempt.worker_kind.as_str())
+            || receipt.actual_category.map(|category| category.as_str())
+                != Some(last_attempt.worker_category.as_str())
+            || receipt.actual_worker_model.as_deref() != last_attempt.worker_model.as_deref()
+            || receipt.actual_route_reason.as_deref() != Some(last_attempt.route_reason.as_str())
+        {
+            bail!("worker phase receipt does not match its task-record attempt evidence");
+        }
+        if receipt.worker_session_id.as_deref() != record.session_id.as_deref()
+            || (last_attempt.session_id.is_some()
+                && receipt.worker_session_id.as_deref() != last_attempt.session_id.as_deref())
+        {
+            bail!("worker phase receipt session does not match task-record evidence");
+        }
+        Ok(())
+    }
+
+    pub fn read_plan_graph(&self, goal_id: &str) -> Result<Option<crate::plan_graph::PlanGraph>> {
+        let path = self.plans_dir().join(format!("{goal_id}.plan.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let plan_graph: crate::plan_graph::PlanGraph = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        plan_graph
+            .validate()
+            .with_context(|| format!("invalid persisted PlanGraph at {}", path.display()))?;
+        self.validate_plan_approval_bundle(&plan_graph)
+            .with_context(|| format!("invalid approval bundle for {}", path.display()))?;
+        Ok(Some(plan_graph))
+    }
+
+    pub fn read_unreviewed_plan_graph(
+        &self,
+        goal_id: &str,
+    ) -> Result<Option<crate::plan_graph::PlanGraph>> {
+        let path = self
+            .plans_dir()
+            .join(format!("{goal_id}.unreviewed.plan.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let plan_graph: crate::plan_graph::PlanGraph = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        plan_graph
+            .validate()
+            .with_context(|| format!("invalid persisted PlanGraph at {}", path.display()))?;
+        Ok(Some(plan_graph))
+    }
+
+    pub fn validate_plan_approval_bundle(
+        &self,
+        plan_graph: &crate::plan_graph::PlanGraph,
+    ) -> Result<()> {
+        let approval = self
+            .read_plan_approval_state(&plan_graph.goal_id)?
+            .context("approved PlanGraph is missing approval.json")?;
+        approval.validate_against(plan_graph)?;
+        let review_dir = self.plan_review_dir(&plan_graph.goal_id);
+        let revision = plan_graph.revision;
+        let planner_raw_output = fs::read_to_string(
+            review_dir.join(format!("revision-{revision:03}-planner-output.txt")),
+        )
+        .context("approved PlanGraph is missing planner raw output")?;
+        let planner_receipt: crate::plan_review::PlannerExecutionReceipt = read_json_file(
+            &review_dir.join(format!("revision-{revision:03}-planner-receipt.json")),
+        )?;
+        let verifier: crate::plan_review::PlanVerifierReport = read_json_file(
+            &review_dir.join(format!("revision-{revision:03}-verifier-report.json")),
+        )?;
+        let critic_raw_output = fs::read_to_string(
+            review_dir.join(format!("revision-{revision:03}-critic-output.txt")),
+        )
+        .context("approved PlanGraph is missing PlanCritic raw output")?;
+        let critic_receipt: crate::plan_review::PlanCriticReceipt = read_json_file(
+            &review_dir.join(format!("revision-{revision:03}-critic-receipt.json")),
+        )?;
+
+        planner_receipt.validate(plan_graph, &planner_raw_output)?;
+        verifier.validate(plan_graph)?;
+        critic_receipt.validate(
+            plan_graph,
+            &planner_receipt,
+            &planner_raw_output,
+            &verifier,
+            &critic_raw_output,
+        )?;
+        if !critic_receipt.approved() {
+            bail!("canonical PlanGraph requires an approving PlanCritic receipt");
+        }
+        if approval.planner_receipt_hash != planner_receipt.receipt_hash
+            || approval.verifier_report_hash != verifier.report_hash
+            || approval.critic_receipt_hash.as_deref() != Some(critic_receipt.receipt_hash.as_str())
+        {
+            bail!("approval manifest does not match its persisted receipt chain");
+        }
+        Ok(())
     }
 
     pub fn append_event(&self, event: &Event) -> Result<PathBuf> {
@@ -600,6 +1096,15 @@ pub fn event(
     }
 }
 
+fn read_json_file<T>(path: &Path) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
 pub fn write_json<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize + ?Sized,
@@ -611,5 +1116,27 @@ where
     let contents = serde_json::to_string_pretty(value).context("failed to serialize json")?;
     fs::write(path, format!("{contents}\n"))
         .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize + ?Sized,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let contents = serde_json::to_string_pretty(value).context("failed to serialize json")?;
+    let temporary_path = path.with_extension(format!("tmp-{}", id_timestamp()));
+    fs::write(&temporary_path, format!("{contents}\n"))
+        .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+    fs::rename(&temporary_path, path).with_context(|| {
+        format!(
+            "failed to atomically replace {} with {}",
+            path.display(),
+            temporary_path.display()
+        )
+    })?;
     Ok(())
 }
