@@ -2793,7 +2793,7 @@ impl NativeAgentConnection {
         ));
         let _acp_broker_backend: Arc<dyn NativeWorkerBackend> =
             Arc::new(GearAcpBrokerBackend::new(acp_broker_tx));
-        let _broker_factory = Arc::new(PhaseBrokerFactory::new(
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
             broker_registry,
             workspace.join(".gearbox-agent"),
         ));
@@ -2825,6 +2825,7 @@ impl NativeAgentConnection {
         let agent = self.agent.clone();
         let cancellation_session_id = session_id.clone();
         let run_broker = broker;
+        let run_broker_factory = broker_factory;
         cx.spawn(async move |cx| {
             let review_language_model = phase_models.critic_model.clone();
             let review_workspace = workspace.clone();
@@ -2954,6 +2955,7 @@ impl NativeAgentConnection {
                 require_plan_approval: true,
                 max_plan_revisions: gear_max_plan_revisions_from_env(),
                 broker: Some(run_broker),
+                broker_factory: Some(run_broker_factory),
             };
             let continuation_session_id = cancellation_session_id.to_string();
             let run_task = cx.background_spawn(smol::unblock(move || {

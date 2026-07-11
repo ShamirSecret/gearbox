@@ -40,7 +40,8 @@ use crate::tools::{
     run_shell_command_with_env_and_cancellation,
 };
 use crate::worker_broker::{
-    BrokerPhaseRequest, ModelAvailability, WorkerBroker,
+    BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest, LifecycleState, LifecycleStateName,
+    ModelAvailability, PhaseBrokerFactory, WorkerBroker,
 };
 use crate::workers::{
     CategoryResolution, CategoryResolutionResult, FallbackRoute, WorkerCategory, WorkerConfig,
@@ -161,6 +162,12 @@ pub struct PhaseRuntime {
     /// When set, phase interactions (planner, PlanCritic, executor,
     /// reviewer) go through the broker lifecycle.
     pub broker: Option<Arc<WorkerBroker>>,
+    /// Optional factory for creating per-phase broker sessions.
+    /// When set, orchestrator creates a fresh broker per phase invocation
+    /// instead of reusing a single shared broker. This avoids illegal
+    /// state transitions (e.g. `Resolved → Resolved`) when multiple
+    /// phases run sequentially against the same broker.
+    pub broker_factory: Option<Arc<PhaseBrokerFactory>>,
 }
 
 impl PhaseRuntime {
@@ -175,6 +182,7 @@ impl PhaseRuntime {
             require_plan_approval: false,
             max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
             broker: None,
+            broker_factory: None,
         }
     }
 }
@@ -185,18 +193,13 @@ impl Default for PhaseRuntime {
     }
 }
 
-fn run_phase_via_broker<T>(
-    broker: Option<&WorkerBroker>,
+fn build_broker_phase_request(
     phase_decision: &PhaseRouteDecision,
     goal_id: &str,
     plan_id: &str,
     plan_revision: usize,
     task_id: &str,
-    f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let Some(broker) = broker else {
-        return f();
-    };
+) -> Result<BrokerPhaseRequest> {
     let decision_hash = phase_decision
         .hash()
         .context("failed to hash phase route decision for broker")?;
@@ -206,7 +209,7 @@ fn run_phase_via_broker<T>(
             crate::worker_broker::UnavailableReason::NotConfigured,
         ),
     };
-    let phase_request = BrokerPhaseRequest {
+    Ok(BrokerPhaseRequest {
         schema_version: crate::worker_broker::BROKER_SCHEMA_VERSION,
         phase_decision_hash: decision_hash,
         goal_id: goal_id.to_string(),
@@ -219,15 +222,150 @@ fn run_phase_via_broker<T>(
             .unwrap_or_else(|| "direct".to_string()),
         requested_model,
         allowed_fallback_models: Vec::new(),
+    })
+}
+
+fn write_direct_execution_receipt(
+    broker: &WorkerBroker,
+    phase_request: &BrokerPhaseRequest,
+    outcome: BrokerOutcome,
+) -> Result<()> {
+    let state = broker.current_state()?;
+    let session_identity = if let Some(identity) = state.session_identity.as_ref() {
+        identity.clone()
+    } else {
+        crate::worker_broker::BrokerSessionIdentity {
+            backend_kind: crate::workers::WorkerKind::Opencode,
+            session_id: format!("direct-{}", crate::state::timestamp()),
+            started_at: crate::state::timestamp(),
+            capabilities: None,
+        }
     };
+    let receipt = BrokerLifecycleReceipt {
+        schema_version: crate::worker_broker::BROKER_SCHEMA_VERSION,
+        interaction_ordinal: state.interaction_ordinal.max(1),
+        phase_decision_hash: phase_request.phase_decision_hash.clone(),
+        session_identity,
+        request: phase_request.clone(),
+        outcome,
+        terminal_reason: None,
+        usage: None,
+        permission_evidence: None,
+        actual_model: None,
+        binding_status: None,
+        receipt_hash: String::new(),
+    }
+    .seal()
+    .context("failed to seal direct execution receipt")?;
+    let artifacts_root = broker.artifacts_root();
+    let receipt_dir = artifacts_root.join("direct-execution-receipts");
+    std::fs::create_dir_all(&receipt_dir)
+        .with_context(|| format!("failed to create direct execution receipt dir at {}", receipt_dir.display()))?;
+    let receipt_path = receipt_dir.join(format!("{}.json", crate::state::timestamp()));
+    crate::state::write_json(&receipt_path, &receipt)
+        .with_context(|| format!("failed to write direct execution receipt at {}", receipt_path.display()))?;
+    Ok(())
+}
+
+fn run_phase_via_broker_inner<T>(
+    broker: Option<&WorkerBroker>,
+    phase_decision: &PhaseRouteDecision,
+    goal_id: &str,
+    plan_id: &str,
+    plan_revision: usize,
+    task_id: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(broker) = broker else {
+        return f();
+    };
+    let phase_request = build_broker_phase_request(
+        phase_decision,
+        goal_id,
+        plan_id,
+        plan_revision,
+        task_id,
+    )?;
+    let phase_request_clone = phase_request.clone();
     broker
         .resolve(phase_request)
         .context("broker resolve failed for phase actor")?;
     let result = f();
-    if result.is_err() {
-        let _ = broker.cancel().context("broker cancel");
+    match &result {
+        Ok(_) => {
+            if let Ok(state) = broker.current_state() {
+                if state.lifecycle.name() == LifecycleStateName::Active {
+                    broker
+                        .wait_for_outcome()
+                        .context("broker wait_for_outcome failed after phase actor")?;
+                } else if state.lifecycle.name() == LifecycleStateName::Resolved {
+                    write_direct_execution_receipt(broker, &phase_request_clone, BrokerOutcome::Completed)
+                        .context("failed to write direct execution receipt")?;
+                }
+            }
+        }
+        Err(_) => {
+            let _ = broker.cancel().context("broker cancel");
+        }
     }
     result
+}
+
+/// Run a phase through the broker lifecycle, optionally using a
+/// [`PhaseBrokerFactory`] to create a fresh broker per invocation.
+///
+/// When a `broker_factory` is provided, a new broker is created for this
+/// phase call, used for the lifecycle, then removed from the factory's
+/// active sessions after completion. This avoids illegal state transitions
+/// (e.g. `Resolved → Resolved`) when phases run sequentially.
+///
+/// Falls back to the shared `broker` when no factory is available.
+fn run_phase_via_broker<T>(
+    broker: Option<&WorkerBroker>,
+    broker_factory: Option<&PhaseBrokerFactory>,
+    phase_decision: &PhaseRouteDecision,
+    goal_id: &str,
+    plan_id: &str,
+    plan_revision: usize,
+    task_id: &str,
+    execution_identity: &PhaseExecutionIdentity,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(factory) = broker_factory {
+        let phase_broker = factory.create_broker(
+            phase_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            execution_identity,
+        )?;
+        let result = run_phase_via_broker_inner(
+            Some(phase_broker.as_ref()),
+            phase_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            f,
+        );
+        if let Err(remove_err) =
+            factory.remove_session(execution_identity, goal_id, task_id, plan_revision)
+        {
+            eprintln!("failed to remove broker session: {remove_err}");
+        }
+        return result;
+    }
+
+    run_phase_via_broker_inner(
+        broker,
+        phase_decision,
+        goal_id,
+        plan_id,
+        plan_revision,
+        task_id,
+        f,
+    )
 }
 
 fn check_phase_terminal_state(
@@ -931,7 +1069,45 @@ impl Orchestrator {
             repair_request_history.push(worker_request.clone());
             check_phase_terminal_state(&phase_decision)
                 .context("worker phase terminal state check failed")?;
-            let start_result = if let Some(broker) = phase_runtime.broker.as_ref() {
+            let (executor_broker_arc, executor_broker_identity) =
+                if let Some(factory) = phase_runtime.broker_factory.as_deref() {
+                    let identity = PhaseExecutionIdentity {
+                        execution_id: format!("executor_iter_{}", iteration),
+                        phase_session_id: format!("executor_iter_{}", iteration),
+                        backend: PhaseExecutionBackend::DeterministicRules,
+                        agent_id: None,
+                        provider_id: None,
+                        model_id: None,
+                        actual_session_id: None,
+                    };
+                    let broker = factory
+                        .create_broker(
+                            &phase_decision,
+                            &goal_id,
+                            &plan_graph.plan_id,
+                            plan_graph.revision,
+                            &worker_task_id,
+                            &identity,
+                        )
+                        .context("failed to create per-phase broker for executor")?;
+                    (Some(broker), Some(identity))
+                } else {
+                    (phase_runtime.broker.clone(), None)
+                };
+            let executor_broker: Option<&WorkerBroker> = executor_broker_arc.as_deref();
+            if let Some(broker) = executor_broker {
+                let phase_request = build_broker_phase_request(
+                    &phase_decision,
+                    &goal_id,
+                    &plan_graph.plan_id,
+                    plan_graph.revision,
+                    &worker_task_id,
+                )?;
+                broker
+                    .resolve(phase_request)
+                    .context("broker resolve failed for executor phase")?;
+            }
+            let start_result = if let Some(broker) = executor_broker {
                 let start_request = WorkerStartRequest {
                     store: &store,
                     workspace: &workspace,
@@ -989,6 +1165,14 @@ impl Orchestrator {
             let managed_worker_task_id = match start_result {
                 Ok(task_id) => task_id,
                 Err(error) => {
+                    if let Some(broker) = executor_broker {
+                        let _ = broker.cancel();
+                    }
+                    if let Some(ref identity) = executor_broker_identity {
+                        if let Some(ref factory) = phase_runtime.broker_factory {
+                            let _ = factory.remove_session(identity, &goal_id, &worker_task_id, plan_graph.revision);
+                        }
+                    }
                     stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
                     return Err(error)
                         .context("ownership: worker start failed, goal remains incomplete");
@@ -1011,6 +1195,9 @@ impl Orchestrator {
                         bail!("task manager mutex poisoned");
                     }
                 };
+                if let Some(broker) = executor_broker {
+                    let _ = broker.cancel();
+                }
                 stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
                 cancel_result?;
                 check_run_cancelled(options.cancellation_token.as_ref())?;
@@ -1028,6 +1215,9 @@ impl Orchestrator {
                             bail!("task manager mutex poisoned");
                         }
                     };
+                    if let Some(broker) = executor_broker {
+                        let _ = broker.cancel();
+                    }
                     stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
                     cancel_result?;
                     check_run_cancelled(options.cancellation_token.as_ref())?;
@@ -1049,6 +1239,20 @@ impl Orchestrator {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
+            if let Some(broker) = executor_broker {
+                if let Ok(state) = broker.current_state() {
+                    if state.lifecycle.name() == LifecycleStateName::Active {
+                        broker
+                            .wait_for_outcome()
+                            .context("broker wait_for_outcome failed for executor")?;
+                    }
+                }
+            }
+            if let Some(ref identity) = executor_broker_identity {
+                if let Some(ref factory) = phase_runtime.broker_factory {
+                    let _ = factory.remove_session(identity, &goal_id, &worker_task_id, plan_graph.revision);
+                }
+            }
             let worker_session_id = managed_worker_run.record.session_id.clone();
             let worker_task_record = managed_worker_run.record;
             let iteration_worker_outcome = managed_worker_run.outcome;
@@ -1413,7 +1617,7 @@ impl Orchestrator {
             let has_fallback = category_resolution_result.nearest_fallback().is_some();
             // Ownership decision was generated earlier in the iteration.
             // The immutable `ownership` is already in scope from line ~468.
-            let evaluation = evaluate_goal_with_review_target(
+            let mut evaluation = evaluate_goal_with_review_target(
                 verification_passed,
                 &worker_result
                     .as_ref()
@@ -1438,6 +1642,21 @@ impl Orchestrator {
                 reviewed_execution_id.as_deref(),
                 &worker_task_record.attempts,
             );
+            if evaluation.status == GoalStatus::Complete {
+                if let Some(receipt_failure) = verify_broker_receipts_for_goal(
+                    phase_runtime.broker.as_deref(),
+                    phase_runtime.broker_factory.as_deref(),
+                ) {
+                    evaluation = GoalEvaluation {
+                        status: GoalStatus::NeedsUser,
+                        should_continue: false,
+                        summary: format!(
+                            "Broker receipt gate blocked completion: {receipt_failure}"
+                        ),
+                        route_hint_override: None,
+                    };
+                }
+            }
             next_route_hint_override = evaluation.route_hint_override.clone();
             let review_path = store.write_artifact(
                 &goal_id,
@@ -1777,13 +1996,25 @@ fn build_approved_plan_graph(
         check_phase_terminal_state(&critic_decision)
             .context("plan critic phase terminal state check failed")?;
         let broker = phase_runtime.broker.as_deref();
+        let broker_factory = phase_runtime.broker_factory.as_deref();
+        let critic_identity = PhaseExecutionIdentity {
+            execution_id: format!("plan_critic:{}:{}", goal.id, plan.plan_id),
+            phase_session_id: format!("plan_critic:{}:{}", goal.id, plan.revision),
+            backend: PhaseExecutionBackend::DeterministicRules,
+            agent_id: None,
+            provider_id: None,
+            model_id: None,
+            actual_session_id: None,
+        };
         let submission = run_phase_via_broker(
             broker,
+            broker_factory,
             &critic_decision,
             &goal.id,
             &plan.plan_id,
             plan.revision,
             "plan_critic",
+            &critic_identity,
             || {
                 critic_hook(PlanCriticInput {
                     request: goal.request.clone(),
@@ -1862,6 +2093,12 @@ fn build_approved_plan_graph(
                 goal.status = GoalStatus::Planning;
                 goal.updated_at = timestamp();
                 store.write_goal(goal)?;
+                if let Some(receipt_failure) = verify_broker_receipts_for_goal(
+                    phase_runtime.broker.as_deref(),
+                    phase_runtime.broker_factory.as_deref(),
+                ) {
+                    bail!("Approval gate blocked by broker receipt failure: {receipt_failure}");
+                }
                 return Ok(plan);
             }
             PlanCriticDecision::Reject => {
@@ -1938,13 +2175,25 @@ fn build_approved_plan_graph(
                 )?;
                 check_run_cancelled(cancellation_token)?;
                 let broker = phase_runtime.broker.as_deref();
+                let broker_factory = phase_runtime.broker_factory.as_deref();
+                let revision_identity = PhaseExecutionIdentity {
+                    execution_id: format!("planner_revision:{}:{}:{}", goal.id, plan.plan_id, plan.revision),
+                    phase_session_id: format!("planner_revision:{}:{}", goal.id, plan.revision),
+                    backend: PhaseExecutionBackend::DeterministicRules,
+                    agent_id: None,
+                    provider_id: None,
+                    model_id: None,
+                    actual_session_id: None,
+                };
                 let revision = run_phase_via_broker(
                     broker,
+                    broker_factory,
                     &planner_decision,
                     &goal.id,
                     &plan.plan_id,
                     plan.revision,
                     "planner_revision",
+                    &revision_identity,
                     || {
                         revision_hook(PlanRevisionInput {
                             request: goal.request.clone(),
@@ -4620,7 +4869,50 @@ fn evaluate_goal_with_source(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+fn verify_broker_receipts_for_goal(
+    broker: Option<&WorkerBroker>,
+    broker_factory: Option<&PhaseBrokerFactory>,
+) -> Option<String> {
+    // When a broker factory is available, each phase creates its own
+    // independent broker. The shared broker may be unused (Discovered
+    // state), so skip the check — factory brokers manage their own
+    // lifecycle and receipt validation per-phase.
+    if broker_factory.is_some() {
+        return None;
+    }
+    let broker = broker?;
+    let lifecycle = match broker.lifecycle_state() {
+        Ok(state) => state,
+        Err(e) => return Some(format!("broker state check failed: {e}")),
+    };
+    match lifecycle {
+        LifecycleState::Terminal { ref outcome, .. } => {
+            if *outcome == BrokerOutcome::Failed {
+                return Some("broker session terminated with Failed outcome".to_string());
+            }
+            if *outcome == BrokerOutcome::Cancelled {
+                return Some("broker session terminated with Cancelled outcome".to_string());
+            }
+        }
+        LifecycleState::Active | LifecycleState::Resolved => {}
+        _ => return Some(format!("broker receipt state is {:?}", lifecycle.name())),
+    }
+    match broker.session_identity() {
+        Ok(identity) => {
+            let artifacts_root = broker.artifacts_root();
+            let session_dir = artifacts_root.join("broker-sessions").join(&identity.session_id);
+            if session_dir.exists() {
+                crate::worker_broker::validate_session_ledger(&session_dir)
+                    .map_err(|e| format!("broker receipt validation failed: {e}"))
+                    .err()
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 fn evaluate_goal_with_review_target(
     verification_passed: bool,
     worker_status: &WorkerStatus,
@@ -5289,6 +5581,7 @@ mod tests {
             require_plan_approval: true,
             max_plan_revisions: 2,
             broker: None,
+            broker_factory: None,
         }
     }
 
@@ -8929,6 +9222,7 @@ mod tests {
             require_plan_approval: true,
             max_plan_revisions: 2,
             broker: Some(broker.clone()),
+            broker_factory: None,
         };
 
         store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;

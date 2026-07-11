@@ -711,13 +711,12 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
         "At least one goal-id directory must exist under artifacts/"
     );
 
-    let broker_sessions_exists = goal_dirs
-        .iter()
-        .any(|e| e.path().join("broker-sessions").is_dir());
+    let broker_sessions_exists = gearbox_root.join("broker-sessions").is_dir();
 
     assert!(
         broker_sessions_exists,
-        "broker-sessions/ must exist under artifacts/<goal-id>/ — PhaseRuntime.broker is \
-         wired in send_gear_prompt and the orchestrator goes through broker lifecycle."
+        "broker-sessions/ must exist under .gearbox-agent/ — the PhaseBrokerFactory \
+         creates per-phase brokers in send_gear_prompt and the orchestrator goes \
+         through broker lifecycle."
     );
 }

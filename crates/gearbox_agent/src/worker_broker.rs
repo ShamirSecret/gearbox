@@ -2093,6 +2093,32 @@ impl PhaseBrokerFactory {
 
         Ok(broker)
     }
+
+    /// Remove a session from the active sessions list.
+    ///
+    /// Should be called after a phase completes (success or failure) so that
+    /// subsequent phase invocations can reuse the factory without hitting the
+    /// duplicate session guard.
+    pub fn remove_session(
+        &self,
+        execution_identity: &PhaseExecutionIdentity,
+        goal_id: &str,
+        task_id: &str,
+        plan_revision: usize,
+    ) -> Result<()> {
+        let session_key = format!(
+            "{}:{}:{}:{}",
+            execution_identity.execution_id,
+            goal_id,
+            task_id,
+            plan_revision,
+        );
+        let mut sessions = self.active_sessions.lock().map_err(|e| {
+            anyhow::anyhow!("PhaseBrokerFactory active_sessions lock poisoned: {e}")
+        })?;
+        sessions.retain(|s| s.session_key != session_key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
