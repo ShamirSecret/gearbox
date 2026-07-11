@@ -1204,6 +1204,7 @@ pub struct TaskManager {
     artifacts_root: Option<PathBuf>,
     finished_task_tx: Sender<FinishedTaskMessage>,
     finished_task_rx: Receiver<FinishedTaskMessage>,
+    lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 pub type SharedTaskManager = Arc<Mutex<TaskManager>>;
@@ -1301,12 +1302,29 @@ impl Default for TaskManager {
             artifacts_root: None,
             finished_task_tx,
             finished_task_rx,
+            lifecycle_events: None,
+        }
+    }
+}
+
+
+impl TaskManager {
+    pub fn set_lifecycle_event_log(&mut self, log: Option<Arc<Mutex<Vec<String>>>>) {
+        self.lifecycle_events = log;
+    }
+
+    fn record_event(&self, event: &str) {
+        if let Some(events) = &self.lifecycle_events {
+            if let Ok(mut guard) = events.lock() {
+                guard.push(event.to_string());
+            }
         }
     }
 }
 
 impl Drop for TaskManager {
     fn drop(&mut self) {
+        self.record_event("task_manager:drop");
         self.shutdown_resident_tasks("task_manager_drop");
     }
 }
@@ -3322,11 +3340,12 @@ impl TaskManager {
                 let result = running_task.handle.wait_for_idle()?;
                 Ok((outcome, result))
             })();
-            if let Err(error) = finished_task_tx.send(FinishedTaskMessage {
+            let send_result = finished_task_tx.send(FinishedTaskMessage {
                 task_id,
                 running_task,
                 run_result,
-            }) {
+            });
+            if let Err(error) = send_result {
                 eprintln!("failed to dispatch finished Gear worker task: {error}");
             }
         });

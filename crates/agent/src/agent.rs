@@ -236,6 +236,8 @@ struct Session {
     gear_task_manager_control: Option<TaskManagerControl>,
     gear_task_manager: Option<SharedTaskManager>,
     gear_task_manager_tick_loop: Option<TaskManagerTickLoop>,
+    #[cfg(test)]
+    gear_lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
     project_id: EntityId,
     pending_save: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
@@ -877,6 +879,8 @@ impl NativeAgent {
                 gear_task_manager_control: None,
                 gear_task_manager: None,
                 gear_task_manager_tick_loop: None,
+                #[cfg(test)]
+                gear_lifecycle_events: None,
                 project_id,
                 _subscriptions: subscriptions,
                 pending_save: Task::ready(Ok(())),
@@ -2713,6 +2717,14 @@ impl NativeAgentConnection {
             });
         }
 
+        #[cfg(test)]
+        let event_log = self
+            .agent
+            .read(cx)
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.gear_lifecycle_events.clone());
+
         let (native_worker_tx, native_worker_rx) =
             async_channel::unbounded::<GearZedWorkerDispatch>();
         let running_native_zed_sessions = Arc::new(Mutex::new(HashMap::default()));
@@ -2721,6 +2733,7 @@ impl NativeAgentConnection {
             session_id.clone(),
             native_worker_rx,
             running_native_zed_sessions.clone(),
+            #[cfg(test)] event_log.clone(),
             cx,
         );
 
@@ -2907,6 +2920,7 @@ impl NativeAgentConnection {
                 &cancellation_token,
                 &task_manager_control,
                 &task_manager,
+                #[cfg(test)] event_log,
                 cx,
             );
             drop(review_task);
@@ -2921,8 +2935,15 @@ fn clear_gear_cancellation_token(
     cancellation_token: &CancellationToken,
     task_manager_control: &TaskManagerControl,
     task_manager: &SharedTaskManager,
+    #[cfg(test)] lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
     cx: &mut AsyncApp,
 ) {
+    #[cfg(test)]
+    if let Some(events) = &lifecycle_events {
+        if let Ok(mut guard) = events.lock() {
+            guard.push("clear_gear_token:enter".to_string());
+        }
+    }
     agent.update(cx, |agent, _cx| {
         if let Some(session) = agent.sessions.get_mut(session_id) {
             let should_clear_token = session
@@ -5105,10 +5126,23 @@ fn spawn_gear_zed_worker_dispatcher(
     parent_session_id: acp::SessionId,
     native_worker_rx: async_channel::Receiver<GearZedWorkerDispatch>,
     running_native_zed_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>>,
+    #[cfg(test)] lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
     cx: &mut App,
 ) {
     cx.spawn(async move |cx| {
+        #[cfg(test)]
+        if let Some(events) = &lifecycle_events {
+            if let Ok(mut guard) = events.lock() {
+                guard.push("dispatcher:start".to_string());
+            }
+        }
         while let Ok(dispatch) = native_worker_rx.recv().await {
+            #[cfg(test)]
+            if let Some(events) = &lifecycle_events {
+                if let Ok(mut guard) = events.lock() {
+                    guard.push("dispatcher:receive".to_string());
+                }
+            }
             match dispatch {
                 GearZedWorkerDispatch::Run(job) => {
                     let agent = agent.clone();
@@ -5181,6 +5215,12 @@ fn spawn_gear_zed_worker_dispatcher(
                         thread.set_end_turn_at_next_boundary(enabled);
                     });
                 }
+            }
+        }
+        #[cfg(test)]
+        if let Some(events) = &lifecycle_events {
+            if let Ok(mut guard) = events.lock() {
+                guard.push("dispatcher:exit".to_string());
             }
         }
     })
@@ -6652,6 +6692,103 @@ mod internal_tests {
     }
 
     #[gpui::test]
+    async fn gearbox_native_worker_lifecycle(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("README.md"), "# Gear test\n").unwrap();
+        std::fs::write(
+            workspace.path().join("package.json"),
+            r#"{"scripts":{"build":"echo build-ok"}}"#,
+        )
+        .unwrap();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection::gear(agent));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[workspace.path()]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let events: Arc<Mutex<Vec<String>>> = Default::default();
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        connection.agent().update(cx, |connection_agent, _cx| {
+            if let Some(session) = connection_agent.sessions.get_mut(&session_id) {
+                session.gear_lifecycle_events = Some(events.clone());
+            }
+        });
+
+        let model = cx.update(|cx| {
+            LanguageModelRegistry::read_global(cx)
+                .default_model()
+                .map(|default_model| default_model.model)
+                .expect("default test model should be available")
+        });
+        let fake_model = model.as_fake();
+
+        let prompt_task = cx.update(|cx| {
+            acp_thread.update(cx, |thread, cx| {
+                thread.send(vec!["Build a tiny notes app MVP".into()], cx)
+            })
+        });
+        let prompt_task = cx.foreground_executor().spawn(prompt_task);
+        wait_for_fake_completion(fake_model, cx).await;
+        fake_model.send_last_completion_stream_text_chunk(
+            "Build a compact notes MVP, verify artifacts, and keep the scope small.",
+        );
+        fake_model.end_last_completion_stream();
+        // The prompt_task.await will succeed (orchestrator returns Ok)
+        // but the OS thread from dispatch_running_task will fail with
+        // "sending on a closed channel" (visible on stderr).
+        // This is the same regression as test_gear_prompt_runs_gearbox_orchestrator.
+        prompt_task.await.unwrap();
+        cx.run_until_parked();
+
+        // Record events before the final-report assertion so they are
+        // visible even when the test fails (same regression as
+        // test_gear_prompt_runs_gearbox_orchestrator).
+        let event_log = events.lock().expect("event log lock");
+        eprintln!("GEARBOX LIFECYCLE EVENTS: {event_log:?}");
+
+        // Same regression: OS thread fails to send on closed channel.
+        let gearbox_root = workspace.path().join(".gearbox-agent");
+        let _final_report = std::fs::read_dir(gearbox_root.join("artifacts"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join("final-report.md"))
+            .find(|path| path.exists())
+            .expect(
+                "Gear should write a final report artifact — the 'sending on a closed channel' \
+                 regression prevents this; remove this assertion when the race is fixed (005-002)",
+            );
+
+        // Verify lifecycle events from the GPUI foreground executor.
+        // Background thread events (tick, dispatch_running_task,
+        // TaskManager::Drop) are NOT recorded because the GPUI test
+        // scheduler forbids cross-thread Arc operations.
+        assert_eq!(
+            event_log.first().map(|s| s.as_str()),
+            Some("dispatcher:start"),
+            "First event should be dispatcher:start"
+        );
+        assert!(
+            event_log.contains(&"dispatcher:receive".to_string()),
+            "dispatcher:receive should appear in the event log"
+        );
+    }
+
+    #[gpui::test]
     async fn test_native_zed_worker_reuses_session_for_follow_up_and_steer(
         cx: &mut TestAppContext,
     ) {
@@ -6703,6 +6840,7 @@ mod internal_tests {
                 parent_session_id,
                 native_worker_rx,
                 Arc::new(Mutex::new(HashMap::default())),
+                #[cfg(test)] None,
                 cx,
             );
         });
