@@ -1445,11 +1445,13 @@ impl WorkerBroker {
     /// Requires that `resolve()` was called first with a `BrokerPhaseRequest`.
     pub fn start_via_broker(
         &self,
-        request: crate::workers::WorkerStartRequest<'_>,
+        _request: crate::workers::WorkerStartRequest<'_>,
     ) -> Result<Arc<dyn WorkerSessionHandle>> {
-        // Delegate to the registry, which will route through this broker
-        // when configured (the registry stores a reference to this broker).
-        self.registry.start(request)
+        // Lifecycle preparation only — the actual worker is started by the
+        // orchestrator via task_manager.start() immediately after this call.
+        // We return a no-op handle whose only function is to satisfy the
+        // Result type; the handle is discarded by the caller.
+        Ok(Arc::new(NoopWorkerSessionHandle))
     }
 
     // ── Ledger helpers ───────────────────────────────────────────────────
@@ -1850,6 +1852,40 @@ pub fn validate_session_ledger(session_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// A no-op session handle returned by `WorkerBroker::start_via_broker`.
+///
+/// The handle is discarded by the orchestrator, which separately starts the
+/// actual worker via `task_manager.start()`. All interaction methods return
+/// an error to make misuse obvious at runtime.
+struct NoopWorkerSessionHandle;
+
+impl WorkerSessionHandle for NoopWorkerSessionHandle {
+    fn session_id(&self) -> Option<String> {
+        None
+    }
+    fn send_follow_up(&self, _prompt: String) -> Result<()> {
+        bail!("NoopWorkerSessionHandle does not support follow-up");
+    }
+    fn steer(&self, _prompt: String) -> Result<()> {
+        bail!("NoopWorkerSessionHandle does not support steering");
+    }
+    fn interrupt(&self) -> Result<()> {
+        bail!("NoopWorkerSessionHandle does not support interrupt");
+    }
+    fn cancel(&self) -> Result<()> {
+        Ok(())
+    }
+    fn wait_for_outcome(&self) -> Result<crate::workers::WorkerOutcome> {
+        bail!("NoopWorkerSessionHandle does not support outcome waiting");
+    }
+    fn wait_for_result(&self) -> Result<crate::workers::WorkerResult> {
+        bail!("NoopWorkerSessionHandle does not support result waiting");
+    }
+    fn last_output(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ pub use gearbox_agent::task_manager::{
 pub use gearbox_agent::worker_broker::{
     BrokerCapability, BrokerLifecycleReceipt, BrokerOutcome, BrokerPermissionEvidence,
     BrokerPermissionType, BrokerPhaseRequest, BrokerSessionIdentity, ModelAvailability,
-    UnavailableReason,
+    PhaseBrokerFactory, UnavailableReason, WorkerBroker,
 };
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
@@ -60,7 +60,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
 use gearbox_agent::phase_routing::{
-    LiveModelInventory, ModelSelectorId, PhaseBackend, PhaseRouteCandidate, PhaseRouteSource,
+    LiveModelInventory, ModelSelectorId, PhaseRouteCandidate, PhaseRouteSource,
     PhaseRouteTable,
 };
 use gearbox_agent::plan_graph::PhaseProfile;
@@ -2291,7 +2291,7 @@ impl NativeAgentConnection {
         };
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
             return Ok(ActionOutcome::Noop(OutcomeContext {
-                task_id: Some(task_id.clone()),
+                task_id: Some(task_id),
                 ..OutcomeContext::default()
             }));
         };
@@ -2316,7 +2316,7 @@ impl NativeAgentConnection {
         };
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
             return Ok(ActionOutcome::Noop(OutcomeContext {
-                task_id: Some(task_id.clone()),
+                task_id: Some(task_id),
                 ..OutcomeContext::default()
             }));
         };
@@ -2765,17 +2765,44 @@ impl NativeAgentConnection {
             self.agent.downgrade(),
             session_id.clone(),
             native_worker_rx,
-            running_native_zed_sessions.clone(),
+            running_native_zed_sessions,
             #[cfg(test)]
             event_log.clone(),
             cx,
         );
 
+        let (acp_broker_tx, acp_broker_rx) =
+            async_channel::unbounded::<GearAcpBrokerDispatch>();
+        let running_acp_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>> =
+            Arc::new(Mutex::new(HashMap::default()));
+        spawn_gear_acp_broker_dispatcher(
+            self.agent.downgrade(),
+            session_id.clone(),
+            acp_broker_rx,
+            running_acp_sessions,
+            cx,
+        );
+
+        let native_backend: Arc<dyn NativeWorkerBackend> =
+            Arc::new(GearZedWorkerBackend::new(native_worker_tx));
+        let broker_registry =
+            Arc::new(WorkerRegistry::with_native_backend(native_backend.clone()));
+        let broker = Arc::new(WorkerBroker::new(
+            broker_registry.clone(),
+            workspace.join(".gearbox-agent").join("artifacts"),
+        ));
+        let _acp_broker_backend: Arc<dyn NativeWorkerBackend> =
+            Arc::new(GearAcpBrokerBackend::new(acp_broker_tx));
+        let _broker_factory = Arc::new(PhaseBrokerFactory::new(
+            broker_registry,
+            workspace.join(".gearbox-agent"),
+        ));
+        let task_registry = WorkerRegistry::with_native_backend(native_backend)
+            .with_broker(broker.clone());
+
         let mut task_manager = TaskManager::with_control(task_manager_control.clone());
         task_manager.set_session_scope(session_id.to_string());
-        task_manager.set_worker_registry(WorkerRegistry::with_native_backend(Arc::new(
-            GearZedWorkerBackend::new(native_worker_tx),
-        )));
+        task_manager.set_worker_registry(task_registry);
         let task_manager = task_manager.into_shared();
         let task_manager_tick_loop =
             TaskManagerTickLoop::start(task_manager.clone(), std::time::Duration::from_millis(50));
@@ -2797,6 +2824,7 @@ impl NativeAgentConnection {
 
         let agent = self.agent.clone();
         let cancellation_session_id = session_id.clone();
+        let run_broker = broker;
         cx.spawn(async move |cx| {
             let review_language_model = phase_models.critic_model.clone();
             let review_workspace = workspace.clone();
@@ -2925,7 +2953,7 @@ impl NativeAgentConnection {
                 plan_revision_hook: Some(plan_revision_hook),
                 require_plan_approval: true,
                 max_plan_revisions: gear_max_plan_revisions_from_env(),
-                broker: None,
+                broker: Some(run_broker),
             };
             let continuation_session_id = cancellation_session_id.to_string();
             let run_task = cx.background_spawn(smol::unblock(move || {
@@ -3220,12 +3248,6 @@ fn resolve_phase_language_model(
     current_language_model: Option<&Arc<dyn LanguageModel>>,
     models: &LanguageModels,
 ) -> Result<Arc<dyn LanguageModel>> {
-    if decision.candidate.backend != PhaseBackend::DirectModel {
-        anyhow::bail!(
-            "phase {:?} currently requires the trusted direct-model backend; configure ACP/native planning in a later broker stage",
-            decision.phase
-        );
-    }
     let requested = decision
         .requested_model
         .as_ref()
@@ -6031,7 +6053,6 @@ fn build_native_zed_worker_result(
 // ── ACP Broker Backend ──────────────────────────────────────────────────────
 
 /// Typed channel dispatch for the ACP broker foreground dispatcher.
-#[allow(dead_code)]
 enum GearAcpBrokerDispatch {
     /// Start a new ACP broker worker session.
     Run(GearAcpBrokerJob),
@@ -6042,7 +6063,6 @@ enum GearAcpBrokerDispatch {
 }
 
 /// Job passed through the channel to start an ACP broker worker session.
-#[allow(dead_code)]
 struct GearAcpBrokerJob {
     store: gearbox_agent::state::StateStore,
     task_id: String,

@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{CoordinatorModel, Scope, StateStore, Task, TaskInputs, write_json};
 use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation};
-use crate::worker_broker::{BrokerCapability, BrokerSessionIdentity, WorkerBroker, broker_capabilities_for_kind};
+use crate::worker_broker::{
+    BrokerCapability, BrokerSessionIdentity, LifecycleStateName, WorkerBroker,
+    broker_capabilities_for_kind,
+};
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -1643,10 +1646,13 @@ impl WorkerRegistry {
         let handle = self.start_direct(worker_kind, request)?;
 
         if let Some(broker) = &self.broker {
-            // Only wrap through broker if it has a resolved/active state
-            // (indicating the caller called broker.resolve() first).
+            // Only wrap through broker when it is in Resolved state
+            // (indicating the caller called broker.resolve() first but
+            // has not yet called start()). Once started the broker is
+            // Active and subsequent worker dispatches use the registry
+            // directly to avoid illegal state transitions.
             let state = broker.current_state().ok();
-            if state.map_or(false, |s| !s.lifecycle.is_terminal()) {
+            if state.map_or(false, |s| s.lifecycle.name() == LifecycleStateName::Resolved) {
                 let identity = BrokerSessionIdentity {
                     backend_kind: worker_kind,
                     session_id: handle

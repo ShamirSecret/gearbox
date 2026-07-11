@@ -717,13 +717,7 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
 
     assert!(
         broker_sessions_exists,
-        "FAILS NOW — broker-sessions/ does not exist in any goal directory under artifacts/. \
-         This proves PhaseRuntime.broker is None in send_gear_prompt. \
-         \
-         After GBX-007-003/004 wiring (broker factory + ACP production registration), \
-         broker-sessions/ WILL be created and this assertion PASSES. \
-         \
-         Current code path: send_gear_prompt → PhaseRuntime {{ broker: None, ... }} → \
-         run_phase_via_broker(None, ...) → immediate `else` return → no broker artifacts."
+        "broker-sessions/ must exist under artifacts/<goal-id>/ — PhaseRuntime.broker is \
+         wired in send_gear_prompt and the orchestrator goes through broker lifecycle."
     );
 }
