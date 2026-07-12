@@ -27,8 +27,8 @@ use crate::plan_review::{
 use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalEpochEventKind,
-    GoalStatus, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind,
-    TaskOutputs, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
+    GoalRunLeaseGuard, GoalStatus, Scope, Session, SettledBudgetUsage, StateStore, Task,
+    TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -717,7 +717,7 @@ impl Orchestrator {
             current_model.validate()?;
         }
         let phase_routes_path = store.write_phase_route_table(&goal_id, &phase_runtime.routes)?;
-        let plan_graph = build_approved_plan_graph(
+        let plan_graph = build_approved_plan_graph_with_budget(
             &mut goal,
             &scope,
             &detection.verification_commands,
@@ -727,6 +727,8 @@ impl Orchestrator {
             &options.event_sink,
             options.cancellation_token.as_ref(),
             &phase_runtime,
+            &goal_run_lease,
+            &epoch_id,
         )?;
         let plan_graph_path = if phase_runtime.require_plan_approval {
             store.write_plan_graph(&plan_graph)?
@@ -1012,6 +1014,7 @@ impl Orchestrator {
                 &goal_run_lease,
                 &budget_reservation_id,
                 "worker",
+                true,
                 selected_route.worker_kind.is_premium(),
                 &goal.budget,
             ) {
@@ -1753,7 +1756,18 @@ impl Orchestrator {
                     comment_violations.join(", ")
                 ));
             }
-            let coordinator_review = run_coordinator_review(
+            let coordinator_review_budget_key = format!("coordinator-review.{iteration}");
+            let coordinator_review_budget = if options.coordinator_review_hook.is_some() {
+                reserve_planning_phase_budget(
+                    &mut goal,
+                    &store,
+                    Some((&goal_run_lease, &epoch_id)),
+                    &coordinator_review_budget_key,
+                )?
+            } else {
+                None
+            };
+            let coordinator_review_result = run_coordinator_review(
                 &store,
                 &options.event_sink,
                 &options.coordinator_review_hook,
@@ -1777,7 +1791,15 @@ impl Orchestrator {
                 &scope_check,
                 &before_diff,
                 &after_diff,
+            );
+            settle_planning_phase_budget(
+                &goal,
+                &store,
+                Some((&goal_run_lease, &epoch_id)),
+                coordinator_review_budget.as_deref(),
+                &coordinator_review_budget_key,
             )?;
+            let coordinator_review = coordinator_review_result?;
             last_coordinator_review = coordinator_review.clone();
             let coordinator_review = coordinator_review.as_ref();
             let mut context_risk_signals = detect_context_risk_signals(collect_context_risk_texts(
@@ -2076,6 +2098,92 @@ impl Orchestrator {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn reserve_planning_phase_budget(
+    goal: &mut Goal,
+    store: &StateStore,
+    budget_context: Option<(&GoalRunLeaseGuard, &str)>,
+    phase_key: &str,
+) -> Result<Option<String>> {
+    let Some((lease, epoch_id)) = budget_context else {
+        return Ok(None);
+    };
+    let reservation_id = format!("{epoch_id}.{phase_key}");
+    if let Err(error) = store.reserve_budget_call(
+        lease,
+        &reservation_id,
+        phase_key,
+        false,
+        false,
+        &goal.budget,
+    ) {
+        goal.status = GoalStatus::Limited;
+        goal.summary = format!("Planning phase budget reservation failed: {error}");
+        goal.updated_at = timestamp();
+        store.write_goal(goal)?;
+        store.append_goal_epoch_event(
+            &goal.id,
+            epoch_id,
+            &format!("{reservation_id}.aborted"),
+            GoalEpochEventKind::Aborted,
+            json!({
+                "phase": phase_key,
+                "reason": error.to_string(),
+            }),
+        )?;
+        bail!("{}", goal.summary);
+    }
+    store.append_goal_epoch_event(
+        &goal.id,
+        epoch_id,
+        &format!("{reservation_id}.reserved"),
+        GoalEpochEventKind::BudgetReserved,
+        json!({
+            "reservation_id": reservation_id,
+            "phase": phase_key,
+            "worker_call": false,
+            "premium": false,
+            "reserved_tokens": goal.budget.max_tokens_per_call,
+        }),
+    )?;
+    Ok(Some(reservation_id))
+}
+
+fn settle_planning_phase_budget(
+    goal: &Goal,
+    store: &StateStore,
+    budget_context: Option<(&GoalRunLeaseGuard, &str)>,
+    reservation_id: Option<&str>,
+    phase_key: &str,
+) -> Result<()> {
+    let (Some((lease, epoch_id)), Some(reservation_id)) = (budget_context, reservation_id) else {
+        return Ok(());
+    };
+    let settlement = store.settle_budget_call(
+        lease,
+        reservation_id,
+        SettledBudgetUsage {
+            requested_tokens: None,
+            actual_tokens: None,
+            cost_micros: None,
+            duration_ms: None,
+            cache_hit: None,
+            unavailable_reason: Some(format!("{phase_key} hook does not expose provider usage")),
+        },
+    )?;
+    store.append_goal_epoch_event(
+        &goal.id,
+        epoch_id,
+        &format!("{reservation_id}.settled"),
+        GoalEpochEventKind::BudgetSettled,
+        json!({
+            "reservation_id": reservation_id,
+            "phase": phase_key,
+            "usage": settlement.usage,
+        }),
+    )?;
+    Ok(())
+}
+
 fn build_approved_plan_graph(
     goal: &mut Goal,
     scope: &Scope,
@@ -2086,6 +2194,59 @@ fn build_approved_plan_graph(
     event_sink: &Option<EventSink>,
     cancellation_token: Option<&CancellationToken>,
     phase_runtime: &PhaseRuntime,
+) -> Result<PlanGraph> {
+    build_approved_plan_graph_inner(
+        goal,
+        scope,
+        verification_commands,
+        workspace,
+        store,
+        session_id,
+        event_sink,
+        cancellation_token,
+        phase_runtime,
+        None,
+    )
+}
+
+fn build_approved_plan_graph_with_budget(
+    goal: &mut Goal,
+    scope: &Scope,
+    verification_commands: &[String],
+    workspace: &std::path::Path,
+    store: &StateStore,
+    session_id: &str,
+    event_sink: &Option<EventSink>,
+    cancellation_token: Option<&CancellationToken>,
+    phase_runtime: &PhaseRuntime,
+    lease: &GoalRunLeaseGuard,
+    epoch_id: &str,
+) -> Result<PlanGraph> {
+    build_approved_plan_graph_inner(
+        goal,
+        scope,
+        verification_commands,
+        workspace,
+        store,
+        session_id,
+        event_sink,
+        cancellation_token,
+        phase_runtime,
+        Some((lease, epoch_id)),
+    )
+}
+
+fn build_approved_plan_graph_inner(
+    goal: &mut Goal,
+    scope: &Scope,
+    verification_commands: &[String],
+    workspace: &std::path::Path,
+    store: &StateStore,
+    session_id: &str,
+    event_sink: &Option<EventSink>,
+    cancellation_token: Option<&CancellationToken>,
+    phase_runtime: &PhaseRuntime,
+    budget_context: Option<(&GoalRunLeaseGuard, &str)>,
 ) -> Result<PlanGraph> {
     if !phase_runtime.require_plan_approval
         && phase_runtime.planner_hook.is_none()
@@ -2103,13 +2264,23 @@ fn build_approved_plan_graph(
             )?;
             check_phase_terminal_state(&decision)
                 .context("intent fold phase terminal state check failed")?;
-            let submission = intent_fold_hook(IntentFoldInput {
+            let budget_reservation =
+                reserve_planning_phase_budget(goal, store, budget_context, "intent-fold")?;
+            let submission_result = intent_fold_hook(IntentFoldInput {
                 goal_id: goal.id.clone(),
                 request: goal.request.clone(),
                 scope: scope.clone(),
                 route_decision: decision.clone(),
             })
-            .context("IntentFold hook failed before planning")?;
+            .context("IntentFold hook failed before planning");
+            settle_planning_phase_budget(
+                goal,
+                store,
+                budget_context,
+                budget_reservation.as_deref(),
+                "intent-fold",
+            )?;
+            let submission = submission_result?;
             let parsed = IntentFoldVerdict::parse(&submission.raw_output)?;
             if parsed != submission.verdict {
                 bail!("IntentFold raw output does not match its typed verdict");
@@ -2152,7 +2323,9 @@ fn build_approved_plan_graph(
             )?;
             check_phase_terminal_state(&planner_decision)
                 .context("planner phase terminal state check failed")?;
-            let submission = planner_hook(PlannerInput {
+            let budget_reservation =
+                reserve_planning_phase_budget(goal, store, budget_context, "planner")?;
+            let submission_result = planner_hook(PlannerInput {
                 goal_id: goal.id.clone(),
                 request: goal.request.clone(),
                 scope: scope.clone(),
@@ -2160,7 +2333,15 @@ fn build_approved_plan_graph(
                 route_decision: planner_decision.clone(),
                 intent_fold: intent_fold_receipt.clone(),
             })
-            .context("planner hook failed before plan construction")?;
+            .context("planner hook failed before plan construction");
+            settle_planning_phase_budget(
+                goal,
+                store,
+                budget_context,
+                budget_reservation.as_deref(),
+                "planner",
+            )?;
+            let submission = submission_result?;
             let parsed = parse_planner_draft(&submission.raw_output)
                 .context("planner hook raw output is not a PlanGraphDraft")?;
             if parsed != submission.draft {
@@ -2353,7 +2534,10 @@ fn build_approved_plan_graph(
             model_id: None,
             actual_session_id: None,
         };
-        let submission = run_phase_via_broker(
+        let critic_budget_key = format!("plan-critic.{}", plan.revision);
+        let budget_reservation =
+            reserve_planning_phase_budget(goal, store, budget_context, &critic_budget_key)?;
+        let submission_result = run_phase_via_broker(
             broker,
             broker_factory,
             &critic_decision,
@@ -2372,7 +2556,15 @@ fn build_approved_plan_graph(
                 })
                 .context("PlanCritic hook failed before plan approval")
             },
+        );
+        settle_planning_phase_budget(
+            goal,
+            store,
+            budget_context,
+            budget_reservation.as_deref(),
+            &critic_budget_key,
         )?;
+        let submission = submission_result?;
         check_run_cancelled(cancellation_token)?;
         validate_phase_execution_identity(&critic_decision, &submission.reviewer)?;
         if seen_phase_identities
@@ -2540,7 +2732,14 @@ fn build_approved_plan_graph(
                     model_id: None,
                     actual_session_id: None,
                 };
-                let revision = run_phase_via_broker(
+                let revision_budget_key = format!("planner-revision.{}", plan.revision);
+                let budget_reservation = reserve_planning_phase_budget(
+                    goal,
+                    store,
+                    budget_context,
+                    &revision_budget_key,
+                )?;
+                let revision_result = run_phase_via_broker(
                     broker,
                     broker_factory,
                     &planner_decision,
@@ -2559,7 +2758,15 @@ fn build_approved_plan_graph(
                         })
                         .context("planner revision hook failed")
                     },
+                );
+                settle_planning_phase_budget(
+                    goal,
+                    store,
+                    budget_context,
+                    budget_reservation.as_deref(),
+                    &revision_budget_key,
                 )?;
+                let revision = revision_result?;
                 check_run_cancelled(cancellation_token)?;
                 if seen_phase_identities
                     .iter()
@@ -6156,8 +6363,22 @@ mod tests {
             broker: None,
             broker_factory: None,
         };
+        let epoch_id = "epoch-planner-test";
+        let lease = store.acquire_goal_run_lease(
+            &goal.id,
+            epoch_id,
+            "session-opencode-planner",
+            Duration::from_secs(60),
+        )?;
+        store.append_goal_epoch_event(
+            &goal.id,
+            epoch_id,
+            &format!("{epoch_id}.started"),
+            GoalEpochEventKind::Started,
+            json!({ "session_id": "session-opencode-planner" }),
+        )?;
 
-        let plan = build_approved_plan_graph(
+        let plan = build_approved_plan_graph_with_budget(
             &mut goal,
             &scope,
             &["echo verify".to_string()],
@@ -6167,6 +6388,8 @@ mod tests {
             &None,
             None,
             &phase_runtime,
+            &lease,
+            epoch_id,
         )?;
 
         assert_eq!(plan.draft, draft);
@@ -6177,7 +6400,16 @@ mod tests {
                 .and_then(|receipt| receipt.session_id.as_deref()),
             Some("opencode_planner_session")
         );
+        let budget_ledger = store.read_goal_budget_ledger(&goal.id)?;
+        assert_eq!(budget_ledger.reservations.len(), 1);
+        assert_eq!(budget_ledger.reservations[0].phase, "planner");
+        assert!(!budget_ledger.reservations[0].worker_call);
+        assert_eq!(
+            budget_ledger.reservations[0].status,
+            crate::state::BudgetReservationStatus::Settled
+        );
         assert!(goal.coordinator_brief.is_some());
+        lease.release()?;
         Ok(())
     }
 

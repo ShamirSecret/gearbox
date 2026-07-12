@@ -145,6 +145,8 @@ pub struct Goal {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Budget {
+    #[serde(default = "default_max_calls_per_epoch")]
+    pub max_calls_per_epoch: usize,
     pub max_worker_calls: usize,
     pub max_premium_worker_calls: usize,
     pub max_repair_attempts_per_error: usize,
@@ -167,6 +169,7 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
+            max_calls_per_epoch: default_max_calls_per_epoch(),
             max_worker_calls: 8,
             max_premium_worker_calls: 8,
             max_repair_attempts_per_error: 2,
@@ -179,6 +182,10 @@ impl Default for Budget {
             max_usage_unknown_calls: default_max_usage_unknown_calls(),
         }
     }
+}
+
+fn default_max_calls_per_epoch() -> usize {
+    32
 }
 
 fn default_max_provider_unknown_streak() -> usize {
@@ -198,7 +205,7 @@ fn default_max_tokens_per_call() -> u64 {
 }
 
 fn default_max_tokens_per_epoch() -> u64 {
-    1_000_000
+    4_096_000
 }
 
 fn default_max_cost_micros_per_epoch() -> u64 {
@@ -206,7 +213,7 @@ fn default_max_cost_micros_per_epoch() -> u64 {
 }
 
 fn default_max_usage_unknown_calls() -> usize {
-    8
+    32
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +439,7 @@ pub struct BudgetReservation {
     pub goal_id: String,
     pub epoch_id: String,
     pub phase: String,
+    pub worker_call: bool,
     pub premium: bool,
     pub reserved_tokens: u64,
     pub reserved_cost_micros: u64,
@@ -1386,6 +1394,7 @@ impl StateStore {
         lease: &GoalRunLeaseGuard,
         reservation_id: &str,
         phase: &str,
+        worker_call: bool,
         premium: bool,
         budget: &Budget,
     ) -> Result<BudgetReservation> {
@@ -1405,7 +1414,7 @@ impl StateStore {
         let goal_id = lease.lease.goal_id.as_str();
         let epoch_id = lease.lease.epoch_id.as_str();
         let mut ledger = self.read_goal_budget_ledger(goal_id)?;
-        let (calls, premium_calls, tokens, cost, unknown_calls) =
+        let (calls, worker_calls, premium_calls, tokens, cost, unknown_calls) =
             budget_ledger_totals(&ledger, epoch_id);
         if let Some(existing) = ledger
             .reservations
@@ -1414,13 +1423,17 @@ impl StateStore {
         {
             if existing.epoch_id == epoch_id
                 && existing.phase == phase
+                && existing.worker_call == worker_call
                 && existing.premium == premium
             {
                 return Ok(existing.clone());
             }
             bail!("budget reservation id conflicts with an existing reservation");
         }
-        if calls >= budget.max_worker_calls {
+        if calls >= budget.max_calls_per_epoch {
+            bail!("epoch call budget exhausted before reservation");
+        }
+        if worker_call && worker_calls >= budget.max_worker_calls {
             bail!("worker call budget exhausted before reservation");
         }
         if premium && premium_calls >= budget.max_premium_worker_calls {
@@ -1441,6 +1454,7 @@ impl StateStore {
             goal_id: goal_id.to_string(),
             epoch_id: epoch_id.to_string(),
             phase: phase.to_string(),
+            worker_call,
             premium,
             reserved_tokens: budget.max_tokens_per_call,
             reserved_cost_micros,
@@ -1677,8 +1691,9 @@ impl StateStore {
 fn budget_ledger_totals(
     ledger: &GoalBudgetLedger,
     epoch_id: &str,
-) -> (usize, usize, u64, u64, usize) {
+) -> (usize, usize, usize, u64, u64, usize) {
     let mut calls = 0usize;
+    let mut worker_calls = 0usize;
     let mut premium_calls = 0usize;
     let mut tokens = 0u64;
     let mut cost = 0u64;
@@ -1687,6 +1702,7 @@ fn budget_ledger_totals(
         reservation.epoch_id == epoch_id && reservation.status != BudgetReservationStatus::Released
     }) {
         calls = calls.saturating_add(1);
+        worker_calls = worker_calls.saturating_add(usize::from(reservation.worker_call));
         premium_calls = premium_calls.saturating_add(usize::from(reservation.premium));
         match reservation.usage.as_ref() {
             Some(usage) => {
@@ -1705,7 +1721,14 @@ fn budget_ledger_totals(
             }
         }
     }
-    (calls, premium_calls, tokens, cost, unknown_calls)
+    (
+        calls,
+        worker_calls,
+        premium_calls,
+        tokens,
+        cost,
+        unknown_calls,
+    )
 }
 
 fn validate_goal_epoch_transition(
@@ -1923,11 +1946,11 @@ mod epoch_tests {
         )?;
 
         let first =
-            store.reserve_budget_call(&lease, "epoch-1.worker.1", "worker", true, &budget)?;
+            store.reserve_budget_call(&lease, "epoch-1.worker.1", "worker", true, true, &budget)?;
         assert_eq!(first.reserved_tokens, 60);
         assert_eq!(first.reserved_cost_micros, 100);
         let replay =
-            store.reserve_budget_call(&lease, "epoch-1.worker.1", "worker", true, &budget)?;
+            store.reserve_budget_call(&lease, "epoch-1.worker.1", "worker", true, true, &budget)?;
         assert_eq!(replay, first);
         store.settle_budget_call(
             &lease,
@@ -1942,8 +1965,14 @@ mod epoch_tests {
             },
         )?;
 
-        let second =
-            store.reserve_budget_call(&lease, "epoch-1.worker.2", "worker", false, &budget)?;
+        let second = store.reserve_budget_call(
+            &lease,
+            "epoch-1.worker.2",
+            "worker",
+            true,
+            false,
+            &budget,
+        )?;
         assert_eq!(second.reserved_cost_micros, 70);
         store.settle_budget_call(
             &lease,
@@ -1959,7 +1988,7 @@ mod epoch_tests {
         )?;
         assert!(
             store
-                .reserve_budget_call(&lease, "epoch-1.worker.3", "worker", false, &budget,)
+                .reserve_budget_call(&lease, "epoch-1.worker.3", "worker", true, false, &budget,)
                 .is_err()
         );
         let ledger_path = store.goal_budget_ledger_path("goal-1");
@@ -1969,6 +1998,57 @@ mod epoch_tests {
             ledger_contents.replace("\"cost_micros\": 30", "\"cost_micros\": 31"),
         )?;
         assert!(store.read_goal_budget_ledger("goal-1").is_err());
+        lease.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn epoch_call_budget_does_not_consume_worker_call_budget() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let lease = store.acquire_goal_run_lease(
+            "goal-2",
+            "epoch-2",
+            "session-2",
+            std::time::Duration::from_secs(60),
+        )?;
+        let budget = Budget {
+            max_calls_per_epoch: 2,
+            max_worker_calls: 0,
+            max_tokens_per_call: 1,
+            max_tokens_per_epoch: 4,
+            max_usage_unknown_calls: 4,
+            ..Budget::default()
+        };
+        for phase in ["planner", "plan-critic"] {
+            let reservation_id = format!("epoch-2.{phase}");
+            store.reserve_budget_call(&lease, &reservation_id, phase, false, false, &budget)?;
+            store.settle_budget_call(
+                &lease,
+                &reservation_id,
+                SettledBudgetUsage {
+                    requested_tokens: Some(1),
+                    actual_tokens: Some(0),
+                    cost_micros: Some(0),
+                    duration_ms: Some(1),
+                    cache_hit: Some(false),
+                    unavailable_reason: None,
+                },
+            )?;
+        }
+        assert!(
+            store
+                .reserve_budget_call(
+                    &lease,
+                    "epoch-2.reviewer",
+                    "reviewer",
+                    false,
+                    false,
+                    &budget,
+                )
+                .is_err()
+        );
         lease.release()?;
         Ok(())
     }

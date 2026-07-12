@@ -4701,15 +4701,16 @@ fn gear_max_runtime_minutes_from_env() -> usize {
 
 fn gear_budget_from_env() -> Budget {
     Budget {
+        max_calls_per_epoch: gear_usize_from_env("GEARBOX_GEAR_MAX_CALLS_PER_EPOCH", 32),
         max_worker_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_WORKER_CALLS", 8),
         max_premium_worker_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_PREMIUM_WORKER_CALLS", 8),
         max_tokens_per_call: gear_u64_from_env("GEARBOX_GEAR_MAX_TOKENS_PER_CALL", 128_000),
-        max_tokens_per_epoch: gear_u64_from_env("GEARBOX_GEAR_MAX_TOKENS_PER_EPOCH", 1_000_000),
+        max_tokens_per_epoch: gear_u64_from_env("GEARBOX_GEAR_MAX_TOKENS_PER_EPOCH", 4_096_000),
         max_cost_micros_per_epoch: gear_u64_from_env(
             "GEARBOX_GEAR_MAX_COST_MICROS_PER_EPOCH",
             u64::MAX,
         ),
-        max_usage_unknown_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_USAGE_UNKNOWN_CALLS", 8),
+        max_usage_unknown_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_USAGE_UNKNOWN_CALLS", 32),
         max_runtime_minutes: gear_max_runtime_minutes_from_env(),
         ..Budget::default()
     }
