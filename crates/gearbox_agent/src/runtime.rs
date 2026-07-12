@@ -223,8 +223,10 @@ pub struct StrategistNextGoalVerdict {
 
 impl StrategistNextGoalVerdict {
     pub fn parse(raw_output: &str) -> Result<Self> {
-        serde_json::from_str(raw_output.trim())
-            .context("strategist did not return one strict next-goal JSON object")
+        crate::plan_review::parse_json_object(
+            raw_output,
+            "strategist did not return one strict next-goal JSON object",
+        )
     }
 
     pub fn validate(&self, goal_id: &str, epoch_id: &str, status: &GoalStatus) -> Result<()> {

@@ -743,6 +743,7 @@ pub fn parse_planner_draft_diagnostic(
     } else {
         trimmed
     };
+    let json = json.find('{').map(|index| &json[index..]).unwrap_or(json);
     let mut hasher = Sha256::new();
     hasher.update(output.as_bytes());
     let raw_sha256 = format!("{:x}", hasher.finalize());
@@ -768,6 +769,21 @@ pub fn parse_planner_draft_diagnostic(
             })
         }
     }
+}
+
+pub fn validate_planner_draft(goal_id: &str, draft: &PlanGraphDraft) -> Result<()> {
+    PlanGraph::seal(
+        goal_id,
+        1,
+        PlanSource::PlannerModel,
+        Some(PlannerReceipt {
+            provider_id: "planner-validation".to_string(),
+            model_id: "planner-validation".to_string(),
+            session_id: None,
+        }),
+        draft.clone(),
+    )?;
+    Ok(())
 }
 
 fn validate_acyclic(tasks: &[PlanTaskContract]) -> Result<()> {

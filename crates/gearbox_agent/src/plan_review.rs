@@ -1,5 +1,6 @@
 use crate::plan_graph::{PlanGraph, PlanSource, TestStrategy, parse_planner_draft};
 use anyhow::{Context as _, Result, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -62,9 +63,7 @@ impl PlanApprovalState {
         if let Some(critic_receipt_hash) = self.critic_receipt_hash.as_deref() {
             validate_sha256("plan approval critic receipt hash", critic_receipt_hash)?;
         }
-        if let Some(secondary_critic_receipt_hash) =
-            self.secondary_critic_receipt_hash.as_deref()
-        {
+        if let Some(secondary_critic_receipt_hash) = self.secondary_critic_receipt_hash.as_deref() {
             validate_sha256(
                 "plan approval secondary critic receipt hash",
                 secondary_critic_receipt_hash,
@@ -220,10 +219,32 @@ pub struct IntentFoldVerdict {
     pub summary: String,
 }
 
+pub(crate) fn parse_json_object<T: DeserializeOwned>(raw_output: &str, context: &str) -> Result<T> {
+    let trimmed = raw_output.trim();
+    let mut last_error = None;
+    for (index, character) in trimmed.char_indices() {
+        if character != '{' {
+            continue;
+        }
+        let candidate = &trimmed[index..];
+        let mut deserializer = serde_json::Deserializer::from_str(candidate);
+        match T::deserialize(&mut deserializer) {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    bail!(
+        "{context}: {}",
+        last_error.unwrap_or_else(|| "no JSON object found".to_string())
+    )
+}
+
 impl IntentFoldVerdict {
     pub fn parse(raw_output: &str) -> Result<Self> {
-        serde_json::from_str(raw_output.trim())
-            .context("intent fold did not return one strict IntentFoldVerdict JSON object")
+        parse_json_object(
+            raw_output,
+            "intent fold did not return one strict IntentFoldVerdict JSON object",
+        )
     }
 
     pub fn validate(&self, goal_id: &str) -> Result<()> {
@@ -708,8 +729,10 @@ pub struct PlanCriticVerdict {
 
 impl PlanCriticVerdict {
     pub fn parse(raw_output: &str) -> Result<Self> {
-        serde_json::from_str(raw_output.trim())
-            .context("plan critic did not return one strict PlanCriticVerdict JSON object")
+        parse_json_object(
+            raw_output,
+            "plan critic did not return one strict PlanCriticVerdict JSON object",
+        )
     }
 
     pub fn validate(
@@ -1491,6 +1514,15 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_phase_parser_accepts_provider_prose_before_json() -> Result<()> {
+        let raw = r#"I inspected the workspace first.
+{"schema_version":1,"goal_id":"goal","normalized_objective":"outcome","assumptions":[],"constraints":[],"ambiguities":[],"required_questions":[],"risks":[],"acceptance_signals":["verified"],"decision":"ready","summary":"ready"}"#;
+        let verdict = IntentFoldVerdict::parse(raw)?;
+        assert_eq!(verdict.goal_id, "goal");
+        Ok(())
+    }
     use crate::{
         plan_graph::{
             CommandExpectation, PlanReference, PlannerReceipt, QaScenario,

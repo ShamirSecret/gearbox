@@ -9,7 +9,8 @@ use crate::phase_routing::{
 #[cfg(test)]
 use crate::plan_graph::PhaseProfile;
 use crate::plan_graph::{
-    PLAN_GRAPH_SCHEMA_EXEMPLAR, parse_planner_draft, parse_planner_draft_diagnostic,
+    PLAN_GRAPH_SCHEMA_EXEMPLAR, PlannerParseDiagnostic, parse_planner_draft,
+    parse_planner_draft_diagnostic, validate_planner_draft,
 };
 use crate::plan_review::{IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVerdict};
 use crate::runtime::{
@@ -158,6 +159,11 @@ impl OpenCodePhaseRunner {
             bail!("Gear OpenCode phase runner received a non-OpenCode route");
         }
         let config = decision.overlay_worker_config(&self.worker_config)?;
+        let phase_route_hint = match &task_kind {
+            crate::state::TaskKind::Review => Some("review"),
+            crate::state::TaskKind::Spec | crate::state::TaskKind::Plan => Some("explore"),
+            _ => None,
+        };
         let store = StateStore::new(&self.workspace);
         store.initialize()?;
         let task = Task {
@@ -196,7 +202,7 @@ impl OpenCodePhaseRunner {
                 cancellation_token: Some(self.cancellation_token.clone()),
                 coordinator_model: None,
                 coordinator_brief: None,
-                route_hint: None,
+                route_hint: phase_route_hint,
             },
         )?;
         if execution.result.status != WorkerStatus::Succeeded {
@@ -273,6 +279,55 @@ impl OpenCodePhaseRunner {
         for repair_attempt in 0..=MAX_PLANNER_SCHEMA_REPAIRS {
             match parse_planner_draft_diagnostic(&output.raw_output) {
                 Ok(draft) => {
+                    if let Err(error) = validate_planner_draft(&input.goal_id, &draft) {
+                        if repair_attempt >= MAX_PLANNER_SCHEMA_REPAIRS {
+                            bail!(
+                                "planner contract repair exhausted after {} attempts: {}",
+                                MAX_PLANNER_SCHEMA_REPAIRS,
+                                error
+                            );
+                        }
+                        let diagnostic = PlannerParseDiagnostic {
+                            raw_sha256: sha256_hex(&output.raw_output),
+                            json_path: "$".to_string(),
+                            expected: "a semantically valid PlanGraphDraft contract".to_string(),
+                            actual: error.to_string(),
+                            message: error.to_string(),
+                            line: 0,
+                            column: 0,
+                        };
+                        let store = StateStore::new(&self.workspace);
+                        store.initialize()?;
+                        store.write_artifact(
+                            &input.goal_id,
+                            &format!("planner-schema-diagnostic-r{}.json", repair_attempt + 1),
+                            &format!("{}\n", serde_json::to_string_pretty(&diagnostic)?),
+                        )?;
+                        if previous_raw_sha.as_deref() == Some(diagnostic.raw_sha256.as_str()) {
+                            bail!(
+                                "planner repeated the same semantically invalid output: {}",
+                                serde_json::to_string(&diagnostic)?
+                            );
+                        }
+                        previous_raw_sha = Some(diagnostic.raw_sha256.clone());
+                        let repair_prompt = gear_opencode_planner_repair_prompt(
+                            &input,
+                            &output.raw_output,
+                            &diagnostic,
+                            repair_attempt + 1,
+                        )?;
+                        output = self.run(
+                            &input.route_decision,
+                            &input.goal_id,
+                            &format!("pending_{}", input.goal_id),
+                            0,
+                            &format!("planner_{}_repair_{}", input.goal_id, repair_attempt + 1),
+                            crate::state::TaskKind::Plan,
+                            input.scope.clone(),
+                            repair_prompt,
+                        )?;
+                        continue;
+                    }
                     return Ok(PlannerSubmission {
                         draft,
                         planner: output.execution_identity,
@@ -411,6 +466,11 @@ impl OpenCodePhaseRunner {
             artifact_path: Some(output.artifact_path),
         })
     }
+}
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +637,7 @@ fn trimmed_env_value(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::phase_routing::OpenCodeModelProfiles;
-    use crate::plan_graph::{PLAN_GRAPH_SCHEMA_EXEMPLAR, PlanGraphDraft};
+    use crate::plan_graph::PLAN_GRAPH_SCHEMA_EXEMPLAR;
     use crate::state::Scope;
     use crate::workers::WorkerRegistry;
 
@@ -633,17 +693,7 @@ mod tests {
     fn runner_produces_independent_execution_identities_per_phase() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let output_path = temp_dir.path().join("output.json");
-        std::fs::write(
-            &output_path,
-            serde_json::to_string(&PlanGraphDraft {
-                objective: "test".to_string(),
-                must_have: Vec::new(),
-                must_not_have: Vec::new(),
-                topology_lock: Vec::new(),
-                tasks: Vec::new(),
-                final_acceptance: Vec::new(),
-            })?,
-        )?;
+        std::fs::write(&output_path, PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
         let command = format!(
             "sh -c 'cp {} \"$GEARBOX_WORKER_LAST_MESSAGE\"'",
             output_path.to_string_lossy()
