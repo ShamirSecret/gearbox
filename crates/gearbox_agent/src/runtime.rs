@@ -27,8 +27,9 @@ use crate::plan_review::{
 use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalEpochEventKind,
-    GoalRunLeaseGuard, GoalStatus, Scope, Session, SettledBudgetUsage, StateStore, Task,
-    TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
+    GoalRunLeaseGuard, GoalStatus, PlanNodeRunLedger, PlanNodeRunStatus, Scope, Session,
+    SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+    WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -939,10 +940,13 @@ impl Orchestrator {
                 "approval_required": phase_runtime.require_plan_approval,
             }),
         )?;
-        let closed_world_contract = plan_graph.closed_world_contract();
-        let initial_preferred_phase = closed_world_contract.preferred_phase_profile.clone();
+        let plan_tasks = plan_graph.draft.tasks.clone();
+        let first_plan_task = plan_tasks
+            .first()
+            .context("approved PlanGraph has no executable tasks")?;
+        let initial_preferred_phase = first_plan_task.preferred_phase_profile.clone();
         let initial_plan_route_hint =
-            phase_profile_route_hint(&closed_world_contract.preferred_phase_profile);
+            phase_profile_route_hint(&first_plan_task.preferred_phase_profile);
         let initial_worker_phase =
             worker_phase_for_route_hint(&initial_preferred_phase, initial_plan_route_hint);
         let initial_phase_decision = phase_runtime.routes.resolve_for_worker(
@@ -953,23 +957,21 @@ impl Orchestrator {
         )?;
         let initial_worker_config =
             initial_phase_decision.overlay_worker_config(&options.worker)?;
-        let mut tasks = initial_tasks(
-            &goal_id,
-            &scope,
-            initial_worker_config
-                .selected_route_for_hint(1, initial_plan_route_hint)
-                .worker_kind,
-        );
-        if let Some(task) = tasks.iter_mut().find(|task| task.id == "task_003") {
-            task.title = closed_world_contract.title.clone();
-            task.scope = Scope::new(
-                closed_world_contract.scope.allowed_files.clone(),
-                closed_world_contract.scope.forbidden_files.clone(),
-                closed_world_contract.scope.max_files_changed,
+        let mut tasks = initial_tasks(&goal_id, &scope);
+        tasks.extend(plan_tasks.iter().map(|plan_task| {
+            let mut task = plan_task.to_runtime_task(
+                &goal_id,
+                initial_worker_config
+                    .selected_route_for_hint(1, initial_plan_route_hint)
+                    .worker_kind,
             );
-            task.inputs.plan_task = Some(closed_world_contract);
-        }
+            task.inputs.phase_route_locked = false;
+            task
+        }));
         store.write_tasks(&goal_id, &tasks)?;
+
+        let mut plan_node_runs = PlanNodeRunLedger::from_plan(&goal_id, &epoch_id, &plan_graph)?;
+        store.write_plan_node_runs(&plan_node_runs)?;
 
         let spec_path =
             store.write_artifact(&goal_id, "spec.md", &product::spec(&goal, &detection))?;
@@ -1099,7 +1101,11 @@ impl Orchestrator {
             l
         });
         prepare_lineage_for_run(&mut lineage, &session_id);
+        lineage.plan_remaining_items = plan_node_runs.nodes.len();
         store.write_lineage(&lineage)?;
+
+        let mut completed_plan_tasks = plan_node_runs.completed_task_ids();
+        let mut current_plan_task_id: Option<String> = None;
 
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
@@ -1114,6 +1120,32 @@ impl Orchestrator {
                 });
                 break;
             }
+            let plan_task_id = if let Some(task_id) = current_plan_task_id.clone() {
+                task_id
+            } else {
+                let active = plan_node_runs.active_task_ids();
+                let next = plan_graph
+                    .runnable_tasks(&completed_plan_tasks, &active)?
+                    .into_iter()
+                    .next()
+                    .map(|task| task.task_id.clone());
+                let Some(task_id) = next else {
+                    if completed_plan_tasks.len() == plan_graph.draft.tasks.len() {
+                        break;
+                    }
+                    goal.status = GoalStatus::NeedsUser;
+                    goal.summary =
+                        "PlanGraph has no runnable node; dependency state requires a user decision."
+                            .to_string();
+                    goal.updated_at = timestamp();
+                    store.write_goal(&goal)?;
+                    break;
+                };
+                plan_node_runs.mark(&task_id, PlanNodeRunStatus::Runnable)?;
+                store.write_plan_node_runs(&plan_node_runs)?;
+                current_plan_task_id = Some(task_id.clone());
+                task_id
+            };
             let parent_task_id = goal.current_task_id.clone();
             let worker_route_hint = next_route_hint_override
                 .as_deref()
@@ -1219,8 +1251,13 @@ impl Orchestrator {
                     "reserved_tokens": goal.budget.max_tokens_per_call,
                 }),
             )?;
-            let worker_task_id = if iteration == 1 {
-                "task_003".to_string()
+            let first_plan_attempt = plan_node_runs
+                .nodes
+                .iter()
+                .find(|node| node.task_id == plan_task_id)
+                .is_some_and(|node| node.attempt == 0);
+            let worker_task_id = if first_plan_attempt {
+                plan_task_id.clone()
             } else {
                 let verification_path = last_verification_path
                     .as_deref()
@@ -1258,6 +1295,15 @@ impl Orchestrator {
                 )?;
                 repair_task_id
             };
+            {
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.attempt = node.attempt.saturating_add(1);
+                node.worker_task_id = Some(worker_task_id.clone());
+                node.status = PlanNodeRunStatus::Running;
+                node.updated_at = timestamp();
+                plan_node_runs.updated_at = timestamp();
+            }
+            store.write_plan_node_runs(&plan_node_runs)?;
 
             append_event(
                 &store,
@@ -1301,7 +1347,7 @@ impl Orchestrator {
                     Some(&goal_id),
                     Some(&worker_task_id),
                     EventKind::WorkerStarted,
-                    if iteration == 1 {
+                    if first_plan_attempt {
                         "Prepared implementation worker packet".to_string()
                     } else {
                         "Prepared repair worker packet".to_string()
@@ -1344,6 +1390,28 @@ impl Orchestrator {
                 persisted_task.inputs.phase_route_locked = worker_task.inputs.phase_route_locked;
             }
             store.write_tasks(&goal_id, &tasks)?;
+            if first_plan_attempt {
+                if let Some(plan_task) = worker_task.inputs.plan_task.as_ref() {
+                    if matches!(plan_task.test.strategy, crate::plan_graph::TestStrategy::Tdd) {
+                        let red_path = run_plan_red_evidence(
+                            &workspace,
+                            &store,
+                            &goal_id,
+                            &plan_task_id,
+                            plan_graph.revision,
+                            plan_task,
+                            options.cancellation_token.as_ref(),
+                        )?;
+                        let node = plan_node_runs.node_mut(&plan_task_id)?;
+                        node.red_evidence_path =
+                            Some(red_path.to_string_lossy().to_string());
+                        node.status = PlanNodeRunStatus::RedVerified;
+                        node.updated_at = timestamp();
+                        plan_node_runs.updated_at = timestamp();
+                        store.write_plan_node_runs(&plan_node_runs)?;
+                    }
+                }
+            }
             if let Some(plan_task) = worker_task.inputs.plan_task.as_mut() {
                 plan_task.task_id = worker_task_id.clone();
                 if let Some(reviewed_execution_id) = reviewed_execution_id.as_deref() {
@@ -1368,7 +1436,7 @@ impl Orchestrator {
                     ];
                 }
             }
-            let base_worker_request = if iteration == 1 {
+            let base_worker_request = if first_plan_attempt {
                 options.request.clone()
             } else {
                 repair_request(
@@ -1627,6 +1695,39 @@ impl Orchestrator {
             let iteration_worker_outcome = managed_worker_run.outcome;
             let iteration_worker_result = managed_worker_run.result;
             let iteration_worker_result_for_risk = iteration_worker_result.clone();
+            let (plan_green_paths, plan_green_passed) =
+                if first_plan_attempt
+                    && iteration_worker_result.status == WorkerStatus::Succeeded
+                {
+                    run_plan_green_evidence(
+                        &workspace,
+                        &store,
+                        &goal_id,
+                        &plan_task_id,
+                        plan_graph.revision,
+                        plan_graph
+                            .task(&plan_task_id)
+                            .context("missing PlanGraph task for GREEN evidence")?,
+                        options.cancellation_token.as_ref(),
+                    )?
+                } else {
+                    (Vec::new(), iteration_worker_result.status == WorkerStatus::Succeeded)
+                };
+            {
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.green_evidence_paths = plan_green_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect();
+                if plan_green_passed {
+                    node.status = PlanNodeRunStatus::GreenVerified;
+                } else if iteration_worker_result.status != WorkerStatus::Succeeded {
+                    node.status = PlanNodeRunStatus::Failed;
+                }
+                node.updated_at = timestamp();
+                plan_node_runs.updated_at = timestamp();
+                store.write_plan_node_runs(&plan_node_runs)?;
+            }
             let phase_route_receipt = phase_route_receipt_for_worker(
                 &phase_decision,
                 100 + iteration,
@@ -1882,7 +1983,8 @@ impl Orchestrator {
                 &product::verification(&verification_results),
             )?;
 
-            let verification_passed = !verification_results.is_empty()
+            let verification_passed = plan_green_passed
+                && !verification_results.is_empty()
                 && verification_results.iter().all(|result| result.success);
             update_verification_task(
                 &mut tasks,
@@ -2150,7 +2252,51 @@ impl Orchestrator {
                 }),
             )?;
 
-            let should_continue = evaluation.should_continue;
+            let node_review_passed = verification_passed
+                && worker_result
+                    .as_ref()
+                    .is_some_and(|result| result.status == WorkerStatus::Succeeded)
+                && review_gate.failed_reason().is_none();
+            if node_review_passed {
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.status = PlanNodeRunStatus::Reviewed;
+                node.review_evidence_path = Some(review_path.to_string_lossy().to_string());
+                node.status = PlanNodeRunStatus::Completed;
+                node.updated_at = timestamp();
+                plan_node_runs.updated_at = timestamp();
+                plan_node_runs.validate()?;
+                store.write_plan_node_runs(&plan_node_runs)?;
+                completed_plan_tasks.insert(plan_task_id.clone());
+                current_plan_task_id = None;
+                lineage.plan_remaining_items = plan_graph
+                    .draft
+                    .tasks
+                    .len()
+                    .saturating_sub(completed_plan_tasks.len());
+                lineage.updated_at = timestamp();
+                store.write_lineage(&lineage)?;
+            }
+            let all_plan_tasks_completed =
+                completed_plan_tasks.len() == plan_graph.draft.tasks.len();
+            if evaluation.status == GoalStatus::Complete && !all_plan_tasks_completed {
+                evaluation = GoalEvaluation {
+                    status: GoalStatus::Running,
+                    should_continue: true,
+                    summary: format!(
+                        "Plan node {} completed; {} node(s) remain.",
+                        plan_task_id,
+                        plan_graph.draft.tasks.len() - completed_plan_tasks.len()
+                    ),
+                    route_hint_override: None,
+                };
+            } else if all_plan_tasks_completed && evaluation.status == GoalStatus::Complete {
+                evaluation.summary = format!(
+                    "{} All {} PlanGraph nodes completed with evidence.",
+                    evaluation.summary,
+                    completed_plan_tasks.len()
+                );
+            }
+            let should_continue = evaluation.should_continue || !all_plan_tasks_completed;
             final_evaluation = Some(evaluation);
             if !should_continue {
                 break;
@@ -3559,16 +3705,10 @@ fn prepare_lineage_for_run(lineage: &mut WorkLineage, session_id: &str) {
     lineage.updated_at = timestamp();
 }
 
-fn initial_tasks(goal_id: &str, scope: &Scope, worker_kind: WorkerKind) -> Vec<Task> {
+fn initial_tasks(goal_id: &str, scope: &Scope) -> Vec<Task> {
     [
         ("task_001", "Generate minimal spec", TaskKind::Spec, None),
         ("task_002", "Generate executable plan", TaskKind::Plan, None),
-        (
-            "task_003",
-            "Dispatch bounded implementation packet",
-            TaskKind::Edit,
-            Some(worker_kind.as_str().to_string()),
-        ),
         (
             "task_004",
             "Run Gear-owned verification",
@@ -3647,6 +3787,147 @@ fn run_verification(
             )
         })
         .collect()
+}
+
+fn plan_artifact_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_plan_command_evidence(
+    store: &StateStore,
+    goal_id: &str,
+    task_id: &str,
+    revision: usize,
+    phase: &str,
+    expectation: &crate::plan_graph::CommandExpectation,
+    result: Option<&ShellCommandResult>,
+) -> Result<std::path::PathBuf> {
+    let file_name = format!(
+        "plan-node-{}-{}-r{revision}.md",
+        plan_artifact_component(task_id),
+        phase
+    );
+    let body = match result {
+        Some(result) => format!(
+            "# Plan node {phase} evidence\n\nTask: {task_id}\n\nCommand: {}\n\nExpected observation: {}\n\nExit code: {:?}\n\nSuccess: {}\n\n## stdout\n\n{}\n\n## stderr\n\n{}\n",
+            expectation.command,
+            expectation.expected_observation,
+            result.exit_code,
+            result.success,
+            result.stdout,
+            result.stderr,
+        ),
+        None => format!(
+            "# Plan node {phase} evidence\n\nTask: {task_id}\n\nNo command was required. Reason: {}\n",
+            expectation.expected_observation
+        ),
+    };
+    store.write_artifact(goal_id, &file_name, &body)
+}
+
+fn run_plan_red_evidence(
+    workspace: &std::path::Path,
+    store: &StateStore,
+    goal_id: &str,
+    task_id: &str,
+    revision: usize,
+    plan_task: &crate::plan_graph::PlanTaskContract,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<std::path::PathBuf> {
+    let expectation = plan_task
+        .test
+        .red
+        .as_ref()
+        .with_context(|| format!("TDD task {task_id} is missing RED expectation"))?;
+    let result = run_shell_command_with_env_and_cancellation(
+        workspace,
+        &expectation.command,
+        &std::collections::HashMap::new(),
+        cancellation_token,
+    )
+    .with_context(|| format!("failed to execute RED command for plan node {task_id}"))?;
+    let evidence_path = write_plan_command_evidence(
+        store,
+        goal_id,
+        task_id,
+        revision,
+        "red",
+        expectation,
+        Some(&result),
+    )?;
+    if result.success {
+        bail!(
+            "TDD RED command unexpectedly passed for plan node {task_id}; evidence at {}",
+            evidence_path.display()
+        );
+    }
+    Ok(evidence_path)
+}
+
+fn run_plan_green_evidence(
+    workspace: &std::path::Path,
+    store: &StateStore,
+    goal_id: &str,
+    task_id: &str,
+    revision: usize,
+    plan_task: &crate::plan_graph::PlanTaskContract,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<(Vec<std::path::PathBuf>, bool)> {
+    if matches!(plan_task.test.strategy, crate::plan_graph::TestStrategy::None) {
+        let reason = plan_task
+            .test
+            .no_test_reason
+            .clone()
+            .unwrap_or_else(|| "No test command was requested.".to_string());
+        let expectation = crate::plan_graph::CommandExpectation {
+            command: "none".to_string(),
+            expected_observation: reason,
+            evidence_path: format!("plan-node-{task_id}-no-test.md"),
+        };
+        let path = write_plan_command_evidence(
+            store,
+            goal_id,
+            task_id,
+            revision,
+            "no-test",
+            &expectation,
+            None,
+        )?;
+        return Ok((vec![path], true));
+    }
+
+    let mut paths = Vec::new();
+    let mut passed = true;
+    for (index, expectation) in plan_task.test.green.iter().enumerate() {
+        let result = run_shell_command_with_env_and_cancellation(
+            workspace,
+            &expectation.command,
+            &std::collections::HashMap::new(),
+            cancellation_token,
+        )
+        .with_context(|| format!("failed to execute GREEN command for plan node {task_id}"))?;
+        let phase = format!("green-{index}");
+        paths.push(write_plan_command_evidence(
+            store,
+            goal_id,
+            task_id,
+            revision,
+            &phase,
+            expectation,
+            Some(&result),
+        )?);
+        passed &= result.success;
+    }
+    Ok((paths, passed))
 }
 
 fn run_coordinator_review(

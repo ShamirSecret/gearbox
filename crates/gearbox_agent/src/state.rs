@@ -334,6 +334,197 @@ pub struct TaskOutputs {
     pub summary: String,
 }
 
+/// Durable execution state for one frozen PlanGraph node.
+///
+/// The worker result is evidence attached to this record; it is not allowed
+/// to advance a node by itself. The runtime writes the state transition after
+/// validating dependencies, test evidence, review evidence, and scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanNodeRunStatus {
+    Pending,
+    Runnable,
+    Running,
+    RedVerified,
+    Implemented,
+    GreenVerified,
+    Reviewed,
+    Completed,
+    Failed,
+    NeedsUser,
+    Cancelled,
+}
+
+impl PlanNodeRunStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::NeedsUser | Self::Cancelled
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanNodeRun {
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub task_id: String,
+    pub attempt: usize,
+    pub dependencies: Vec<String>,
+    pub status: PlanNodeRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_evidence_path: Option<String>,
+    #[serde(default)]
+    pub green_evidence_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_evidence_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanNodeRunLedger {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub nodes: Vec<PlanNodeRun>,
+    pub updated_at: String,
+}
+
+pub const PLAN_NODE_RUN_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+impl PlanNodeRunLedger {
+    pub fn from_plan(
+        goal_id: &str,
+        epoch_id: &str,
+        plan: &crate::plan_graph::PlanGraph,
+    ) -> Result<Self> {
+        plan.validate()?;
+        Ok(Self {
+            schema_version: PLAN_NODE_RUN_LEDGER_SCHEMA_VERSION,
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            plan_revision: plan.revision,
+            plan_hash: plan.plan_hash.clone(),
+            nodes: plan
+                .draft
+                .tasks
+                .iter()
+                .map(|task| PlanNodeRun {
+                    goal_id: goal_id.to_string(),
+                    epoch_id: epoch_id.to_string(),
+                    plan_id: plan.plan_id.clone(),
+                    plan_revision: plan.revision,
+                    plan_hash: plan.plan_hash.clone(),
+                    task_id: task.task_id.clone(),
+                    attempt: 0,
+                    dependencies: task.dependencies.clone(),
+                    status: PlanNodeRunStatus::Pending,
+                    worker_task_id: None,
+                    red_evidence_path: None,
+                    green_evidence_paths: Vec::new(),
+                    review_evidence_path: None,
+                    error: None,
+                    updated_at: timestamp(),
+                })
+                .collect(),
+            updated_at: timestamp(),
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != PLAN_NODE_RUN_LEDGER_SCHEMA_VERSION {
+            bail!("unsupported PlanNodeRunLedger schema version {}", self.schema_version);
+        }
+        if self.nodes.is_empty() {
+            bail!("PlanNodeRunLedger must contain at least one node");
+        }
+        let mut ids = HashSet::new();
+        for node in &self.nodes {
+            if node.goal_id != self.goal_id
+                || node.epoch_id != self.epoch_id
+                || node.plan_id != self.plan_id
+                || node.plan_revision != self.plan_revision
+                || node.plan_hash != self.plan_hash
+            {
+                bail!("PlanNodeRun has inconsistent plan binding");
+            }
+            if !ids.insert(node.task_id.as_str()) {
+                bail!("duplicate PlanNodeRun task id `{}`", node.task_id);
+            }
+            if node.status == PlanNodeRunStatus::Completed
+                && (node.attempt == 0
+                    || node.green_evidence_paths.is_empty()
+                    || node.review_evidence_path.is_none())
+            {
+                bail!(
+                    "completed PlanNodeRun `{}` is missing attempt, GREEN, or review evidence",
+                    node.task_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn completed_task_ids(&self) -> HashSet<String> {
+        self.nodes
+            .iter()
+            .filter(|node| node.status == PlanNodeRunStatus::Completed)
+            .map(|node| node.task_id.clone())
+            .collect()
+    }
+
+    pub fn active_task_ids(&self) -> HashSet<String> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.status,
+                    PlanNodeRunStatus::Runnable
+                        | PlanNodeRunStatus::Running
+                        | PlanNodeRunStatus::RedVerified
+                        | PlanNodeRunStatus::Implemented
+                        | PlanNodeRunStatus::GreenVerified
+                        | PlanNodeRunStatus::Reviewed
+                )
+            })
+            .map(|node| node.task_id.clone())
+            .collect()
+    }
+
+    pub fn node_mut(&mut self, task_id: &str) -> Result<&mut PlanNodeRun> {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.task_id == task_id)
+            .with_context(|| format!("unknown PlanNodeRun task `{task_id}`"))
+    }
+
+    pub fn mark(&mut self, task_id: &str, status: PlanNodeRunStatus) -> Result<()> {
+        let node = self.node_mut(task_id)?;
+        if node.status.is_terminal() && node.status != status {
+            bail!(
+                "cannot transition terminal PlanNodeRun `{task_id}` from {:?} to {:?}",
+                node.status,
+                status
+            );
+        }
+        node.status = status;
+        node.updated_at = timestamp();
+        self.updated_at = timestamp();
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommandRecord {
     pub command: String,
@@ -642,6 +833,7 @@ impl StateStore {
             self.sessions_dir(),
             self.goals_dir(),
             self.tasks_dir(),
+            self.plan_node_runs_dir(),
             self.plans_dir(),
             self.plan_reviews_dir(),
             self.events_dir(),
@@ -666,6 +858,14 @@ impl StateStore {
 
     pub fn tasks_dir(&self) -> PathBuf {
         self.root.join("tasks")
+    }
+
+    pub fn plan_node_runs_dir(&self) -> PathBuf {
+        self.root.join("plan-node-runs")
+    }
+
+    pub fn plan_node_runs_path(&self, goal_id: &str) -> PathBuf {
+        self.plan_node_runs_dir().join(format!("{goal_id}.json"))
     }
 
     pub fn plans_dir(&self) -> PathBuf {
@@ -848,6 +1048,21 @@ impl StateStore {
         Ok(Some(serde_json::from_str(&contents).with_context(
             || format!("failed to parse {}", path.display()),
         )?))
+    }
+
+    pub fn write_plan_node_runs(&self, ledger: &PlanNodeRunLedger) -> Result<PathBuf> {
+        ledger.validate()?;
+        let path = self.plan_node_runs_path(&ledger.goal_id);
+        write_json_atomic(&path, ledger)?;
+        Ok(path)
+    }
+
+    pub fn read_plan_node_runs(&self, goal_id: &str) -> Result<Option<PlanNodeRunLedger>> {
+        let path = self.plan_node_runs_path(goal_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_json_file(&path)?))
     }
 
     pub fn write_plan_graph(&self, plan_graph: &crate::plan_graph::PlanGraph) -> Result<PathBuf> {

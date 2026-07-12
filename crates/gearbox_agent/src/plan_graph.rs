@@ -277,18 +277,33 @@ impl PlanGraph {
         &self,
         completed: &HashSet<String>,
     ) -> Result<Option<&PlanTaskContract>> {
+        Ok(self.runnable_tasks(completed, &HashSet::new())?.into_iter().next())
+    }
+
+    /// Return every task whose dependencies are complete and which is not
+    /// already active. The runtime uses this as the scheduler input; model
+    /// output and Markdown projections never participate in this decision.
+    pub fn runnable_tasks(
+        &self,
+        completed: &HashSet<String>,
+        active: &HashSet<String>,
+    ) -> Result<Vec<&PlanTaskContract>> {
         self.validate()?;
-        Ok(self
+        let mut runnable = self
             .draft
             .tasks
             .iter()
-            .filter(|task| !completed.contains(&task.task_id))
+            .filter(|task| {
+                !completed.contains(&task.task_id) && !active.contains(&task.task_id)
+            })
             .filter(|task| {
                 task.dependencies
                     .iter()
                     .all(|dependency| completed.contains(dependency))
             })
-            .min_by_key(|task| (task.parallel_wave, task.task_id.as_str())))
+            .collect::<Vec<_>>();
+        runnable.sort_by_key(|task| (task.parallel_wave, task.task_id.as_str()));
+        Ok(runnable)
     }
 
     pub fn closed_world_contract(&self) -> PlanTaskContract {
@@ -857,6 +872,110 @@ mod tests {
         )?;
         graph.draft.objective.push_str(" tampered");
         assert!(graph.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runnable_tasks_returns_all_ready_nodes_without_active_nodes() -> Result<()> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let mut draft = deterministic_fallback_draft("graph", &scope, &[]);
+        draft.tasks[0].task_id = "node_a".to_string();
+        draft.tasks[0].title = "A".to_string();
+        draft.tasks[0].scope.write_scope = vec!["src/a".to_string()];
+        let mut node_b = draft.tasks[0].clone();
+        node_b.task_id = "node_b".to_string();
+        node_b.title = "B".to_string();
+        node_b.scope.write_scope = vec!["src/b".to_string()];
+        let mut node_c = draft.tasks[0].clone();
+        node_c.task_id = "node_c".to_string();
+        node_c.title = "C".to_string();
+        node_c.scope.write_scope = vec!["src/c".to_string()];
+        let first = draft.tasks.remove(0);
+        draft.tasks = vec![first, node_b, node_c];
+        let graph = PlanGraph::seal(
+            "goal",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            draft,
+        )?;
+
+        let ready = graph.runnable_tasks(&HashSet::new(), &HashSet::new())?;
+        assert_eq!(
+            ready
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node_a", "node_b", "node_c"]
+        );
+        let active = HashSet::from([String::from("node_b")]);
+        let ready = graph.runnable_tasks(&HashSet::new(), &active)?;
+        assert_eq!(
+            ready
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node_a", "node_c"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runnable_tasks_respects_dependencies() -> Result<()> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let mut draft = deterministic_fallback_draft("graph", &scope, &[]);
+        draft.tasks[0].task_id = "node_a".to_string();
+        draft.tasks[0].scope.write_scope = vec!["src/a".to_string()];
+        let mut node_b = draft.tasks[0].clone();
+        node_b.task_id = "node_b".to_string();
+        node_b.dependencies = vec!["node_a".to_string()];
+        node_b.parallel_wave = 1;
+        node_b.scope.write_scope = vec!["src/b".to_string()];
+        draft.tasks.push(node_b);
+        let graph = PlanGraph::seal(
+            "goal",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            draft,
+        )?;
+
+        let ready = graph.runnable_tasks(&HashSet::new(), &HashSet::new())?;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].task_id, "node_a");
+        let completed = HashSet::from([String::from("node_a")]);
+        let ready = graph.runnable_tasks(&completed, &HashSet::new())?;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].task_id, "node_b");
+        Ok(())
+    }
+
+    #[test]
+    fn plan_node_run_ledger_is_persisted_and_rejects_evidence_less_completion() -> Result<()> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let graph = PlanGraph::seal(
+            "goal",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            deterministic_fallback_draft("graph", &scope, &[]),
+        )?;
+        let mut ledger =
+            crate::state::PlanNodeRunLedger::from_plan("goal", "epoch", &graph)?;
+        assert!(ledger.mark("task_003", crate::state::PlanNodeRunStatus::Completed).is_ok());
+        assert!(ledger.validate().is_err());
+
+        let node = ledger.node_mut("task_003")?;
+        node.attempt = 1;
+        node.green_evidence_paths.push("green.md".to_string());
+        node.review_evidence_path = Some("review.md".to_string());
+        ledger.validate()?;
+        let temp_dir = tempfile::tempdir()?;
+        let store = crate::state::StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let path = store.write_plan_node_runs(&ledger)?;
+        assert!(path.is_file());
+        assert_eq!(store.read_plan_node_runs("goal")?, Some(ledger));
         Ok(())
     }
 }
