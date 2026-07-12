@@ -8,7 +8,9 @@ use crate::phase_routing::{
 };
 #[cfg(test)]
 use crate::plan_graph::PhaseProfile;
-use crate::plan_graph::parse_planner_draft;
+use crate::plan_graph::{
+    PLAN_GRAPH_SCHEMA_EXEMPLAR, parse_planner_draft, parse_planner_draft_diagnostic,
+};
 use crate::plan_review::{IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVerdict};
 use crate::runtime::{
     IntentFoldInput, IntentFoldSubmission, PhaseRuntime, PlanCriticInput, PlanCriticSubmission,
@@ -122,6 +124,8 @@ pub struct OpenCodePhaseRunner {
     pub cancellation_token: CancellationToken,
 }
 
+const MAX_PLANNER_SCHEMA_REPAIRS: usize = 2;
+
 struct OpenCodePhaseOutput {
     raw_output: String,
     execution_identity: PhaseExecutionIdentity,
@@ -234,7 +238,7 @@ impl OpenCodePhaseRunner {
             0,
             &task_id,
             crate::state::TaskKind::Spec,
-            input.scope,
+            input.scope.clone(),
             prompt,
         )?;
         let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
@@ -248,24 +252,69 @@ impl OpenCodePhaseRunner {
 
     pub fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
         let prompt = gear_opencode_planner_prompt(&input)?;
-        let task_id = format!("planner_{}", input.goal_id);
-        let output = self.run(
+        let mut output = self.run(
             &input.route_decision,
             &input.goal_id,
             &format!("pending_{}", input.goal_id),
             0,
-            &task_id,
+            &format!("planner_{}", input.goal_id),
             crate::state::TaskKind::Plan,
-            input.scope,
+            input.scope.clone(),
             prompt,
         )?;
-        let draft = parse_planner_draft(&output.raw_output)?;
-        Ok(PlannerSubmission {
-            draft,
-            planner: output.execution_identity,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        let mut previous_raw_sha = None;
+        for repair_attempt in 0..=MAX_PLANNER_SCHEMA_REPAIRS {
+            match parse_planner_draft_diagnostic(&output.raw_output) {
+                Ok(draft) => {
+                    return Ok(PlannerSubmission {
+                        draft,
+                        planner: output.execution_identity,
+                        raw_output: output.raw_output,
+                        artifact_path: Some(output.artifact_path),
+                    });
+                }
+                Err(diagnostic) if repair_attempt < MAX_PLANNER_SCHEMA_REPAIRS => {
+                    let store = StateStore::new(&self.workspace);
+                    store.initialize()?;
+                    store.write_artifact(
+                        &input.goal_id,
+                        &format!("planner-schema-diagnostic-r{}.json", repair_attempt + 1),
+                        &format!("{}\n", serde_json::to_string_pretty(&diagnostic)?),
+                    )?;
+                    if previous_raw_sha.as_deref() == Some(diagnostic.raw_sha256.as_str()) {
+                        bail!(
+                            "planner repeated the same malformed output; schema diagnostic: {}",
+                            serde_json::to_string(&diagnostic)?
+                        );
+                    }
+                    previous_raw_sha = Some(diagnostic.raw_sha256.clone());
+                    let repair_prompt = gear_opencode_planner_repair_prompt(
+                        &input,
+                        &output.raw_output,
+                        &diagnostic,
+                        repair_attempt + 1,
+                    )?;
+                    output = self.run(
+                        &input.route_decision,
+                        &input.goal_id,
+                        &format!("pending_{}", input.goal_id),
+                        0,
+                        &format!("planner_{}_repair_{}", input.goal_id, repair_attempt + 1),
+                        crate::state::TaskKind::Plan,
+                        input.scope.clone(),
+                        repair_prompt,
+                    )?;
+                }
+                Err(diagnostic) => {
+                    bail!(
+                        "planner schema repair exhausted after {} attempts: {}",
+                        MAX_PLANNER_SCHEMA_REPAIRS,
+                        serde_json::to_string(&diagnostic)?
+                    );
+                }
+            }
+        }
+        bail!("planner schema repair loop terminated unexpectedly")
     }
 
     pub fn critique(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
@@ -370,9 +419,32 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
         .transpose()?
         .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The draft must contain objective, must_have, must_not_have, topology_lock, tasks, and final_acceptance. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed IntentFold receipt as a binding interpretation of the goal: preserve its constraints, mitigate its risks, and turn its acceptance signals into executable checks. Do not write code.\n\nGoal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed IntentFold receipt as a binding interpretation of the goal: preserve its constraints, mitigate its risks, and turn its acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        PLAN_GRAPH_SCHEMA_EXEMPLAR,
         input.request,
         intent_fold,
+        serde_json::to_string_pretty(&input.scope)?,
+        serde_json::to_string_pretty(&input.verification_commands)?,
+    ))
+}
+
+fn gear_opencode_planner_repair_prompt(
+    input: &PlannerInput,
+    raw_output: &str,
+    diagnostic: &crate::plan_graph::PlannerParseDiagnostic,
+    attempt: usize,
+) -> Result<String> {
+    Ok(format!(
+        "You are the same Gear planner on fresh repair turn {attempt}. Return a complete PlanGraphDraft JSON object only; never return a patch, prose, or markdown fence. Preserve the request and IntentFold semantics. Correct only the schema errors identified by Rust and keep all valid semantic content. Use the exact nested shapes and enum values in the exemplar.\n\nSchema exemplar:\n{PLAN_GRAPH_SCHEMA_EXEMPLAR}\n\nRust diagnostic:\n{}\n\nMalformed output to repair:\n{}\n\nOriginal goal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        serde_json::to_string_pretty(diagnostic)?,
+        raw_output,
+        input.request,
+        input
+            .intent_fold
+            .as_ref()
+            .map(serde_json::to_string_pretty)
+            .transpose()?
+            .unwrap_or_else(|| "none".to_string()),
         serde_json::to_string_pretty(&input.scope)?,
         serde_json::to_string_pretty(&input.verification_commands)?,
     ))
@@ -469,7 +541,7 @@ fn trimmed_env_value(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::phase_routing::OpenCodeModelProfiles;
-    use crate::plan_graph::PlanGraphDraft;
+    use crate::plan_graph::{PLAN_GRAPH_SCHEMA_EXEMPLAR, PlanGraphDraft};
     use crate::state::Scope;
     use crate::workers::WorkerRegistry;
 
@@ -595,6 +667,53 @@ mod tests {
         assert_eq!(first.planner.provider_id.as_deref(), Some("openai"));
         assert_eq!(first.planner.model_id.as_deref(), Some("gpt-planner"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn planner_repairs_schema_drift_on_a_fresh_turn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let output_path = temp_dir.path().join("valid-plan.json");
+        let counter_path = temp_dir.path().join("turn-count");
+        std::fs::write(&output_path, PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
+        let script_path = temp_dir.path().join("planner-worker.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncount=0\n[ -f '{counter}' ] && count=$(cat '{counter}')\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{counter}'\nif [ \"$count\" -eq 1 ]; then printf '%s' '{{\\\"objective\\\":\\\"x\\\",\\\"topology_lock\\\":\\\"drift\\\",\\\"tasks\\\":[]}}' > \"$GEARBOX_WORKER_LAST_MESSAGE\"; else cp '{output}' \"$GEARBOX_WORKER_LAST_MESSAGE\"; fi\n",
+                counter = counter_path.to_string_lossy(),
+                output = output_path.to_string_lossy(),
+            ),
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.plan(PlannerInput {
+            goal_id: "repair_goal".to_string(),
+            request: "repair a malformed draft".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            verification_commands: Vec::new(),
+            route_decision: decision,
+            intent_fold: None,
+        })?;
+        assert_eq!(submission.draft.tasks.len(), 1);
+        assert_eq!(std::fs::read_to_string(counter_path)?, "2");
         Ok(())
     }
 

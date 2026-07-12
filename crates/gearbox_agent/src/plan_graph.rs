@@ -7,6 +7,59 @@ use std::collections::{HashMap, HashSet};
 
 pub const PLAN_GRAPH_SCHEMA_VERSION: u32 = 1;
 
+/// Compact contract example embedded in planner repair prompts. Keep this
+/// synchronized with the typed draft by exercising it in the unit tests below.
+pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
+  "objective": "observable outcome",
+  "must_have": ["acceptance signal"],
+  "must_not_have": ["forbidden change"],
+  "topology_lock": ["task_a"],
+  "tasks": [{
+    "task_id": "task_a",
+    "title": "Implement the bounded change",
+    "goal": "Deliver the requested behavior",
+    "deliverable": "verified implementation",
+    "dependencies": [],
+    "parallel_wave": 0,
+    "scope": {
+      "allowed_files": ["src/example.rs"],
+      "forbidden_files": [".git"],
+      "write_scope": ["src/example.rs"],
+      "max_files_changed": 1
+    },
+    "required_capabilities": ["file_write"],
+    "preferred_phase_profile": "executor_quick",
+    "must_do": ["implement the behavior"],
+    "must_not_do": ["modify forbidden paths"],
+    "references": [{"path": "src/example.rs", "reason": "implementation entry point"}],
+    "test": {
+      "strategy": "tests_after",
+      "red": null,
+      "green": [{"command": "cargo test", "expected_observation": "tests pass", "evidence_path": ".gearbox-agent/artifacts/green.log"}],
+      "no_test_reason": null
+    },
+    "qa": {
+      "happy_path": [{"name": "happy", "steps": ["run the verification"], "expected_result": "behavior is present", "evidence_path": ".gearbox-agent/artifacts/qa.log"}],
+      "failure_path": [{"name": "failure", "steps": ["capture the failure"], "expected_result": "failure is diagnosable", "evidence_path": ".gearbox-agent/artifacts/qa.log"}]
+    },
+    "artifacts": [{"path": ".gearbox-agent/artifacts/final-report.md", "description": "verification report", "required": true}],
+    "commit_boundary": "no_commit",
+    "completion_predicates": ["verification evidence exists"]
+  }],
+  "final_acceptance": ["the observable outcome is verified"]
+}"#;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerParseDiagnostic {
+    pub raw_sha256: String,
+    pub json_path: String,
+    pub expected: String,
+    pub actual: String,
+    pub message: String,
+    pub line: usize,
+    pub column: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanSource {
@@ -277,7 +330,10 @@ impl PlanGraph {
         &self,
         completed: &HashSet<String>,
     ) -> Result<Option<&PlanTaskContract>> {
-        Ok(self.runnable_tasks(completed, &HashSet::new())?.into_iter().next())
+        Ok(self
+            .runnable_tasks(completed, &HashSet::new())?
+            .into_iter()
+            .next())
     }
 
     /// Return every task whose dependencies are complete and which is not
@@ -293,9 +349,7 @@ impl PlanGraph {
             .draft
             .tasks
             .iter()
-            .filter(|task| {
-                !completed.contains(&task.task_id) && !active.contains(&task.task_id)
-            })
+            .filter(|task| !completed.contains(&task.task_id) && !active.contains(&task.task_id))
             .filter(|task| {
                 task.dependencies
                     .iter()
@@ -670,6 +724,17 @@ pub fn deterministic_fallback_draft(
 }
 
 pub fn parse_planner_draft(output: &str) -> Result<PlanGraphDraft> {
+    parse_planner_draft_diagnostic(output).map_err(|diagnostic| {
+        anyhow::anyhow!(
+            "planner did not return a valid PlanGraphDraft JSON object: {}",
+            serde_json::to_string(&diagnostic).unwrap_or_else(|_| diagnostic.message.clone())
+        )
+    })
+}
+
+pub fn parse_planner_draft_diagnostic(
+    output: &str,
+) -> std::result::Result<PlanGraphDraft, PlannerParseDiagnostic> {
     let trimmed = output.trim();
     let json = if let Some(rest) = trimmed.strip_prefix("```json") {
         rest.strip_suffix("```").unwrap_or(rest).trim()
@@ -678,7 +743,31 @@ pub fn parse_planner_draft(output: &str) -> Result<PlanGraphDraft> {
     } else {
         trimmed
     };
-    serde_json::from_str(json).context("planner did not return a valid PlanGraphDraft JSON object")
+    let mut hasher = Sha256::new();
+    hasher.update(output.as_bytes());
+    let raw_sha256 = format!("{:x}", hasher.finalize());
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let mut track = serde_path_to_error::Track::new();
+    let path = serde_path_to_error::Deserializer::new(&mut deserializer, &mut track);
+    match PlanGraphDraft::deserialize(path) {
+        Ok(draft) => Ok(draft),
+        Err(error) => {
+            let message = error.to_string();
+            let (actual, expected) = message
+                .split_once(", expected ")
+                .map(|(actual, expected)| (actual.to_string(), expected.to_string()))
+                .unwrap_or_else(|| (message.clone(), "valid PlanGraphDraft JSON".to_string()));
+            Err(PlannerParseDiagnostic {
+                raw_sha256,
+                json_path: track.path().to_string(),
+                expected,
+                actual,
+                message,
+                line: error.line(),
+                column: error.column(),
+            })
+        }
+    }
 }
 
 fn validate_acyclic(tasks: &[PlanTaskContract]) -> Result<()> {
@@ -766,6 +855,29 @@ mod tests {
             evidence_path: "evidence/green.txt".to_string(),
         }];
         draft
+    }
+
+    #[test]
+    fn planner_protocol_contract_exemplar_is_typed() -> Result<()> {
+        let draft = parse_planner_draft(PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
+        assert_eq!(draft.tasks.len(), 1);
+        assert_eq!(
+            draft.tasks[0].preferred_phase_profile,
+            PhaseProfile::ExecutorQuick
+        );
+        assert_eq!(draft.tasks[0].test.strategy, TestStrategy::TestsAfter);
+        Ok(())
+    }
+
+    #[test]
+    fn planner_schema_diagnostic_reports_path_types_and_raw_hash() {
+        let malformed = r#"{"objective":"x","topology_lock":"must be an array","tasks":[]}"#;
+        let error = parse_planner_draft_diagnostic(malformed).expect_err("schema drift must fail");
+        assert_eq!(error.json_path, "topology_lock");
+        assert!(error.expected.contains("sequence"));
+        assert!(error.actual.contains("string"));
+        assert_eq!(error.raw_sha256.len(), 64);
+        assert!(error.line >= 1 && error.column >= 1);
     }
 
     fn planner_receipt() -> Option<PlannerReceipt> {
@@ -913,13 +1025,7 @@ mod tests {
         node_c.scope.write_scope = vec!["src/c".to_string()];
         let first = draft.tasks.remove(0);
         draft.tasks = vec![first, node_b, node_c];
-        let graph = PlanGraph::seal(
-            "goal",
-            1,
-            PlanSource::DeterministicFallback,
-            None,
-            draft,
-        )?;
+        let graph = PlanGraph::seal("goal", 1, PlanSource::DeterministicFallback, None, draft)?;
 
         let ready = graph.runnable_tasks(&HashSet::new(), &HashSet::new())?;
         assert_eq!(
@@ -960,13 +1066,7 @@ mod tests {
         node_b.parallel_wave = 1;
         node_b.scope.write_scope = vec!["src/b".to_string()];
         draft.tasks.push(node_b);
-        let graph = PlanGraph::seal(
-            "goal",
-            1,
-            PlanSource::DeterministicFallback,
-            None,
-            draft,
-        )?;
+        let graph = PlanGraph::seal("goal", 1, PlanSource::DeterministicFallback, None, draft)?;
 
         let ready = graph.runnable_tasks(&HashSet::new(), &HashSet::new())?;
         assert_eq!(ready.len(), 1);
@@ -988,11 +1088,12 @@ mod tests {
             None,
             deterministic_fallback_draft("graph", &scope, &[]),
         )?;
-        let mut ledger =
-            crate::state::PlanNodeRunLedger::from_plan("goal", "epoch", &graph)?;
-        assert!(ledger
-            .mark("task_003", crate::state::PlanNodeRunStatus::Completed)
-            .is_err());
+        let mut ledger = crate::state::PlanNodeRunLedger::from_plan("goal", "epoch", &graph)?;
+        assert!(
+            ledger
+                .mark("task_003", crate::state::PlanNodeRunStatus::Completed)
+                .is_err()
+        );
 
         let node = ledger.node_mut("task_003")?;
         node.status = crate::state::PlanNodeRunStatus::Completed;
@@ -1034,12 +1135,8 @@ mod tests {
             reviewer_execution_ids: vec!["reviewer-1".to_string()],
         })
         .collect();
-        let receipt = crate::state::FinalVerificationWaveReceipt::seal(
-            "goal",
-            "epoch",
-            &graph,
-            dimensions,
-        )?;
+        let receipt =
+            crate::state::FinalVerificationWaveReceipt::seal("goal", "epoch", &graph, dimensions)?;
         receipt.validate(&graph)?;
         let mut tampered = receipt.clone();
         tampered.plan_hash = "f".repeat(64);
