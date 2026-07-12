@@ -217,6 +217,19 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 
 ## Agent Integration Changes
 
+### 2026-07-12 Objective controller bridge
+
+`crates/agent/src/agent.rs` is modified by Gearbox to opt into the Gear-owned
+`ObjectiveGraph` rolling controller only when `GEARBOX_GEAR_OBJECTIVE` is
+explicitly enabled. The normal upstream/single-goal path remains unchanged;
+the bridge passes the existing `PhaseRuntime`/worker broker into
+`Orchestrator::run_objective_with_phase_runtime`, preserves Gear cancellation
+and task-manager ownership, and maps the durable objective terminal state back
+to the existing response contract. Objective mode also preserves a user
+continuation stop instead of clearing it automatically. Upstream merges must
+keep this branch conditional and must not make ObjectiveGraph a dependency of
+the non-Gear agent path.
+
 ### `[NEW]` `crates/agent/Cargo.toml`
 - `+dep: gearbox_agent`
 

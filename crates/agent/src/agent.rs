@@ -74,7 +74,7 @@ use gearbox_agent::runtime::{
     PlanCriticHook, PlanCriticInput, PlanCriticSubmission, PlanRevisionHook, PlanRevisionInput,
     PlanRevisionSubmission, PlannerHook, PlannerInput, PlannerSubmission, RunOptions,
     StrategistNextGoalHook, StrategistNextGoalInput, StrategistNextGoalSubmission,
-    StrategistNextGoalVerdict,
+    StrategistNextGoalVerdict, objective_policy_from_env,
 };
 use gearbox_agent::state::{
     Budget, ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
@@ -3009,42 +3009,52 @@ impl NativeAgentConnection {
                 broker_factory: Some(run_broker_factory),
             };
             let continuation_session_id = cancellation_session_id.to_string();
+            let objective_policy = objective_policy_from_env()?;
             let run_task = cx.background_spawn(smol::unblock(move || {
-                StateStore::new(&workspace)
-                    .clear_continuation_stop_for_session(&continuation_session_id)?;
+                if objective_policy.is_none() {
+                    StateStore::new(&workspace)
+                        .clear_continuation_stop_for_session(&continuation_session_id)?;
+                }
                 let event_sink = {
                     let event_tx = event_tx.clone();
                     Arc::new(move |event: &gearbox_agent::state::Event| {
                         event_tx.try_send(gear_event_status_markdown(event)).ok();
                     }) as gearbox_agent::runtime::EventSink
                 };
-                let outcome = Orchestrator::run_with_phase_runtime(
-                    RunOptions {
-                        request,
-                        workspace,
-                        verification_commands: gear_verification_commands_from_env(),
-                        worker: run_worker_config,
-                        allowed_paths: Vec::new(),
-                        forbidden_paths: Vec::new(),
-                        max_files_changed: gear_max_files_changed_from_env(),
-                        install_dependencies: false,
-                        event_sink: Some(event_sink),
-                        cancellation_token: Some(run_cancellation_token),
-                        max_iterations: gear_max_iterations_from_env(),
-                        max_provider_unknown_streak: gear_max_provider_unknown_streak_from_env(),
-                        max_child_depth: gear_max_child_depth_from_env(),
-                        max_runtime_minutes: gear_max_runtime_minutes_from_env(),
-                        budget: Some(gear_budget_from_env()),
-                        coordinator_model,
-                        coordinator_brief,
-                        coordinator_review_hook,
-                        task_manager_control: Some(run_task_manager_control),
-                        task_manager: Some(run_task_manager),
-                        session_id: Some(continuation_session_id),
-                        continuation: true,
-                    },
-                    run_phase_runtime,
-                )?;
+                let run_options = RunOptions {
+                    request,
+                    workspace,
+                    verification_commands: gear_verification_commands_from_env(),
+                    worker: run_worker_config,
+                    allowed_paths: Vec::new(),
+                    forbidden_paths: Vec::new(),
+                    max_files_changed: gear_max_files_changed_from_env(),
+                    install_dependencies: false,
+                    event_sink: Some(event_sink),
+                    cancellation_token: Some(run_cancellation_token),
+                    max_iterations: gear_max_iterations_from_env(),
+                    max_provider_unknown_streak: gear_max_provider_unknown_streak_from_env(),
+                    max_child_depth: gear_max_child_depth_from_env(),
+                    max_runtime_minutes: gear_max_runtime_minutes_from_env(),
+                    budget: Some(gear_budget_from_env()),
+                    coordinator_model,
+                    coordinator_brief,
+                    coordinator_review_hook,
+                    task_manager_control: Some(run_task_manager_control),
+                    task_manager: Some(run_task_manager),
+                    session_id: Some(continuation_session_id),
+                    continuation: true,
+                };
+                let outcome = if let Some(policy) = objective_policy {
+                    Orchestrator::run_objective_with_phase_runtime(
+                        run_options,
+                        run_phase_runtime,
+                        policy,
+                    )?
+                    .into_last_goal_outcome()?
+                } else {
+                    Orchestrator::run_with_phase_runtime(run_options, run_phase_runtime)?
+                };
                 let final_report = std_fs::read_to_string(&outcome.final_report_path)
                     .with_context(|| {
                         format!(
