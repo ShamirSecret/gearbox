@@ -1293,6 +1293,7 @@ impl Orchestrator {
                     &goal_id,
                     &scope,
                     iteration,
+                    &plan_task_id,
                     verification_path,
                     parent_task_id.clone(),
                     selected_route.worker_kind,
@@ -4798,6 +4799,7 @@ fn add_repair_task(
     goal_id: &str,
     scope: &Scope,
     iteration: usize,
+    plan_task_id: &str,
     verification_path: &std::path::Path,
     parent_task_id: Option<String>,
     worker_kind: WorkerKind,
@@ -4805,7 +4807,7 @@ fn add_repair_task(
     let task_id = repair_task_id(iteration);
     let plan_task = tasks
         .iter()
-        .find(|task| task.id == "task_003")
+        .find(|task| task.id == plan_task_id)
         .and_then(|task| task.inputs.plan_task.clone());
     tasks.push(Task {
         id: task_id.clone(),
