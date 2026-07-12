@@ -5,8 +5,9 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::runtime::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
-    Orchestrator, RunOptions,
+    Orchestrator, PhaseRuntime, RunOptions,
 };
+use crate::state::ObjectivePolicy;
 use crate::workers::{WorkerConfig, WorkerKind, WorkerRoute};
 
 #[derive(Debug, Parser)]
@@ -25,6 +26,36 @@ enum Command {
 #[derive(Debug, Args)]
 struct RunCommand {
     prompt: String,
+
+    #[arg(long)]
+    objective: bool,
+
+    #[arg(long)]
+    auto_continue: bool,
+
+    #[arg(long, default_value_t = 3)]
+    max_epochs: usize,
+
+    #[arg(long, default_value_t = 96)]
+    max_objective_calls: usize,
+
+    #[arg(long, default_value_t = 12_288_000)]
+    max_objective_tokens: u64,
+
+    #[arg(long, default_value_t = 10_000_000)]
+    max_objective_cost_micros: u64,
+
+    #[arg(long, default_value_t = 32)]
+    max_unknown_usage_calls: usize,
+
+    #[arg(long, default_value_t = 2)]
+    max_consecutive_no_progress: usize,
+
+    #[arg(long, default_value_t = 3)]
+    max_consecutive_failures: usize,
+
+    #[arg(long, default_value_t = 0)]
+    objective_cooldown_seconds: u64,
 
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
@@ -111,7 +142,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Run(command) => {
             let worker = worker_config_from_command(&command)?;
-            let outcome = Orchestrator::run(RunOptions {
+            let options = RunOptions {
                 request: command.prompt,
                 workspace: command.workspace,
                 verification_commands: command.verification_commands,
@@ -134,7 +165,27 @@ pub fn run() -> Result<()> {
                 task_manager: None,
                 session_id: None,
                 continuation: false,
-            })?;
+            };
+            let outcome = if command.objective {
+                Orchestrator::run_objective_with_phase_runtime(
+                    options,
+                    PhaseRuntime::legacy(),
+                    ObjectivePolicy {
+                        auto_continue: command.auto_continue,
+                        max_epochs: command.max_epochs,
+                        max_calls: command.max_objective_calls,
+                        max_tokens: command.max_objective_tokens,
+                        max_cost_micros: command.max_objective_cost_micros,
+                        max_unknown_usage_calls: command.max_unknown_usage_calls,
+                        max_consecutive_no_progress: command.max_consecutive_no_progress,
+                        max_consecutive_failures: command.max_consecutive_failures,
+                        cooldown_seconds: command.objective_cooldown_seconds,
+                    },
+                )?
+                .into_last_goal_outcome()?
+            } else {
+                Orchestrator::run(options)?
+            };
 
             println!("Gear goal: {}", outcome.goal_id);
             println!("Status: {}", outcome.status.as_str());
@@ -267,6 +318,16 @@ mod tests {
     fn run_command() -> RunCommand {
         RunCommand {
             prompt: "build a test app".to_string(),
+            objective: false,
+            auto_continue: false,
+            max_epochs: 3,
+            max_objective_calls: 96,
+            max_objective_tokens: 12_288_000,
+            max_objective_cost_micros: 10_000_000,
+            max_unknown_usage_calls: 32,
+            max_consecutive_no_progress: 2,
+            max_consecutive_failures: 3,
+            objective_cooldown_seconds: 0,
             workspace: PathBuf::from("."),
             verification_commands: Vec::new(),
             opencode_command: None,

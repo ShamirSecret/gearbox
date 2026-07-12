@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    env,
     fs as std_fs,
     path::PathBuf,
     sync::Arc,
@@ -7,8 +8,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::languages::{LanguageDetection, detect_with_request};
@@ -29,9 +31,10 @@ use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, FinalVerificationDimension,
     FinalVerificationResult, FinalVerificationWaveReceipt, Goal, GoalEpochEventKind,
-    GoalRunLeaseGuard, GoalStatus, PlanNodeRunLedger, PlanNodeRunStatus, Scope, Session,
-    SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
-    WorkLineage, event, id_timestamp, timestamp,
+    GoalGraphNode, GoalRunLeaseGuard, GoalStatus, ObjectiveEventKind, ObjectiveGraph,
+    ObjectivePolicy, ObjectiveStatus, PlanNodeRunLedger,
+    PlanNodeRunStatus, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind,
+    TaskOutputs, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -687,11 +690,175 @@ pub struct CoordinatorReview {
 #[derive(Clone, Debug)]
 pub struct RunOutcome {
     pub goal_id: String,
+    pub epoch_id: String,
     pub session_id: String,
     pub status: GoalStatus,
     pub artifacts_root: PathBuf,
     pub final_report_path: PathBuf,
     pub events_path: PathBuf,
+    pub final_verification_wave_path: PathBuf,
+    pub final_verification_wave_hash: String,
+    pub strategist_receipt: Option<StrategistNextGoalReceipt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectiveRunOutcome {
+    pub objective_id: String,
+    pub status: ObjectiveStatus,
+    pub graph_path: PathBuf,
+    pub events_path: PathBuf,
+    pub final_report_path: Option<PathBuf>,
+    pub goal_outcomes: Vec<RunOutcome>,
+}
+
+impl ObjectiveRunOutcome {
+    pub fn into_last_goal_outcome(self) -> Result<RunOutcome> {
+        let objective_status = self.status.clone();
+        if let Some(mut outcome) = self.goal_outcomes.into_iter().last() {
+            outcome.status = goal_status_for_objective(&objective_status);
+            return Ok(outcome);
+        }
+        let graph: ObjectiveGraph = serde_json::from_str(
+            &std_fs::read_to_string(&self.graph_path)
+                .with_context(|| format!("failed to read {}", self.graph_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", self.graph_path.display()))?;
+        let node = graph
+            .nodes
+            .iter()
+            .rev()
+            .find(|node| node.final_report_path.is_some())
+            .context("objective has no persisted goal outcome")?;
+        let workspace = PathBuf::from(&graph.workspace);
+        let store = StateStore::new(&workspace);
+        let artifacts_root = store.artifact_dir(&node.goal_id);
+        let final_report_path = PathBuf::from(
+            node.final_report_path
+                .as_deref()
+                .context("objective goal is missing final report path")?,
+        );
+        Ok(RunOutcome {
+            goal_id: node.goal_id.clone(),
+            epoch_id: node.epoch_id.clone(),
+            session_id: node.session_id.clone(),
+            status: goal_status_for_objective(&objective_status),
+            artifacts_root: artifacts_root.clone(),
+            final_report_path,
+            events_path: store.events_path(&node.session_id),
+            final_verification_wave_path: artifacts_root.join("final-verification-wave.json"),
+            final_verification_wave_hash: node
+                .final_wave_receipt_hash
+                .clone()
+                .unwrap_or_default(),
+            strategist_receipt: None,
+        })
+    }
+}
+
+fn goal_status_for_objective(status: &ObjectiveStatus) -> GoalStatus {
+    match status {
+        ObjectiveStatus::Complete => GoalStatus::Complete,
+        ObjectiveStatus::NeedsUser => GoalStatus::NeedsUser,
+        ObjectiveStatus::Stopped => GoalStatus::Blocked,
+        ObjectiveStatus::Limited => GoalStatus::Limited,
+        ObjectiveStatus::Blocked => GoalStatus::Blocked,
+        ObjectiveStatus::Failed => GoalStatus::Failed,
+        ObjectiveStatus::Running => GoalStatus::Running,
+    }
+}
+
+/// Read the explicit Gear objective-controller switch and its bounded policy.
+/// Normal single-goal callers receive `None` and retain the GBX-008 behavior.
+pub fn objective_policy_from_env() -> Result<Option<ObjectivePolicy>> {
+    let Some(raw_enabled) = env::var_os("GEARBOX_GEAR_OBJECTIVE") else {
+        return Ok(None);
+    };
+    let enabled = raw_enabled
+        .to_string_lossy()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(enabled.as_str(), "0" | "false" | "off" | "no") {
+        return Ok(None);
+    }
+    if !matches!(enabled.as_str(), "1" | "true" | "on" | "yes") {
+        bail!("GEARBOX_GEAR_OBJECTIVE must be one of 0/1/false/true/off/on");
+    }
+    let defaults = ObjectivePolicy::rolling_default();
+    let policy = ObjectivePolicy {
+        auto_continue: objective_bool_env("GEARBOX_GEAR_AUTO_CONTINUE", defaults.auto_continue)?,
+        max_epochs: objective_usize_env("GEARBOX_GEAR_MAX_EPOCHS", defaults.max_epochs)?,
+        max_calls: objective_usize_env(
+            "GEARBOX_GEAR_MAX_OBJECTIVE_CALLS",
+            defaults.max_calls,
+        )?,
+        max_tokens: objective_u64_env(
+            "GEARBOX_GEAR_MAX_OBJECTIVE_TOKENS",
+            defaults.max_tokens,
+        )?,
+        max_cost_micros: objective_u64_env(
+            "GEARBOX_GEAR_MAX_OBJECTIVE_COST_MICROS",
+            defaults.max_cost_micros,
+        )?,
+        max_unknown_usage_calls: objective_usize_env(
+            "GEARBOX_GEAR_MAX_OBJECTIVE_UNKNOWN_USAGE_CALLS",
+            defaults.max_unknown_usage_calls,
+        )?,
+        max_consecutive_no_progress: objective_usize_env(
+            "GEARBOX_GEAR_MAX_CONSECUTIVE_NO_PROGRESS",
+            defaults.max_consecutive_no_progress,
+        )?,
+        max_consecutive_failures: objective_usize_env(
+            "GEARBOX_GEAR_MAX_CONSECUTIVE_FAILURES",
+            defaults.max_consecutive_failures,
+        )?,
+        cooldown_seconds: objective_u64_env(
+            "GEARBOX_GEAR_OBJECTIVE_COOLDOWN_SECONDS",
+            defaults.cooldown_seconds,
+        )?,
+    };
+    policy.validate()?;
+    Ok(Some(policy))
+}
+
+fn objective_bool_env(name: &str, default_value: bool) -> Result<bool> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default_value);
+    };
+    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => bail!("{name} must be one of 0/1/false/true/off/on"),
+    }
+}
+
+fn objective_usize_env(name: &str, default_value: usize) -> Result<usize> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default_value);
+    };
+    let value = value.to_string_lossy();
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn objective_u64_env(name: &str, default_value: u64) -> Result<u64> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default_value);
+    };
+    let value = value.to_string_lossy();
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
 }
 
 struct CompletionNotificationFlushGuard<'a> {
@@ -748,6 +915,23 @@ impl Orchestrator {
         options: RunOptions,
         phase_runtime: PhaseRuntime,
     ) -> Result<RunOutcome> {
+        Self::run_single_goal_with_phase_runtime(options, phase_runtime, None, None)
+    }
+
+    pub fn run_objective_with_phase_runtime(
+        options: RunOptions,
+        phase_runtime: PhaseRuntime,
+        policy: ObjectivePolicy,
+    ) -> Result<ObjectiveRunOutcome> {
+        run_objective_controller(options, phase_runtime, policy)
+    }
+
+    fn run_single_goal_with_phase_runtime(
+        options: RunOptions,
+        phase_runtime: PhaseRuntime,
+        fixed_goal_id: Option<String>,
+        fixed_epoch_id: Option<String>,
+    ) -> Result<RunOutcome> {
         if options.request.trim().is_empty() {
             bail!("prompt cannot be empty");
         }
@@ -772,7 +956,8 @@ impl Orchestrator {
             .session_id
             .clone()
             .unwrap_or_else(|| format!("ses_{id_suffix}"));
-        let goal_id = format!("goal_{id_suffix}");
+        let task_namespace = fixed_goal_id.clone();
+        let goal_id = fixed_goal_id.unwrap_or_else(|| format!("goal_{id_suffix}"));
 
         if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
             bail!(
@@ -861,7 +1046,7 @@ impl Orchestrator {
             ),
         )?;
 
-        let epoch_id = format!("epoch_{}", id_timestamp());
+        let epoch_id = fixed_epoch_id.unwrap_or_else(|| format!("epoch_{}", id_timestamp()));
         let lease_seconds =
             u64::try_from(goal.budget.max_runtime_minutes.max(1).saturating_mul(60))
                 .unwrap_or(u64::MAX);
@@ -960,6 +1145,9 @@ impl Orchestrator {
         let initial_worker_config =
             initial_phase_decision.overlay_worker_config(&options.worker)?;
         let mut tasks = initial_tasks(&goal_id, &scope);
+        for task in &mut tasks {
+            task.id = scoped_task_id(task_namespace.as_deref(), &task.id);
+        }
         tasks.extend(plan_tasks.iter().map(|plan_task| {
             let mut task = plan_task.to_runtime_task(
                 &goal_id,
@@ -967,6 +1155,7 @@ impl Orchestrator {
                     .selected_route_for_hint(1, initial_plan_route_hint)
                     .worker_kind,
             );
+            task.id = scoped_task_id(task_namespace.as_deref(), &task.id);
             task.inputs.phase_route_locked = false;
             task
         }));
@@ -977,7 +1166,11 @@ impl Orchestrator {
 
         let spec_path =
             store.write_artifact(&goal_id, "spec.md", &product::spec(&goal, &detection))?;
-        complete_task(&mut tasks, "task_001", |task| {
+        let spec_task_id = scoped_task_id(task_namespace.as_deref(), "task_001");
+        let plan_meta_task_id = scoped_task_id(task_namespace.as_deref(), "task_002");
+        let verification_task_id = scoped_task_id(task_namespace.as_deref(), "task_004");
+        let report_task_id = scoped_task_id(task_namespace.as_deref(), "task_006");
+        complete_task(&mut tasks, &spec_task_id, |task| {
             task.outputs.summary = "Spec artifact created.".to_string();
             task.outputs
                 .evidence
@@ -989,7 +1182,7 @@ impl Orchestrator {
             event(
                 &session_id,
                 Some(&goal_id),
-                Some("task_001"),
+                Some(&spec_task_id),
                 EventKind::SpecCreated,
                 "Spec artifact created",
                 json!({ "path": spec_path.to_string_lossy() }),
@@ -1002,7 +1195,7 @@ impl Orchestrator {
             "plan.md",
             &product::plan(&goal, &plan_graph, &detection),
         )?;
-        complete_task(&mut tasks, "task_002", |task| {
+        complete_task(&mut tasks, &plan_meta_task_id, |task| {
             task.outputs.summary = "Plan artifact created.".to_string();
             task.outputs
                 .evidence
@@ -1020,7 +1213,7 @@ impl Orchestrator {
             event(
                 &session_id,
                 Some(&goal_id),
-                Some("task_002"),
+                Some(&plan_meta_task_id),
                 EventKind::PlanCreated,
                 "Plan artifact created",
                 json!({
@@ -1283,7 +1476,7 @@ impl Orchestrator {
                 .find(|node| node.task_id == plan_task_id)
                 .is_some_and(|node| node.attempt == 0);
             let worker_task_id = if first_plan_attempt {
-                plan_task_id.clone()
+                scoped_task_id(task_namespace.as_deref(), &plan_task_id)
             } else {
                 let verification_path = last_verification_path
                     .as_deref()
@@ -1297,6 +1490,7 @@ impl Orchestrator {
                     verification_path,
                     parent_task_id.clone(),
                     selected_route.worker_kind,
+                    task_namespace.as_deref(),
                 );
                 store.write_tasks(&goal_id, &tasks)?;
                 append_event(
@@ -1829,7 +2023,7 @@ impl Orchestrator {
             // If this was a review iteration, complete the pending review task
             // from the previous iteration that triggered this review.
             if worker_route_hint == Some("review") && iteration > 1 {
-                let prev_review_id = review_task_id(iteration - 1);
+                let prev_review_id = review_task_id(iteration - 1, task_namespace.as_deref());
                 if let Some(review_task) = tasks.iter_mut().find(|t| t.id == prev_review_id) {
                     review_task.status = TaskStatus::Complete;
                     review_task.assigned_worker =
@@ -1975,9 +2169,9 @@ impl Orchestrator {
                 ),
             )?;
 
-            start_task(&mut tasks, "task_004");
+            start_task(&mut tasks, &verification_task_id);
             goal.status = GoalStatus::Verifying;
-            goal.current_task_id = Some("task_004".to_string());
+            goal.current_task_id = Some(verification_task_id.clone());
             goal.updated_at = timestamp();
             store.write_goal(&goal)?;
             store.write_tasks(&goal_id, &tasks)?;
@@ -1987,7 +2181,7 @@ impl Orchestrator {
                 event(
                     &session_id,
                     Some(&goal_id),
-                    Some("task_004"),
+                    Some(&verification_task_id),
                     EventKind::VerificationStarted,
                     "Verification started",
                     json!({
@@ -2028,6 +2222,7 @@ impl Orchestrator {
                 && verification_results.iter().all(|result| result.success);
             update_verification_task(
                 &mut tasks,
+                &verification_task_id,
                 &verification_results,
                 verification_path.to_string_lossy().to_string(),
                 verification_passed,
@@ -2039,7 +2234,7 @@ impl Orchestrator {
                 event(
                     &session_id,
                     Some(&goal_id),
-                    Some("task_004"),
+                    Some(&verification_task_id),
                     if verification_passed {
                         EventKind::VerificationPassed
                     } else {
@@ -2281,6 +2476,7 @@ impl Orchestrator {
                 Some(worker_task_id.clone()),
                 repair_request_path.as_deref(),
                 selected_route.worker_kind.as_str(),
+                task_namespace.as_deref(),
             );
             store.write_tasks(&goal_id, &tasks)?;
             append_event(
@@ -2289,7 +2485,7 @@ impl Orchestrator {
                 event(
                     &session_id,
                     Some(&goal_id),
-                    Some(&review_task_id(iteration)),
+                    Some(&review_task_id(iteration, task_namespace.as_deref())),
                     EventKind::TaskStarted,
                     "Goal check completed",
                     json!({
@@ -2463,7 +2659,7 @@ impl Orchestrator {
         if let Some(executor_execution_id) = last_executor_execution_id.clone() {
             strategist_prior_execution_ids.push(executor_execution_id);
         }
-        let _strategist_receipt = run_strategist_next_goal(
+        let strategist_receipt = run_strategist_next_goal(
             &mut goal,
             &epoch_id,
             &plan_graph,
@@ -2475,7 +2671,7 @@ impl Orchestrator {
             &goal_run_lease,
             &strategist_prior_execution_ids,
         )?;
-        complete_task(&mut tasks, "task_006", |task| {
+        complete_task(&mut tasks, &report_task_id, |task| {
             task.outputs.summary = "Final report artifact created.".to_string();
             task.outputs
                 .evidence
@@ -2559,13 +2755,781 @@ impl Orchestrator {
         let status = goal.status;
         Ok(RunOutcome {
             goal_id,
+            epoch_id,
             session_id: session_id.clone(),
             status,
             artifacts_root,
             final_report_path,
             events_path: store.events_path(&session_id),
+            final_verification_wave_path: final_wave_path,
+            final_verification_wave_hash: final_wave_receipt.receipt_hash,
+            strategist_receipt,
         })
     }
+}
+
+fn run_objective_controller(
+    mut options: RunOptions,
+    phase_runtime: PhaseRuntime,
+    policy: ObjectivePolicy,
+) -> Result<ObjectiveRunOutcome> {
+    policy.validate()?;
+    let workspace = options.workspace.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve objective workspace {}",
+            options.workspace.display()
+        )
+    })?;
+    if !workspace.is_dir() {
+        bail!("objective workspace is not a directory: {}", workspace.display());
+    }
+    if options.request.trim().is_empty() {
+        bail!("objective request cannot be empty");
+    }
+    let store = StateStore::new(&workspace);
+    store.initialize()?;
+    let root_session_id = options
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("objective-session_{}", id_timestamp()));
+    if options.continuation && store.continuation_is_stopped_for_session(&root_session_id)? {
+        bail!(
+            "Gear objective continuation is stopped; explicitly restart the continuation before running again"
+        );
+    }
+    let objective_id = objective_id_for(&root_session_id, &workspace, &options.request)?;
+    let lease_seconds = u64::try_from(options.max_runtime_minutes.max(1).saturating_mul(60))
+        .unwrap_or(u64::MAX);
+    let objective_lease = store.acquire_objective_lease(
+        &objective_id,
+        &root_session_id,
+        Duration::from_secs(lease_seconds),
+    )?;
+    let policy_hash = policy.hash()?;
+    let mut graph = if let Some(graph) = store.read_objective_graph(&objective_id)? {
+        if graph.policy_hash != policy_hash
+            || graph.root_session_id != root_session_id
+            || graph.workspace != workspace.to_string_lossy()
+        {
+            bail!("objective resume policy, session, or workspace binding changed");
+        }
+        graph
+    } else {
+        let scope = Scope::new(
+            options.allowed_paths.clone(),
+            options.forbidden_paths.clone(),
+            options.max_files_changed,
+        );
+        let scope_hash = hash_serialized(&scope)?;
+        let graph = ObjectiveGraph::new(
+            &objective_id,
+            &root_session_id,
+            &workspace.to_string_lossy(),
+            &options.request,
+            &scope_hash,
+            policy.clone(),
+        )?;
+        let path = store.write_objective_graph(&graph)?;
+        store.append_objective_event(
+            &objective_id,
+            "objective.started",
+            ObjectiveEventKind::Started,
+            json!({
+                "root_session_id": root_session_id,
+                "graph_path": path.to_string_lossy(),
+                "policy_hash": policy_hash,
+            }),
+        )?;
+        graph
+    };
+
+    reconcile_objective_frontier(&store, &objective_id, &root_session_id, &mut graph)?;
+    if graph.status.is_terminal() {
+        objective_lease.release()?;
+        return Ok(ObjectiveRunOutcome {
+            objective_id: objective_id.clone(),
+            status: graph.status.clone(),
+            graph_path: store.objective_graph_path(&objective_id),
+            events_path: store.objective_events_path(&objective_id),
+            final_report_path: graph
+                .nodes
+                .iter()
+                .rev()
+                .find_map(|node| node.final_report_path.as_deref().map(PathBuf::from)),
+            goal_outcomes: Vec::new(),
+        });
+    }
+
+    if graph.nodes.is_empty() {
+        let root_goal_id = format!("goal_{objective_id}_000");
+        let root_epoch_id = format!("epoch_{objective_id}_000");
+        let root_node = objective_goal_node(
+            &root_goal_id,
+            &root_epoch_id,
+            &root_session_id,
+            &options.request,
+            Vec::new(),
+            None,
+            None,
+            None,
+            GoalStatus::Planning,
+            None,
+            hash_text(&normalize_objective(&options.request)),
+        )?;
+        graph.add_root_node(root_node)?;
+        store.write_objective_graph(&graph)?;
+        store.append_objective_event(
+            &objective_id,
+            &format!("goal-attached:{root_goal_id}"),
+            ObjectiveEventKind::GoalAttached,
+            json!({
+                "goal_id": root_goal_id,
+                "epoch_id": root_epoch_id,
+                "session_id": root_session_id,
+                "parent_goal_id": Value::Null,
+            }),
+        )?;
+    }
+
+    let mut goal_outcomes = Vec::new();
+    loop {
+        let active_node = graph
+            .active_node()
+            .cloned()
+            .context("running objective has no active goal frontier")?;
+        options.request = active_node.request.clone();
+        options.session_id = Some(active_node.session_id.clone());
+        options.continuation = true;
+        let outcome = Orchestrator::run_single_goal_with_phase_runtime(
+            options.clone(),
+            phase_runtime.clone(),
+            Some(active_node.goal_id.clone()),
+            Some(active_node.epoch_id.clone()),
+        )?;
+        let strategist_receipt = outcome.strategist_receipt.clone();
+        let strategist_receipt_hash = strategist_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_hash.clone());
+        graph.update_active_node(
+            &outcome.goal_id,
+            outcome.status.clone(),
+            Some(outcome.final_verification_wave_hash.clone()),
+            Some(outcome.final_report_path.to_string_lossy().to_string()),
+            strategist_receipt_hash,
+            Some(format!("goal status: {}", outcome.status.as_str())),
+        )?;
+        store.write_objective_graph(&graph)?;
+        goal_outcomes.push(outcome.clone());
+
+        if outcome.status != GoalStatus::Complete {
+            let consecutive_failures = graph.consecutive_failures.saturating_add(1);
+            graph.record_failure(consecutive_failures)?;
+            let objective_status = if consecutive_failures >= policy.max_consecutive_failures {
+                ObjectiveStatus::Limited
+            } else {
+                objective_status_for_goal(&outcome.status)
+            };
+            let reason = format!("active goal ended with {}", outcome.status.as_str());
+            graph.set_terminal(objective_status.clone(), reason.clone())?;
+            store.write_objective_graph(&graph)?;
+            append_objective_terminal_event(
+                &store,
+                &objective_id,
+                &objective_status,
+                &reason,
+                &outcome.goal_id,
+            )?;
+            break;
+        }
+
+        let Some(receipt) = strategist_receipt else {
+            let reason = "completed goal has no strategist receipt; objective stops safely";
+            graph.set_terminal(ObjectiveStatus::Complete, reason.to_string())?;
+            store.write_objective_graph(&graph)?;
+            append_objective_terminal_event(
+                &store,
+                &objective_id,
+                &ObjectiveStatus::Complete,
+                reason,
+                &outcome.goal_id,
+            )?;
+            break;
+        };
+        match receipt.verdict.decision {
+            StrategistNextGoalDecision::Complete => {
+                let reason = "strategist marked the objective complete";
+                graph.set_terminal(ObjectiveStatus::Complete, reason.to_string())?;
+                store.write_objective_graph(&graph)?;
+                append_objective_terminal_event(
+                    &store,
+                    &objective_id,
+                    &ObjectiveStatus::Complete,
+                    reason,
+                    &outcome.goal_id,
+                )?;
+                break;
+            }
+            StrategistNextGoalDecision::NeedsUser => {
+                let reason = receipt.verdict.required_questions.join("; ");
+                graph.set_terminal(ObjectiveStatus::NeedsUser, reason.clone())?;
+                store.write_objective_graph(&graph)?;
+                append_objective_terminal_event(
+                    &store,
+                    &objective_id,
+                    &ObjectiveStatus::NeedsUser,
+                    &reason,
+                    &outcome.goal_id,
+                )?;
+                break;
+            }
+            StrategistNextGoalDecision::Stop => {
+                let reason = receipt.verdict.rationale.clone();
+                graph.set_terminal(ObjectiveStatus::Stopped, reason.clone())?;
+                store.write_objective_graph(&graph)?;
+                append_objective_terminal_event(
+                    &store,
+                    &objective_id,
+                    &ObjectiveStatus::Stopped,
+                    &reason,
+                    &outcome.goal_id,
+                )?;
+                break;
+            }
+            StrategistNextGoalDecision::Continue => {
+                let receipt_idempotency = format!("continue:{}", receipt.receipt_hash);
+                store.append_objective_event(
+                    &objective_id,
+                    &receipt_idempotency,
+                    ObjectiveEventKind::StrategistContinueAccepted,
+                    json!({
+                        "parent_goal_id": outcome.goal_id,
+                        "parent_epoch_id": outcome.epoch_id,
+                        "receipt_hash": receipt.receipt_hash,
+                        "next_objective": receipt.verdict.next_objective,
+                        "acceptance_signals": receipt.verdict.acceptance_signals,
+                    }),
+                )?;
+                if store.continuation_is_stopped_for_session(&root_session_id)? {
+                    let reason = "objective continuation was stopped by the user before child dispatch";
+                    graph.set_terminal(ObjectiveStatus::Stopped, reason.to_string())?;
+                    store.write_objective_graph(&graph)?;
+                    append_objective_terminal_event(
+                        &store,
+                        &objective_id,
+                        &ObjectiveStatus::Stopped,
+                        reason,
+                        &outcome.goal_id,
+                    )?;
+                    break;
+                }
+                if !policy.auto_continue {
+                    let reason = "objective auto-continue is disabled by policy";
+                    graph.set_terminal(ObjectiveStatus::Stopped, reason.to_string())?;
+                    store.write_objective_graph(&graph)?;
+                    append_objective_terminal_event(
+                        &store,
+                        &objective_id,
+                        &ObjectiveStatus::Stopped,
+                        reason,
+                        &outcome.goal_id,
+                    )?;
+                    break;
+                }
+                if graph.nodes.len() >= policy.max_epochs {
+                    let reason = format!("objective reached max_epochs={}", policy.max_epochs);
+                    graph.set_terminal(ObjectiveStatus::Limited, reason.to_string())?;
+                    store.write_objective_graph(&graph)?;
+                    append_objective_terminal_event(
+                        &store,
+                        &objective_id,
+                        &ObjectiveStatus::Limited,
+                        &reason,
+                        &outcome.goal_id,
+                    )?;
+                    break;
+                }
+                let (calls, tokens, cost, unknown_calls) =
+                    objective_budget_totals(&store, &graph)?;
+                if calls >= policy.max_calls
+                    || tokens >= policy.max_tokens
+                    || (policy.max_cost_micros != u64::MAX && cost >= policy.max_cost_micros)
+                    || unknown_calls >= policy.max_unknown_usage_calls
+                {
+                    let reason = format!(
+                        "objective budget exhausted: calls={calls}, tokens={tokens}, cost_micros={cost}, unknown_calls={unknown_calls}"
+                    );
+                    graph.set_terminal(ObjectiveStatus::Limited, reason.to_string())?;
+                    store.write_objective_graph(&graph)?;
+                    append_objective_terminal_event(
+                        &store,
+                        &objective_id,
+                        &ObjectiveStatus::Limited,
+                        &reason,
+                        &outcome.goal_id,
+                    )?;
+                    break;
+                }
+                if policy.cooldown_seconds > 0
+                    && cooldown_remaining_seconds(
+                        &graph.updated_at,
+                        policy.cooldown_seconds,
+                    )? > 0
+                {
+                    let reason = format!(
+                        "objective cooldown of {} seconds has not elapsed",
+                        policy.cooldown_seconds
+                    );
+                    graph.set_terminal(ObjectiveStatus::Limited, reason.to_string())?;
+                    store.write_objective_graph(&graph)?;
+                    append_objective_terminal_event(
+                        &store,
+                        &objective_id,
+                        &ObjectiveStatus::Limited,
+                        &reason,
+                        &outcome.goal_id,
+                    )?;
+                    break;
+                }
+                let next_objective = receipt
+                    .verdict
+                    .next_objective
+                    .clone()
+                    .context("continue verdict lost its next objective")?;
+                let next_hash = hash_text(&normalize_objective(&next_objective));
+                let no_progress = graph
+                    .nodes
+                    .last()
+                    .is_some_and(|node| node.objective_hash == next_hash);
+                let consecutive_no_progress = if no_progress {
+                    graph.consecutive_no_progress.saturating_add(1)
+                } else {
+                    0
+                };
+                graph.record_progress(consecutive_no_progress)?;
+                if consecutive_no_progress >= policy.max_consecutive_no_progress {
+                    let reason = format!(
+                        "objective made no measurable progress for {} consecutive epochs",
+                        consecutive_no_progress
+                    );
+                    graph.set_terminal(ObjectiveStatus::Limited, reason.to_string())?;
+                    store.write_objective_graph(&graph)?;
+                    append_objective_terminal_event(
+                        &store,
+                        &objective_id,
+                        &ObjectiveStatus::Limited,
+                        &reason,
+                        &outcome.goal_id,
+                    )?;
+                    break;
+                }
+                let child_index = graph.nodes.len();
+                let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
+                let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
+                let child_session_id = format!("{root_session_id}.epoch{child_index}");
+                let child_node = objective_goal_node(
+                    &child_goal_id,
+                    &child_epoch_id,
+                    &child_session_id,
+                    &objective_child_request(
+                        &next_objective,
+                        &receipt.verdict.acceptance_signals,
+                    ),
+                    receipt.verdict.acceptance_signals.clone(),
+                    Some(outcome.goal_id.clone()),
+                    Some(outcome.epoch_id.clone()),
+                    Some(receipt.receipt_hash.clone()),
+                    GoalStatus::Planning,
+                    None,
+                    next_hash,
+                )?;
+                graph.attach_child(child_node)?;
+                store.write_objective_graph(&graph)?;
+                store.append_objective_event(
+                    &objective_id,
+                    &format!("goal-attached:{child_goal_id}"),
+                    ObjectiveEventKind::GoalAttached,
+                    json!({
+                        "goal_id": child_goal_id,
+                        "epoch_id": child_epoch_id,
+                        "session_id": child_session_id,
+                        "parent_goal_id": outcome.goal_id,
+                        "parent_epoch_id": outcome.epoch_id,
+                        "parent_strategist_receipt_hash": receipt.receipt_hash,
+                    }),
+                )?;
+                store.append_objective_event(
+                    &objective_id,
+                    &format!("frontier-advanced:{child_goal_id}"),
+                    ObjectiveEventKind::FrontierAdvanced,
+                    json!({ "active_goal_id": child_goal_id }),
+                )?;
+            }
+        }
+    }
+    let status = graph.status.clone();
+    let graph_path = store.write_objective_graph(&graph)?;
+    objective_lease.release()?;
+    Ok(ObjectiveRunOutcome {
+        objective_id: objective_id.clone(),
+        status,
+        graph_path,
+        events_path: store.objective_events_path(&objective_id),
+        final_report_path: goal_outcomes
+            .last()
+            .map(|outcome| outcome.final_report_path.clone()),
+        goal_outcomes,
+    })
+}
+
+fn reconcile_objective_frontier(
+    store: &StateStore,
+    objective_id: &str,
+    root_session_id: &str,
+    graph: &mut ObjectiveGraph,
+) -> Result<()> {
+    let mut events = store.read_objective_events(objective_id)?;
+    if events.is_empty() {
+        store.append_objective_event(
+            objective_id,
+            "objective.started",
+            ObjectiveEventKind::Started,
+            json!({ "root_session_id": root_session_id }),
+        )?;
+        events = store.read_objective_events(objective_id)?;
+    }
+
+    for node in &graph.nodes {
+        let idempotency_key = format!("goal-attached:{}", node.goal_id);
+        if events
+            .iter()
+            .all(|event| event.idempotency_key != idempotency_key)
+        {
+            store.append_objective_event(
+                objective_id,
+                &idempotency_key,
+                ObjectiveEventKind::GoalAttached,
+                json!({
+                    "goal_id": node.goal_id,
+                    "epoch_id": node.epoch_id,
+                    "session_id": node.session_id,
+                    "parent_goal_id": node.parent_goal_id,
+                    "parent_epoch_id": node.parent_epoch_id,
+                    "parent_strategist_receipt_hash": node.parent_strategist_receipt_hash,
+                }),
+            )?;
+            events = store.read_objective_events(objective_id)?;
+        }
+    }
+
+    if graph.status.is_terminal() {
+        let has_terminal_event = events.iter().any(|event| {
+            matches!(
+                event.kind,
+                ObjectiveEventKind::NeedsUser
+                    | ObjectiveEventKind::Stopped
+                    | ObjectiveEventKind::Limited
+                    | ObjectiveEventKind::Blocked
+                    | ObjectiveEventKind::Completed
+                    | ObjectiveEventKind::Failed
+                    | ObjectiveEventKind::Aborted
+            )
+        });
+        if !has_terminal_event {
+            let goal_id = graph
+                .nodes
+                .last()
+                .map(|node| node.goal_id.as_str())
+                .unwrap_or("none");
+            append_objective_terminal_event(
+                store,
+                objective_id,
+                &graph.status,
+                graph.stop_reason.as_deref().unwrap_or("objective terminal"),
+                goal_id,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if graph.nodes.is_empty() || graph.active_goal_id.is_some() {
+        return Ok(());
+    }
+
+    let Some(continue_event) = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == ObjectiveEventKind::StrategistContinueAccepted)
+    else {
+        let reason = "objective frontier was completed without a durable strategist continuation";
+        graph.set_terminal(ObjectiveStatus::Blocked, reason.to_string())?;
+        store.write_objective_graph(graph)?;
+        append_objective_terminal_event(
+            store,
+            objective_id,
+            &ObjectiveStatus::Blocked,
+            reason,
+            graph
+                .nodes
+                .last()
+                .map(|node| node.goal_id.as_str())
+                .unwrap_or("none"),
+        )?;
+        return Ok(());
+    };
+    let parent_goal_id = continue_event
+        .payload
+        .get("parent_goal_id")
+        .and_then(Value::as_str)
+        .context("continuation event is missing parent_goal_id")?;
+    let parent_epoch_id = continue_event
+        .payload
+        .get("parent_epoch_id")
+        .and_then(Value::as_str)
+        .context("continuation event is missing parent_epoch_id")?;
+    let receipt_hash = continue_event
+        .payload
+        .get("receipt_hash")
+        .and_then(Value::as_str)
+        .context("continuation event is missing receipt_hash")?;
+    let next_objective = continue_event
+        .payload
+        .get("next_objective")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("continuation event is missing next_objective")?;
+    let acceptance_signals = continue_event
+        .payload
+        .get("acceptance_signals")
+        .and_then(Value::as_array)
+        .context("continuation event is missing acceptance_signals")?
+        .iter()
+        .map(|signal| {
+            signal
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+                .context("continuation event contains an invalid acceptance signal")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let parent = graph
+        .nodes
+        .iter()
+        .find(|node| node.goal_id == parent_goal_id)
+        .context("continuation event references an unknown parent goal")?;
+    if parent.status != GoalStatus::Complete
+        || parent.epoch_id != parent_epoch_id
+        || parent.strategist_receipt_hash.as_deref() != Some(receipt_hash)
+        || parent.final_wave_receipt_hash.is_none()
+    {
+        bail!("continuation event is not bound to a completed parent goal");
+    }
+    let child_index = graph.nodes.len();
+    let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
+    let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
+    let child_session_id = format!("{root_session_id}.epoch{child_index}");
+    if graph
+        .nodes
+        .iter()
+        .any(|node| node.goal_id == child_goal_id)
+    {
+        bail!("objective recovery found a duplicate child goal id");
+    }
+    let child_node = objective_goal_node(
+        &child_goal_id,
+        &child_epoch_id,
+        &child_session_id,
+        &objective_child_request(next_objective, &acceptance_signals),
+        acceptance_signals.clone(),
+        Some(parent_goal_id.to_string()),
+        Some(parent_epoch_id.to_string()),
+        Some(receipt_hash.to_string()),
+        GoalStatus::Planning,
+        None,
+        hash_text(&normalize_objective(next_objective)),
+    )?;
+    graph.attach_child(child_node)?;
+    store.write_objective_graph(graph)?;
+    store.append_objective_event(
+        objective_id,
+        &format!("goal-attached:{child_goal_id}"),
+        ObjectiveEventKind::GoalAttached,
+        json!({
+            "goal_id": child_goal_id,
+            "epoch_id": child_epoch_id,
+            "session_id": child_session_id,
+            "parent_goal_id": parent_goal_id,
+            "parent_epoch_id": parent_epoch_id,
+            "parent_strategist_receipt_hash": receipt_hash,
+        }),
+    )?;
+    store.append_objective_event(
+        objective_id,
+        &format!("frontier-advanced:{child_goal_id}"),
+        ObjectiveEventKind::FrontierAdvanced,
+        json!({ "active_goal_id": child_goal_id }),
+    )?;
+    Ok(())
+}
+
+fn objective_child_request(next_objective: &str, acceptance_signals: &[String]) -> String {
+    format!(
+        "{}\n\nObjective acceptance signals:\n{}",
+        next_objective,
+        acceptance_signals
+            .iter()
+            .map(|signal| format!("- {signal}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn objective_goal_node(
+    goal_id: &str,
+    epoch_id: &str,
+    session_id: &str,
+    request: &str,
+    acceptance_signals: Vec<String>,
+    parent_goal_id: Option<String>,
+    parent_epoch_id: Option<String>,
+    parent_strategist_receipt_hash: Option<String>,
+    status: GoalStatus,
+    final_wave_receipt_hash: Option<String>,
+    objective_hash: String,
+) -> Result<GoalGraphNode> {
+    let now = timestamp();
+    let node = GoalGraphNode {
+        goal_id: goal_id.to_string(),
+        epoch_id: epoch_id.to_string(),
+        session_id: session_id.to_string(),
+        request: request.to_string(),
+        acceptance_signals,
+        parent_goal_id,
+        parent_epoch_id,
+        parent_strategist_receipt_hash,
+        request_hash: hash_text(request),
+        objective_hash: objective_hash.clone(),
+        status,
+        final_wave_receipt_hash,
+        final_report_path: None,
+        strategist_receipt_hash: None,
+        progress_fingerprint: objective_hash,
+        terminal_reason: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    node.validate()?;
+    Ok(node)
+}
+
+fn objective_id_for(root_session_id: &str, workspace: &std::path::Path, request: &str) -> Result<String> {
+    let seed = format!(
+        "{}\n{}\n{}",
+        root_session_id,
+        workspace.to_string_lossy(),
+        normalize_objective(request)
+    );
+    Ok(format!("objective_{}", &hash_text(&seed)[..20]))
+}
+
+fn normalize_objective(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+fn hash_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn hash_serialized<T: Serialize>(value: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(value).context("failed to serialize objective binding")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn objective_status_for_goal(status: &GoalStatus) -> ObjectiveStatus {
+    match status {
+        GoalStatus::NeedsUser => ObjectiveStatus::NeedsUser,
+        GoalStatus::Blocked => ObjectiveStatus::Blocked,
+        GoalStatus::Limited => ObjectiveStatus::Limited,
+        GoalStatus::Failed => ObjectiveStatus::Failed,
+        GoalStatus::Complete => ObjectiveStatus::Complete,
+        GoalStatus::Draft
+        | GoalStatus::Planning
+        | GoalStatus::Running
+        | GoalStatus::Verifying => ObjectiveStatus::Failed,
+    }
+}
+
+fn append_objective_terminal_event(
+    store: &StateStore,
+    objective_id: &str,
+    status: &ObjectiveStatus,
+    reason: &str,
+    goal_id: &str,
+) -> Result<()> {
+    let kind = match status {
+        ObjectiveStatus::NeedsUser => ObjectiveEventKind::NeedsUser,
+        ObjectiveStatus::Stopped => ObjectiveEventKind::Stopped,
+        ObjectiveStatus::Limited => ObjectiveEventKind::Limited,
+        ObjectiveStatus::Blocked => ObjectiveEventKind::Blocked,
+        ObjectiveStatus::Complete => ObjectiveEventKind::Completed,
+        ObjectiveStatus::Failed => ObjectiveEventKind::Failed,
+        ObjectiveStatus::Running => bail!("running objective cannot append a terminal event"),
+    };
+    store.append_objective_event(
+        objective_id,
+        &format!("terminal:{goal_id}:{}", status_name(status)),
+        kind,
+        json!({ "goal_id": goal_id, "reason": reason }),
+    )?;
+    Ok(())
+}
+
+fn status_name(status: &ObjectiveStatus) -> &'static str {
+    match status {
+        ObjectiveStatus::Running => "running",
+        ObjectiveStatus::NeedsUser => "needs_user",
+        ObjectiveStatus::Stopped => "stopped",
+        ObjectiveStatus::Limited => "limited",
+        ObjectiveStatus::Blocked => "blocked",
+        ObjectiveStatus::Complete => "complete",
+        ObjectiveStatus::Failed => "failed",
+    }
+}
+
+fn objective_budget_totals(
+    store: &StateStore,
+    graph: &ObjectiveGraph,
+) -> Result<(usize, u64, u64, usize)> {
+    let mut calls = 0usize;
+    let mut tokens = 0u64;
+    let mut cost = 0u64;
+    let mut unknown_calls = 0usize;
+    for node in &graph.nodes {
+        let ledger = store.read_goal_budget_ledger(&node.goal_id)?;
+        for reservation in ledger.reservations {
+            if reservation.status == crate::state::BudgetReservationStatus::Released {
+                continue;
+            }
+            calls = calls.saturating_add(1);
+            if let Some(usage) = reservation.usage {
+                tokens = tokens.saturating_add(usage.total_tokens().unwrap_or(reservation.reserved_tokens));
+                if let Some(actual_cost) = usage.cost_micros {
+                    cost = cost.saturating_add(actual_cost);
+                }
+                unknown_calls = unknown_calls.saturating_add(usize::from(usage.is_unknown()));
+            } else {
+                tokens = tokens.saturating_add(reservation.reserved_tokens);
+                unknown_calls = unknown_calls.saturating_add(1);
+            }
+        }
+    }
+    Ok((calls, tokens, cost, unknown_calls))
+}
+
+fn cooldown_remaining_seconds(updated_at: &str, cooldown_seconds: u64) -> Result<u64> {
+    let updated = DateTime::parse_from_rfc3339(updated_at)
+        .context("objective graph has invalid updated_at")?;
+    let elapsed = Local::now().timestamp().saturating_sub(updated.timestamp());
+    Ok(cooldown_seconds.saturating_sub(u64::try_from(elapsed.max(0)).unwrap_or(0)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4020,6 +4984,13 @@ fn initial_tasks(goal_id: &str, scope: &Scope) -> Vec<Task> {
     .collect()
 }
 
+fn scoped_task_id(namespace: Option<&str>, base_id: &str) -> String {
+    namespace
+        .filter(|namespace| !namespace.trim().is_empty())
+        .map(|namespace| format!("{namespace}::{base_id}"))
+        .unwrap_or_else(|| base_id.to_string())
+}
+
 fn start_task(tasks: &mut [Task], task_id: &str) {
     if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
         task.status = TaskStatus::Running;
@@ -4650,11 +5621,15 @@ fn check_run_cancelled(cancellation_token: Option<&CancellationToken>) -> Result
 
 fn update_verification_task(
     tasks: &mut [Task],
+    verification_task_id: &str,
     results: &[ShellCommandResult],
     verification_path: String,
     verification_passed: bool,
 ) {
-    if let Some(task) = tasks.iter_mut().find(|task| task.id == "task_004") {
+    if let Some(task) = tasks
+        .iter_mut()
+        .find(|task| task.id == verification_task_id)
+    {
         task.status = if verification_passed {
             TaskStatus::Complete
         } else {
@@ -4803,11 +5778,19 @@ fn add_repair_task(
     verification_path: &std::path::Path,
     parent_task_id: Option<String>,
     worker_kind: WorkerKind,
+    task_namespace: Option<&str>,
 ) -> String {
-    let task_id = repair_task_id(iteration);
+    let task_id = scoped_task_id(task_namespace, &repair_task_id(iteration));
     let plan_task = tasks
         .iter()
-        .find(|task| task.id == plan_task_id)
+        .find(|task| {
+            task.id == plan_task_id
+                || task
+                    .inputs
+                    .plan_task
+                    .as_ref()
+                    .is_some_and(|plan_task| plan_task.task_id == plan_task_id)
+        })
         .and_then(|task| task.inputs.plan_task.clone());
     tasks.push(Task {
         id: task_id.clone(),
@@ -4844,8 +5827,8 @@ fn repair_task_id(iteration: usize) -> String {
     }
 }
 
-fn review_task_id(iteration: usize) -> String {
-    format!("task_review_{iteration:03}")
+fn review_task_id(iteration: usize, task_namespace: Option<&str>) -> String {
+    scoped_task_id(task_namespace, &format!("task_review_{iteration:03}"))
 }
 
 fn add_review_task(
@@ -4858,13 +5841,14 @@ fn add_review_task(
     parent_task_id: Option<String>,
     repair_request_path: Option<&std::path::Path>,
     worker_kind: &str,
+    task_namespace: Option<&str>,
 ) {
     let mut evidence = vec![review_path.to_string_lossy().to_string()];
     if let Some(repair_request_path) = repair_request_path {
         evidence.push(repair_request_path.to_string_lossy().to_string());
     }
     tasks.push(Task {
-        id: review_task_id(iteration),
+        id: review_task_id(iteration, task_namespace),
         goal_id: goal_id.to_string(),
         parent_task_id,
         title: format!("Review goal after iteration {iteration}"),
@@ -7198,6 +8182,103 @@ mod tests {
         }
     }
 
+    fn objective_worker_for_test() -> WorkerConfig {
+        let mut config = WorkerConfig::default();
+        config.worker_kind = WorkerKind::Opencode;
+        config.worker_command = Some(
+            r###"sh -c 'task_id=$(grep -o "\"task_id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$GEARBOX_WORKER_PACKET" | head -1 | cut -d "\"" -f4); reviewed_id=$(grep -o '"'"'reviewed_execution_id\\":\\"[^\\"]*'"'"' "$GEARBOX_WORKER_PACKET" | head -1 | sed '"'"'s/.*\\"//'"'"'); if [ -z "$reviewed_id" ]; then reviewed_id=$task_id; fi; printf "%s" "{\"schema_version\":1,\"reviewed_execution_id\":\"TASK_ID\",\"dimensions\":[{\"dimension\":\"goal_verification\",\"verdict\":\"pass\",\"findings\":[\"verification evidence inspected\"]},{\"dimension\":\"code_quality\",\"verdict\":\"pass\",\"findings\":[\"scope inspected\"]},{\"dimension\":\"security\",\"verdict\":\"pass\",\"findings\":[\"forbidden paths clean\"]},{\"dimension\":\"qa_execution\",\"verdict\":\"pass\",\"findings\":[\"verification passed\"]}]}" | sed "s|TASK_ID|$reviewed_id|" > "$GEARBOX_WORKER_LAST_MESSAGE"'"###
+                .to_string(),
+        );
+        config.skip_worker = false;
+        config.require_worker = true;
+        config
+    }
+
+    #[test]
+    fn strategist_continue_production_repro() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let critic_hook: PlanCriticHook = Arc::new(|input| {
+            plan_critic_submission(&input, 1, PlanCriticDecision::Approve)
+        });
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = deterministic_fallback_draft(
+                &input.request,
+                &input.scope,
+                &input.verification_commands,
+            );
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("repro_planner"),
+                artifact_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
+            let verdict = StrategistNextGoalVerdict {
+                schema_version: 1,
+                goal_id: input.goal_id,
+                epoch_id: input.epoch_id,
+                reviewed_status: input.status,
+                decision: StrategistNextGoalDecision::Continue,
+                next_objective: Some("Create the successor objective".to_string()),
+                acceptance_signals: vec!["The successor has a durable edge".to_string()],
+                required_questions: Vec::new(),
+                evidence_refs: vec![input.final_report_path],
+                rationale: "The first epoch passed and has a bounded successor".to_string(),
+            };
+            Ok(StrategistNextGoalSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                strategist: phase_identity("repro_strategist"),
+                artifact_path: None,
+            })
+        }));
+        let outcome = Orchestrator::run_with_phase_runtime(
+            RunOptions {
+                request: "Reproduce a discarded Continue receipt".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("repro-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+        )?;
+        assert_eq!(outcome.status, GoalStatus::Complete);
+        assert_eq!(
+            outcome
+                .strategist_receipt
+                .as_ref()
+                .map(|receipt| receipt.verdict.decision),
+            Some(StrategistNextGoalDecision::Continue)
+        );
+        let store = StateStore::new(temp_dir.path());
+        let epoch_events = store.read_goal_epoch_events(&outcome.goal_id)?;
+        assert!(epoch_events
+            .iter()
+            .any(|event| event.kind == GoalEpochEventKind::NextGoalSelected));
+        assert_eq!(fs::read_dir(store.goals_dir())?.count(), 1);
+        assert_eq!(fs::read_dir(store.objectives_dir())?.count(), 0);
+        Ok(())
+    }
+
     fn mock_task_attempt() -> Result<(tempfile::TempDir, TaskAttempt)> {
         let temp_dir = tempfile::tempdir()?;
         let receipt_path = temp_dir.path().join("review-receipt.json");
@@ -7453,6 +8534,335 @@ mod tests {
             2
         );
         lease.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_objective_continue_creates_one_child() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let strategist_calls = Arc::new(AtomicUsize::new(0));
+        let critic_calls = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook = {
+            let critic_calls = critic_calls.clone();
+            Arc::new(move |input: PlanCriticInput| {
+                let call = critic_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                plan_critic_submission(&input, call, PlanCriticDecision::Approve)
+            })
+        };
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        phase_runtime.planner_hook = Some({
+            let planner_calls = planner_calls.clone();
+            Arc::new(move |input: PlannerInput| {
+                let call = planner_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let draft = deterministic_fallback_draft(
+                    &input.request,
+                    &input.scope,
+                    &input.verification_commands,
+                );
+                Ok(PlannerSubmission {
+                    raw_output: serde_json::to_string(&draft)?,
+                    draft,
+                    planner: phase_identity(&format!("planner_{call}")),
+                    artifact_path: None,
+                })
+            })
+        });
+        phase_runtime.strategist_next_goal_hook = Some({
+            let strategist_calls = strategist_calls.clone();
+            Arc::new(move |input: StrategistNextGoalInput| {
+                let call = strategist_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let decision = if call == 1 {
+                    StrategistNextGoalDecision::Continue
+                } else {
+                    StrategistNextGoalDecision::Complete
+                };
+                let (next_objective, acceptance_signals) = if call == 1 {
+                    (
+                        Some("Add restart persistence".to_string()),
+                        vec!["The state survives a process restart".to_string()],
+                    )
+                } else {
+                    (None, Vec::new())
+                };
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision,
+                    next_objective,
+                    acceptance_signals,
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    rationale: if call == 1 {
+                        "The next bounded objective is ready".to_string()
+                    } else {
+                        "The objective is complete".to_string()
+                    },
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity(&format!("strategist_{call}")),
+                    artifact_path: None,
+                })
+            }) as StrategistNextGoalHook
+        });
+        let outcome = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Build a restart-safe task tracker".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("objective-root-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+            ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 2,
+                ..ObjectivePolicy::default()
+            },
+        )?;
+
+        assert_eq!(outcome.status, ObjectiveStatus::Complete);
+        assert_eq!(outcome.goal_outcomes.len(), 2);
+        assert_ne!(
+            outcome.goal_outcomes[0].goal_id,
+            outcome.goal_outcomes[1].goal_id
+        );
+        assert_ne!(
+            outcome.goal_outcomes[0].session_id,
+            outcome.goal_outcomes[1].session_id
+        );
+        let store = StateStore::new(temp_dir.path());
+        let graph: ObjectiveGraph = serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
+        graph.validate()?;
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(
+            graph.nodes[1].parent_goal_id.as_deref(),
+            Some(graph.nodes[0].goal_id.as_str())
+        );
+        assert_eq!(
+            store
+                .read_objective_events(&outcome.objective_id)?
+                .iter()
+                .filter(|event| event.kind == ObjectiveEventKind::GoalAttached)
+                .count(),
+            2
+        );
+        assert_eq!(strategist_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn objective_controller_stops_before_child_when_epoch_limit_is_reached() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = deterministic_fallback_draft(
+                &input.request,
+                &input.scope,
+                &input.verification_commands,
+            );
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("limited_planner"),
+                artifact_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
+            let verdict = StrategistNextGoalVerdict {
+                schema_version: 1,
+                goal_id: input.goal_id,
+                epoch_id: input.epoch_id,
+                reviewed_status: input.status,
+                decision: StrategistNextGoalDecision::Continue,
+                next_objective: Some("Repeat the same bounded task".to_string()),
+                acceptance_signals: vec!["A stable observation exists".to_string()],
+                required_questions: Vec::new(),
+                evidence_refs: vec![input.final_report_path],
+                rationale: "Continue is intentionally blocked by the epoch policy".to_string(),
+            };
+            Ok(StrategistNextGoalSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                strategist: phase_identity("limited_strategist"),
+                artifact_path: None,
+            })
+        }));
+        let outcome = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Build a bounded artifact".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("objective-limit-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+            ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 1,
+                ..ObjectivePolicy::default()
+            },
+        )?;
+        assert_eq!(outcome.status, ObjectiveStatus::Limited);
+        assert_eq!(outcome.goal_outcomes.len(), 1);
+        let graph: ObjectiveGraph = serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.active_goal_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn objective_resume_reconciles_child_after_continue_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let objective_id = "objective-recovery";
+        let root_session_id = "recovery-root";
+        let mut graph = ObjectiveGraph::new(
+            objective_id,
+            root_session_id,
+            &temp_dir.path().to_string_lossy(),
+            "Build a recoverable artifact",
+            "scope-hash",
+            ObjectivePolicy::rolling_default(),
+        )?;
+        let root = objective_goal_node(
+            "goal-recovery-000",
+            "epoch-recovery-000",
+            root_session_id,
+            "Build a recoverable artifact",
+            Vec::new(),
+            None,
+            None,
+            None,
+            GoalStatus::Planning,
+            None,
+            hash_text("build a recoverable artifact"),
+        )?;
+        graph.add_root_node(root)?;
+        store.write_objective_graph(&graph)?;
+        store.append_objective_event(
+            objective_id,
+            "objective.started",
+            ObjectiveEventKind::Started,
+            json!({ "root_session_id": root_session_id }),
+        )?;
+        store.append_objective_event(
+            objective_id,
+            "goal-attached:goal-recovery-000",
+            ObjectiveEventKind::GoalAttached,
+            json!({ "goal_id": "goal-recovery-000" }),
+        )?;
+        graph.update_active_node(
+            "goal-recovery-000",
+            GoalStatus::Complete,
+            Some("final-wave-recovery".to_string()),
+            Some("/tmp/recovery-final-report.md".to_string()),
+            Some("strategist-recovery".to_string()),
+            Some("complete".to_string()),
+        )?;
+        store.write_objective_graph(&graph)?;
+        store.append_objective_event(
+            objective_id,
+            "continue:strategist-recovery",
+            ObjectiveEventKind::StrategistContinueAccepted,
+            json!({
+                "parent_goal_id": "goal-recovery-000",
+                "parent_epoch_id": "epoch-recovery-000",
+                "receipt_hash": "strategist-recovery",
+                "next_objective": "Persist the recovered artifact",
+                "acceptance_signals": ["The artifact is present after restart"],
+            }),
+        )?;
+
+        reconcile_objective_frontier(&store, objective_id, root_session_id, &mut graph)?;
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.active_goal_id.as_deref(), Some("goal_objective-recovery_001"));
+        assert_eq!(graph.nodes[1].parent_strategist_receipt_hash.as_deref(), Some("strategist-recovery"));
+        assert_eq!(store.read_objective_events(objective_id)?.iter().filter(|event| event.kind == ObjectiveEventKind::GoalAttached).count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn objective_stop_prevents_dispatch_before_frontier_creation() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        store.write_continuation_state(
+            "objective-stop-session",
+            "stopped-goal",
+            ContinuationStatus::Stopped,
+        )?;
+        let error = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Do not dispatch this stopped objective".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: Vec::new(),
+                worker: WorkerConfig::default(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 1,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 1,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("objective-stop-session".to_string()),
+                continuation: true,
+            },
+            PhaseRuntime::legacy(),
+            ObjectivePolicy::default(),
+        )
+        .expect_err("a stopped objective must not dispatch a goal");
+        assert!(error.to_string().contains("continuation is stopped"));
         Ok(())
     }
 

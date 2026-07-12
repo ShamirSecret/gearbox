@@ -231,6 +231,17 @@ pub enum GoalStatus {
 }
 
 impl GoalStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::NeedsUser
+                | Self::Blocked
+                | Self::Limited
+                | Self::Complete
+                | Self::Failed
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Draft => "draft",
@@ -738,6 +749,531 @@ pub struct GoalEpochEvent {
     pub event_hash: String,
 }
 
+pub const OBJECTIVE_GRAPH_SCHEMA_VERSION: u32 = 1;
+pub const OBJECTIVE_EVENT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectivePolicy {
+    pub auto_continue: bool,
+    pub max_epochs: usize,
+    pub max_calls: usize,
+    pub max_tokens: u64,
+    pub max_cost_micros: u64,
+    pub max_unknown_usage_calls: usize,
+    pub max_consecutive_no_progress: usize,
+    pub max_consecutive_failures: usize,
+    pub cooldown_seconds: u64,
+}
+
+impl Default for ObjectivePolicy {
+    fn default() -> Self {
+        Self {
+            auto_continue: false,
+            max_epochs: 1,
+            max_calls: 96,
+            max_tokens: 12_288_000,
+            max_cost_micros: 10_000_000,
+            max_unknown_usage_calls: 32,
+            max_consecutive_no_progress: 2,
+            max_consecutive_failures: 3,
+            cooldown_seconds: 0,
+        }
+    }
+}
+
+impl ObjectivePolicy {
+    pub fn rolling_default() -> Self {
+        Self {
+            auto_continue: true,
+            max_epochs: 3,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.max_epochs == 0
+            || self.max_calls == 0
+            || self.max_tokens == 0
+            || self.max_cost_micros == 0
+            || self.max_unknown_usage_calls == 0
+            || self.max_consecutive_no_progress == 0
+            || self.max_consecutive_failures == 0
+        {
+            bail!("objective policy limits must be greater than zero");
+        }
+        Ok(())
+    }
+
+    pub fn hash(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(self).context("failed to serialize objective policy")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveStatus {
+    Running,
+    NeedsUser,
+    Stopped,
+    Limited,
+    Blocked,
+    Complete,
+    Failed,
+}
+
+impl ObjectiveStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::NeedsUser
+                | Self::Stopped
+                | Self::Limited
+                | Self::Blocked
+                | Self::Complete
+                | Self::Failed
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalGraphNode {
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub session_id: String,
+    pub request: String,
+    pub acceptance_signals: Vec<String>,
+    pub parent_goal_id: Option<String>,
+    pub parent_epoch_id: Option<String>,
+    pub parent_strategist_receipt_hash: Option<String>,
+    pub request_hash: String,
+    pub objective_hash: String,
+    pub status: GoalStatus,
+    pub final_wave_receipt_hash: Option<String>,
+    pub final_report_path: Option<String>,
+    pub strategist_receipt_hash: Option<String>,
+    pub progress_fingerprint: String,
+    pub terminal_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl GoalGraphNode {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("goal_id", self.goal_id.as_str()),
+            ("epoch_id", self.epoch_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("request", self.request.as_str()),
+            ("request_hash", self.request_hash.as_str()),
+            ("objective_hash", self.objective_hash.as_str()),
+            ("progress_fingerprint", self.progress_fingerprint.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("goal graph node requires non-empty {field}");
+            }
+        }
+        if self.status == GoalStatus::Complete
+            && (self.final_wave_receipt_hash.is_none() || self.final_report_path.is_none())
+        {
+            bail!("completed goal graph node requires final wave and report artifacts");
+        }
+        let expected_request_hash = format!("{:x}", Sha256::digest(self.request.as_bytes()));
+        if self.request_hash != expected_request_hash {
+            bail!("goal graph node request hash does not match its request");
+        }
+        match (&self.parent_goal_id, &self.parent_epoch_id, &self.parent_strategist_receipt_hash) {
+            (None, None, None) => {}
+            (Some(_), Some(_), Some(hash)) if !hash.trim().is_empty() => {}
+            _ => bail!("objective child must bind its parent epoch and strategist receipt"),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveGraph {
+    pub schema_version: u32,
+    pub objective_id: String,
+    pub root_session_id: String,
+    pub workspace: String,
+    pub request: String,
+    pub scope_hash: String,
+    pub policy: ObjectivePolicy,
+    pub policy_hash: String,
+    pub nodes: Vec<GoalGraphNode>,
+    pub active_goal_id: Option<String>,
+    pub status: ObjectiveStatus,
+    pub stop_reason: Option<String>,
+    pub consecutive_no_progress: usize,
+    pub consecutive_failures: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    pub graph_hash: String,
+}
+
+impl ObjectiveGraph {
+    pub fn new(
+        objective_id: &str,
+        root_session_id: &str,
+        workspace: &str,
+        request: &str,
+        scope_hash: &str,
+        policy: ObjectivePolicy,
+    ) -> Result<Self> {
+        policy.validate()?;
+        let now = timestamp();
+        let policy_hash = policy.hash()?;
+        let mut graph = Self {
+            schema_version: OBJECTIVE_GRAPH_SCHEMA_VERSION,
+            objective_id: objective_id.to_string(),
+            root_session_id: root_session_id.to_string(),
+            workspace: workspace.to_string(),
+            request: request.to_string(),
+            scope_hash: scope_hash.to_string(),
+            policy,
+            policy_hash,
+            nodes: Vec::new(),
+            active_goal_id: None,
+            status: ObjectiveStatus::Running,
+            stop_reason: None,
+            consecutive_no_progress: 0,
+            consecutive_failures: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            graph_hash: String::new(),
+        };
+        graph.graph_hash = graph.expected_hash()?;
+        graph.validate()?;
+        Ok(graph)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != OBJECTIVE_GRAPH_SCHEMA_VERSION
+            || self.objective_id.trim().is_empty()
+            || self.root_session_id.trim().is_empty()
+            || self.workspace.trim().is_empty()
+            || self.request.trim().is_empty()
+            || self.scope_hash.trim().is_empty()
+            || self.policy_hash != self.policy.hash()?
+            || self.graph_hash != self.expected_hash()?
+        {
+            bail!("objective graph binding or hash is invalid");
+        }
+        let mut goal_ids = HashSet::new();
+        let mut active_goal = None;
+        for node in &self.nodes {
+            node.validate()?;
+            if !goal_ids.insert(node.goal_id.as_str()) {
+                bail!("objective graph contains duplicate goal {}", node.goal_id);
+            }
+            if let Some(parent_goal_id) = node.parent_goal_id.as_deref()
+                && !goal_ids.contains(parent_goal_id)
+            {
+                bail!("objective graph node {} references a missing parent", node.goal_id);
+            }
+            if !node.status.is_terminal() {
+                if active_goal.replace(node.goal_id.as_str()).is_some() {
+                    bail!("objective graph has more than one active frontier");
+                }
+            }
+        }
+        if self.active_goal_id.as_deref() != active_goal {
+            bail!("objective graph active frontier does not match node statuses");
+        }
+        if self.status.is_terminal() && active_goal.is_some() {
+            bail!("terminal objective cannot retain an active goal frontier");
+        }
+        Ok(())
+    }
+
+    pub fn add_root_node(&mut self, node: GoalGraphNode) -> Result<()> {
+        if !self.nodes.is_empty() {
+            bail!("objective graph root node already exists");
+        }
+        if node.parent_goal_id.is_some()
+            || node.parent_epoch_id.is_some()
+            || node.parent_strategist_receipt_hash.is_some()
+        {
+            bail!("objective graph root node cannot have a parent");
+        }
+        self.nodes.push(node);
+        self.active_goal_id = self.nodes.first().map(|node| node.goal_id.clone());
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
+    pub fn attach_child(&mut self, node: GoalGraphNode) -> Result<()> {
+        let parent_goal_id = node
+            .parent_goal_id
+            .as_deref()
+            .context("objective child is missing parent goal")?;
+        let parent = self
+            .nodes
+            .iter()
+            .find(|candidate| candidate.goal_id == parent_goal_id)
+            .context("objective child references an unknown parent goal")?;
+        if !parent.status.is_terminal() || parent.status != GoalStatus::Complete {
+            bail!("objective child requires a completed parent goal");
+        }
+        if parent.final_wave_receipt_hash.is_none()
+            || parent.strategist_receipt_hash.is_none()
+            || node.parent_epoch_id.as_deref() != Some(parent.epoch_id.as_str())
+            || node.parent_strategist_receipt_hash.as_deref()
+                != parent.strategist_receipt_hash.as_deref()
+        {
+            bail!("objective child is not bound to the parent's final wave and strategist receipt");
+        }
+        if self.active_goal_id.is_some() {
+            bail!("objective graph already has an active frontier");
+        }
+        if self.nodes.iter().any(|candidate| candidate.goal_id == node.goal_id) {
+            bail!("objective child goal already exists");
+        }
+        self.nodes.push(node);
+        self.active_goal_id = self.nodes.last().map(|node| node.goal_id.clone());
+        self.status = ObjectiveStatus::Running;
+        self.stop_reason = None;
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
+    pub fn active_node(&self) -> Option<&GoalGraphNode> {
+        self.active_goal_id
+            .as_deref()
+            .and_then(|goal_id| self.nodes.iter().find(|node| node.goal_id == goal_id))
+    }
+
+    pub fn update_active_node(
+        &mut self,
+        goal_id: &str,
+        status: GoalStatus,
+        final_wave_receipt_hash: Option<String>,
+        final_report_path: Option<String>,
+        strategist_receipt_hash: Option<String>,
+        terminal_reason: Option<String>,
+    ) -> Result<()> {
+        if self.active_goal_id.as_deref() != Some(goal_id) {
+            bail!("objective update does not target the active frontier");
+        }
+        {
+            let node = self
+                .nodes
+                .iter_mut()
+                .find(|node| node.goal_id == goal_id)
+                .context("objective update references an unknown goal")?;
+            node.status = status.clone();
+            node.final_wave_receipt_hash = final_wave_receipt_hash;
+            node.final_report_path = final_report_path;
+            node.strategist_receipt_hash = strategist_receipt_hash;
+            node.terminal_reason = terminal_reason;
+            node.updated_at = timestamp();
+        }
+        if status.is_terminal() {
+            self.active_goal_id = None;
+        }
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
+    pub fn set_terminal(&mut self, status: ObjectiveStatus, reason: String) -> Result<()> {
+        if !status.is_terminal() {
+            bail!("objective terminal update requires a terminal status");
+        }
+        if self.status.is_terminal() && self.status != status {
+            bail!("objective terminal status cannot be reversed");
+        }
+        self.status = status;
+        self.stop_reason = Some(reason);
+        self.active_goal_id = None;
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
+    pub fn record_progress(&mut self, consecutive_no_progress: usize) -> Result<()> {
+        self.consecutive_no_progress = consecutive_no_progress;
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
+    pub fn record_failure(&mut self, consecutive_failures: usize) -> Result<()> {
+        self.consecutive_failures = consecutive_failures;
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
+    fn reseal(&mut self) -> Result<()> {
+        self.graph_hash.clear();
+        self.graph_hash = self.expected_hash()?;
+        self.validate()
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.graph_hash.clear();
+        let bytes = serde_json::to_vec(&payload).context("failed to serialize objective graph")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveEventKind {
+    Started,
+    GoalAttached,
+    StrategistContinueAccepted,
+    FrontierAdvanced,
+    NeedsUser,
+    Stopped,
+    Limited,
+    Blocked,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveEvent {
+    pub schema_version: u32,
+    pub objective_id: String,
+    pub sequence: u64,
+    pub idempotency_key: String,
+    pub kind: ObjectiveEventKind,
+    pub payload: Value,
+    pub previous_hash: String,
+    pub created_at: String,
+    pub event_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveLease {
+    pub schema_version: u32,
+    pub objective_id: String,
+    pub owner_session_id: String,
+    pub lease_id: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug)]
+pub struct ObjectiveLeaseGuard {
+    lease: ObjectiveLease,
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl ObjectiveLeaseGuard {
+    pub fn lease(&self) -> &ObjectiveLease {
+        &self.lease
+    }
+
+    pub fn release(self) -> Result<()> {
+        self.file
+            .unlock()
+            .with_context(|| format!("failed to unlock {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+impl ObjectiveLease {
+    fn validate(&self, objective_id: &str) -> Result<()> {
+        if self.schema_version != 1 || self.objective_id != objective_id {
+            bail!("objective lease has an invalid schema or objective binding");
+        }
+        for (field, value) in [
+            ("owner_session_id", self.owner_session_id.as_str()),
+            ("lease_id", self.lease_id.as_str()),
+            ("acquired_at", self.acquired_at.as_str()),
+            ("expires_at", self.expires_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("objective lease requires non-empty {field}");
+            }
+        }
+        DateTime::parse_from_rfc3339(&self.acquired_at)
+            .context("objective lease has invalid acquired_at")?;
+        DateTime::parse_from_rfc3339(&self.expires_at)
+            .context("objective lease has invalid expires_at")?;
+        Ok(())
+    }
+}
+
+impl ObjectiveEvent {
+    fn seal(
+        objective_id: &str,
+        sequence: u64,
+        idempotency_key: &str,
+        kind: ObjectiveEventKind,
+        payload: Value,
+        previous_hash: String,
+    ) -> Result<Self> {
+        if objective_id.trim().is_empty() || idempotency_key.trim().is_empty() {
+            bail!("objective events require non-empty objective and idempotency ids");
+        }
+        let mut event = Self {
+            schema_version: OBJECTIVE_EVENT_SCHEMA_VERSION,
+            objective_id: objective_id.to_string(),
+            sequence,
+            idempotency_key: idempotency_key.to_string(),
+            kind,
+            payload,
+            previous_hash,
+            created_at: timestamp(),
+            event_hash: String::new(),
+        };
+        event.event_hash = event.expected_hash()?;
+        Ok(event)
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.event_hash.clear();
+        let bytes = serde_json::to_vec(&payload).context("failed to serialize objective event")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+fn validate_objective_event_transition(
+    active: &mut bool,
+    terminated: &mut bool,
+    event: &ObjectiveEvent,
+) -> Result<()> {
+    match event.kind {
+        ObjectiveEventKind::Started => {
+            if *active || *terminated {
+                bail!("objective cannot start while another objective lifecycle is active or terminal");
+            }
+            *active = true;
+        }
+        ObjectiveEventKind::GoalAttached
+        | ObjectiveEventKind::StrategistContinueAccepted
+        | ObjectiveEventKind::FrontierAdvanced => {
+            if !*active {
+                bail!("objective event requires an active objective");
+            }
+        }
+        ObjectiveEventKind::NeedsUser
+        | ObjectiveEventKind::Stopped
+        | ObjectiveEventKind::Limited
+        | ObjectiveEventKind::Blocked
+        | ObjectiveEventKind::Completed
+        | ObjectiveEventKind::Failed
+        | ObjectiveEventKind::Aborted => {
+            if !*active {
+                bail!("objective terminal event requires an active objective");
+            }
+            *active = false;
+            *terminated = true;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalRunLease {
@@ -1004,6 +1540,7 @@ impl StateStore {
             self.events_dir(),
             self.epochs_dir(),
             self.budgets_dir(),
+            self.objectives_dir(),
             self.artifacts_dir(),
             self.workers_dir(),
         ] {
@@ -1055,6 +1592,178 @@ impl StateStore {
 
     pub fn budgets_dir(&self) -> PathBuf {
         self.root.join("budgets")
+    }
+
+    pub fn objectives_dir(&self) -> PathBuf {
+        self.root.join("objectives")
+    }
+
+    pub fn objective_graph_path(&self, objective_id: &str) -> PathBuf {
+        self.objectives_dir()
+            .join(format!("{objective_id}.graph.json"))
+    }
+
+    pub fn objective_events_path(&self, objective_id: &str) -> PathBuf {
+        self.objectives_dir().join(format!("{objective_id}.jsonl"))
+    }
+
+    pub fn objective_lease_path(&self, objective_id: &str) -> PathBuf {
+        self.objectives_dir()
+            .join(format!("{objective_id}.lease.json"))
+    }
+
+    pub fn write_objective_graph(&self, graph: &ObjectiveGraph) -> Result<PathBuf> {
+        graph.validate()?;
+        let path = self.objective_graph_path(&graph.objective_id);
+        write_json_atomic(&path, graph)?;
+        Ok(path)
+    }
+
+    pub fn read_objective_graph(&self, objective_id: &str) -> Result<Option<ObjectiveGraph>> {
+        let path = self.objective_graph_path(objective_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let graph: ObjectiveGraph = read_json_file(&path)?;
+        graph.validate()?;
+        Ok(Some(graph))
+    }
+
+    pub fn append_objective_event(
+        &self,
+        objective_id: &str,
+        idempotency_key: &str,
+        kind: ObjectiveEventKind,
+        payload: Value,
+    ) -> Result<ObjectiveEvent> {
+        let existing = self.read_objective_events(objective_id)?;
+        if let Some(recorded) = existing
+            .iter()
+            .find(|event| event.idempotency_key == idempotency_key)
+        {
+            if recorded.kind == kind && recorded.payload == payload {
+                return Ok(recorded.clone());
+            }
+            bail!("objective event idempotency key conflicts with an existing event");
+        }
+        let previous_hash = existing
+            .last()
+            .map(|event| event.event_hash.clone())
+            .unwrap_or_else(|| "0".repeat(64));
+        let event = ObjectiveEvent::seal(
+            objective_id,
+            existing.len() as u64,
+            idempotency_key,
+            kind,
+            payload,
+            previous_hash,
+        )?;
+        let mut active = false;
+        let mut terminated = false;
+        for existing_event in &existing {
+            validate_objective_event_transition(&mut active, &mut terminated, existing_event)?;
+        }
+        validate_objective_event_transition(&mut active, &mut terminated, &event)?;
+        let path = self.objective_events_path(objective_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        writeln!(file, "{}", serde_json::to_string(&event)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        Ok(event)
+    }
+
+    pub fn read_objective_events(&self, objective_id: &str) -> Result<Vec<ObjectiveEvent>> {
+        let path = self.objective_events_path(objective_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut events = Vec::new();
+        let mut previous_hash = "0".repeat(64);
+        let mut active = false;
+        let mut terminated = false;
+        let mut idempotency_keys = HashSet::new();
+        for (sequence, line) in contents.lines().enumerate() {
+            let event: ObjectiveEvent = serde_json::from_str(line).with_context(|| {
+                format!("failed to parse {} line {}", path.display(), sequence + 1)
+            })?;
+            if event.schema_version != OBJECTIVE_EVENT_SCHEMA_VERSION
+                || event.objective_id != objective_id
+                || event.sequence != sequence as u64
+                || event.idempotency_key.trim().is_empty()
+                || !idempotency_keys.insert(event.idempotency_key.clone())
+                || event.previous_hash != previous_hash
+                || event.event_hash != event.expected_hash()?
+            {
+                bail!("objective event ledger integrity check failed at sequence {sequence}");
+            }
+            validate_objective_event_transition(&mut active, &mut terminated, &event)?;
+            previous_hash = event.event_hash.clone();
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    pub fn acquire_objective_lease(
+        &self,
+        objective_id: &str,
+        owner_session_id: &str,
+        duration: std::time::Duration,
+    ) -> Result<ObjectiveLeaseGuard> {
+        if duration.is_zero() {
+            bail!("objective lease duration must be greater than zero");
+        }
+        let duration = Duration::from_std(duration)
+            .context("objective lease duration is too large")?;
+        let path = self.objective_lease_path(objective_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open objective lease {}", path.display()))?;
+        if let Err(error) = file.try_lock() {
+            let active = read_json_file::<ObjectiveLease>(&path).ok();
+            let owner = active
+                .as_ref()
+                .map(|lease| lease.owner_session_id.as_str())
+                .unwrap_or("unknown");
+            bail!(
+                "objective {objective_id} is already leased by session {owner}: {error}"
+            );
+        }
+        let now = Local::now();
+        let lease = ObjectiveLease {
+            schema_version: 1,
+            objective_id: objective_id.to_string(),
+            owner_session_id: owner_session_id.to_string(),
+            lease_id: format!("objective_lease_{}", id_timestamp()),
+            acquired_at: now.to_rfc3339(),
+            expires_at: (now + duration).to_rfc3339(),
+        };
+        lease.validate(objective_id)?;
+        file.set_len(0)
+            .with_context(|| format!("failed to truncate {}", path.display()))?;
+        file.write_all(format!("{}\n", serde_json::to_string_pretty(&lease)?).as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        Ok(ObjectiveLeaseGuard { lease, file, path })
     }
 
     pub fn goal_budget_ledger_path(&self, goal_id: &str) -> PathBuf {
@@ -2330,6 +3039,188 @@ mod epoch_tests {
             GoalEpochEventKind::Started,
             json!({ "session_id": "session-2" }),
         )?;
+        second.release()?;
+        Ok(())
+    }
+
+    fn graph_node(
+        goal_id: &str,
+        epoch_id: &str,
+        session_id: &str,
+        request: &str,
+        status: GoalStatus,
+        parent_goal_id: Option<String>,
+        parent_epoch_id: Option<String>,
+        parent_strategist_receipt_hash: Option<String>,
+    ) -> GoalGraphNode {
+        GoalGraphNode {
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            session_id: session_id.to_string(),
+            request: request.to_string(),
+            acceptance_signals: vec!["observable result".to_string()],
+            parent_goal_id,
+            parent_epoch_id,
+            parent_strategist_receipt_hash,
+            request_hash: format!("{:x}", Sha256::digest(request.as_bytes())),
+            objective_hash: format!("objective-{goal_id}"),
+            status,
+            final_wave_receipt_hash: None,
+            final_report_path: None,
+            strategist_receipt_hash: None,
+            progress_fingerprint: format!("progress-{goal_id}"),
+            terminal_reason: None,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+        }
+    }
+
+    #[test]
+    fn objective_graph_enforces_one_frontier_and_parent_receipt_binding() -> Result<()> {
+        let policy = ObjectivePolicy::rolling_default();
+        let mut graph = ObjectiveGraph::new(
+            "objective-1",
+            "session-root",
+            "/tmp/workspace",
+            "Build a product",
+            "scope-hash",
+            policy,
+        )?;
+        graph.add_root_node(graph_node(
+            "goal-1",
+            "epoch-1",
+            "session-root",
+            "Build a product",
+            GoalStatus::Planning,
+            None,
+            None,
+            None,
+        ))?;
+        assert_eq!(graph.active_goal_id.as_deref(), Some("goal-1"));
+        assert!(graph
+            .attach_child(graph_node(
+                "goal-2",
+                "epoch-2",
+                "session-child",
+                "Add persistence",
+                GoalStatus::Planning,
+                Some("goal-1".to_string()),
+                Some("epoch-1".to_string()),
+                Some("strategist-1".to_string()),
+            ))
+            .is_err());
+
+        graph.update_active_node(
+            "goal-1",
+            GoalStatus::Complete,
+            Some("final-wave-1".to_string()),
+            Some("/tmp/final-report-1.md".to_string()),
+            Some("strategist-1".to_string()),
+            Some("complete".to_string()),
+        )?;
+        graph.attach_child(graph_node(
+            "goal-2",
+            "epoch-2",
+            "session-child",
+            "Add persistence",
+            GoalStatus::Planning,
+            Some("goal-1".to_string()),
+            Some("epoch-1".to_string()),
+            Some("strategist-1".to_string()),
+        ))?;
+        assert_eq!(graph.active_goal_id.as_deref(), Some("goal-2"));
+        assert!(graph
+            .attach_child(graph_node(
+                "goal-3",
+                "epoch-3",
+                "session-child-2",
+                "Add tests",
+                GoalStatus::Planning,
+                Some("goal-1".to_string()),
+                Some("epoch-1".to_string()),
+                Some("strategist-1".to_string()),
+            ))
+            .is_err());
+
+        let mut tampered = graph.clone();
+        tampered.nodes[0].request = "rewritten request".to_string();
+        assert!(tampered.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn objective_event_ledger_is_idempotent_hash_chained_and_terminal() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let started = store.append_objective_event(
+            "objective-1",
+            "objective-1.started",
+            ObjectiveEventKind::Started,
+            json!({ "session_id": "root" }),
+        )?;
+        let attached = store.append_objective_event(
+            "objective-1",
+            "goal-attached:goal-1",
+            ObjectiveEventKind::GoalAttached,
+            json!({ "goal_id": "goal-1" }),
+        )?;
+        let replay = store.append_objective_event(
+            "objective-1",
+            "goal-attached:goal-1",
+            ObjectiveEventKind::GoalAttached,
+            json!({ "goal_id": "goal-1" }),
+        )?;
+        assert_eq!(attached.event_hash, replay.event_hash);
+        let completed = store.append_objective_event(
+            "objective-1",
+            "terminal:goal-1:complete",
+            ObjectiveEventKind::Completed,
+            json!({ "goal_id": "goal-1" }),
+        )?;
+        assert_eq!(started.sequence, 0);
+        assert_eq!(completed.previous_hash, attached.event_hash);
+        assert!(store
+            .append_objective_event(
+                "objective-1",
+                "objective-1.restart",
+                ObjectiveEventKind::Started,
+                json!({}),
+            )
+            .is_err());
+
+        let path = store.objective_events_path("objective-1");
+        let contents = fs::read_to_string(&path)?;
+        fs::write(&path, contents.replace("goal-1", "goal-rewritten"))?;
+        assert!(store.read_objective_events("objective-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn objective_lease_excludes_competing_controllers() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let first = store.acquire_objective_lease(
+            "objective-1",
+            "session-1",
+            std::time::Duration::from_secs(60),
+        )?;
+        assert_eq!(first.lease().owner_session_id, "session-1");
+        assert!(store
+            .acquire_objective_lease(
+                "objective-1",
+                "session-2",
+                std::time::Duration::from_secs(60),
+            )
+            .is_err());
+        first.release()?;
+        let second = store.acquire_objective_lease(
+            "objective-1",
+            "session-2",
+            std::time::Duration::from_secs(60),
+        )?;
+        assert_eq!(second.lease().owner_session_id, "session-2");
         second.release()?;
         Ok(())
     }
