@@ -2091,6 +2091,7 @@ fn start_command_backed_worker(
         worker_name: worker_name.to_string(),
         skip_worker: config.skip_worker,
         command: route.worker_command.map(ToString::to_string),
+        worker_model: packet.worker_model.clone(),
         model_variant: packet.variant_applied.clone(),
         tool_policy: packet.tools,
         packet_path,
@@ -2135,6 +2136,7 @@ struct CommandWorkerSessionHandle {
     worker_name: String,
     skip_worker: bool,
     command: Option<String>,
+    worker_model: Option<String>,
     model_variant: Option<String>,
     tool_policy: WorkerToolPolicy,
     packet_path: PathBuf,
@@ -2301,6 +2303,9 @@ impl CommandWorkerSessionHandle {
                 "GEARBOX_WORKER_MODEL_VARIANT".to_string(),
                 model_variant.clone(),
             );
+        }
+        if let Some(worker_model) = &self.worker_model {
+            env.insert("GEARBOX_WORKER_MODEL".to_string(), worker_model.clone());
         }
         env.insert(
             "GEARBOX_WORKER_TOOL_POLICY".to_string(),
@@ -4982,6 +4987,7 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            worker_model: None,
             model_variant: None,
             tool_policy: WorkerToolPolicy::default(),
             packet_path: temp_dir.path().join("packet.json"),
@@ -5127,6 +5133,7 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            worker_model: None,
             model_variant: None,
             tool_policy: WorkerToolPolicy::default(),
             packet_path: temp_dir.path().join("packet.json"),
@@ -5224,6 +5231,7 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            worker_model: None,
             model_variant: None,
             tool_policy: WorkerToolPolicy::default(),
             packet_path: temp_dir.path().join("packet.json"),

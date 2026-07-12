@@ -18,6 +18,8 @@ use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
 use crate::workers::{WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
 
+const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'opencode --pure run --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" "$(cat "$GEARBOX_WORKER_PROMPT")" > "$GEARBOX_WORKER_LAST_MESSAGE"'"#;
+
 #[derive(Debug, Parser)]
 #[command(name = "gear")]
 #[command(about = "Gearbox Gear local orchestration runtime")]
@@ -260,6 +262,10 @@ fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
         .worker_command
         .clone()
         .or_else(|| worker_command_for_kind(worker_kind, command))
+        .or_else(|| {
+            (worker_kind == WorkerKind::OpencodeSession)
+                .then(|| DEFAULT_OPENCODE_SESSION_COMMAND.to_string())
+        })
         .or_else(|| worker_kind.default_command(worker_model.as_deref()))
         .filter(|command| !command.trim().is_empty());
     let worker_routes = worker_routes_from_sequence(
