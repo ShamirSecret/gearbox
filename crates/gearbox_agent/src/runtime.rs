@@ -26,9 +26,9 @@ use crate::plan_review::{
 };
 use crate::product;
 use crate::state::{
-    Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalStatus, Scope,
-    Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage, event,
-    id_timestamp, timestamp,
+    Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalEpochEventKind,
+    GoalStatus, Scope, Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+    WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -682,6 +682,30 @@ impl Orchestrator {
             ),
         )?;
 
+        let epoch_id = format!("epoch_{}", id_timestamp());
+        let lease_seconds = u64::try_from(options.max_runtime_minutes.max(1).saturating_mul(60))
+            .unwrap_or(u64::MAX);
+        let goal_run_lease = store.acquire_goal_run_lease(
+            &goal_id,
+            &epoch_id,
+            &session_id,
+            Duration::from_secs(lease_seconds),
+        )?;
+        store.abort_incomplete_goal_epoch(
+            &goal_id,
+            "previous runtime released its lease without a terminal epoch event",
+        )?;
+        store.append_goal_epoch_event(
+            &goal_id,
+            &epoch_id,
+            &format!("{epoch_id}.started"),
+            GoalEpochEventKind::Started,
+            json!({
+                "session_id": session_id,
+                "request": options.request,
+            }),
+        )?;
+
         phase_runtime.routes.validate()?;
         phase_runtime.inventory.validate()?;
         if let Some(current_model) = phase_runtime.current_model.as_ref() {
@@ -723,6 +747,19 @@ impl Orchestrator {
                 ),
             )?;
         }
+        store.append_goal_epoch_event(
+            &goal_id,
+            &epoch_id,
+            &format!("{epoch_id}.planning.completed"),
+            GoalEpochEventKind::PhaseCompleted,
+            json!({
+                "phase": "planning",
+                "plan_id": plan_graph.plan_id,
+                "plan_revision": plan_graph.revision,
+                "plan_hash": plan_graph.plan_hash,
+                "approval_required": phase_runtime.require_plan_approval,
+            }),
+        )?;
         let closed_world_contract = plan_graph.closed_world_contract();
         let initial_preferred_phase = closed_world_contract.preferred_phase_profile.clone();
         let initial_plan_route_hint =
@@ -1410,6 +1447,22 @@ impl Orchestrator {
                     }),
                 ),
             )?;
+            store.append_goal_epoch_event(
+                &goal_id,
+                &epoch_id,
+                &format!("{epoch_id}.worker.{iteration}.completed"),
+                GoalEpochEventKind::PhaseCompleted,
+                json!({
+                    "phase": "worker",
+                    "iteration": iteration,
+                    "task_id": worker_task_id,
+                    "status": iteration_worker_result.status.as_str(),
+                    "worker_session_id": worker_session_id,
+                    "worker_kind": selected_route.worker_kind.as_str(),
+                    "worker_model": selected_route.worker_model,
+                    "outcome_path": iteration_worker_result.outcome_path.to_string_lossy(),
+                }),
+            )?;
             worker_result = Some(iteration_worker_result);
             worker_output_history.push(iteration_worker_outcome.summary.clone());
             if let Some(finished_at) = worker_task_record.finished_at.as_deref()
@@ -1770,6 +1823,20 @@ impl Orchestrator {
                 ),
             )?;
 
+            store.append_goal_epoch_event(
+                &goal_id,
+                &epoch_id,
+                &format!("{epoch_id}.review.{iteration}.completed"),
+                GoalEpochEventKind::PhaseCompleted,
+                json!({
+                    "phase": "review",
+                    "iteration": iteration,
+                    "status": evaluation.status.as_str(),
+                    "should_continue": evaluation.should_continue,
+                    "review_path": review_path.to_string_lossy(),
+                }),
+            )?;
+
             let should_continue = evaluation.should_continue;
             final_evaluation = Some(evaluation);
             if !should_continue {
@@ -1863,6 +1930,19 @@ impl Orchestrator {
             bail!("{error}");
         }
         task_manager_tick_loop.stop()?;
+
+        store.append_goal_epoch_event(
+            &goal_id,
+            &epoch_id,
+            &format!("{epoch_id}.settled"),
+            GoalEpochEventKind::Settled,
+            json!({
+                "status": goal.status.as_str(),
+                "summary": goal.summary,
+                "final_report_path": final_report_path.to_string_lossy(),
+            }),
+        )?;
+        goal_run_lease.release()?;
 
         let status = goal.status;
         Ok(RunOutcome {
@@ -6499,11 +6579,29 @@ mod tests {
             "{}",
             fs::read_to_string(&outcome.final_report_path)?
         );
-        let continuation_state = StateStore::new(temp_dir.path())
+        let state_store = StateStore::new(temp_dir.path());
+        let continuation_state = state_store
             .read_continuation_state_for_session("acp-session-1")?
             .context("continuation state should use the caller session id")?;
         assert_eq!(continuation_state.goal_id, outcome.goal_id);
         assert_eq!(continuation_state.status, ContinuationStatus::Completed);
+        let epoch_events = state_store.read_goal_epoch_events(&outcome.goal_id)?;
+        assert_eq!(
+            epoch_events.first().map(|event| &event.kind),
+            Some(&GoalEpochEventKind::Started)
+        );
+        assert!(epoch_events.iter().any(|event| {
+            event.kind == GoalEpochEventKind::PhaseCompleted
+                && event.payload.get("phase") == Some(&json!("worker"))
+        }));
+        assert!(epoch_events.iter().any(|event| {
+            event.kind == GoalEpochEventKind::PhaseCompleted
+                && event.payload.get("phase") == Some(&json!("review"))
+        }));
+        assert_eq!(
+            epoch_events.last().map(|event| &event.kind),
+            Some(&GoalEpochEventKind::Settled)
+        );
         assert!(outcome.final_report_path.exists());
         assert!(outcome.events_path.exists());
         assert!(outcome.artifacts_root.join("spec.md").exists());

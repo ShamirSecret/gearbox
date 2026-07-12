@@ -1,9 +1,10 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use chrono::Local;
+use chrono::{DateTime, Duration, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -319,6 +320,126 @@ pub struct Event {
     pub data: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalEpochEventKind {
+    Started,
+    PhaseCompleted,
+    Settled,
+    Aborted,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalEpochEvent {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub sequence: u64,
+    pub idempotency_key: String,
+    pub kind: GoalEpochEventKind,
+    pub payload: Value,
+    pub previous_hash: String,
+    pub created_at: String,
+    pub event_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRunLease {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub owner_session_id: String,
+    pub lease_id: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug)]
+pub struct GoalRunLeaseGuard {
+    lease: GoalRunLease,
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl GoalRunLeaseGuard {
+    pub fn lease(&self) -> &GoalRunLease {
+        &self.lease
+    }
+
+    pub fn release(self) -> Result<()> {
+        self.file
+            .unlock()
+            .with_context(|| format!("failed to unlock {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+impl GoalRunLease {
+    fn validate(&self, goal_id: &str) -> Result<()> {
+        if self.schema_version != 1 || self.goal_id != goal_id {
+            bail!("goal run lease has an invalid schema or goal binding");
+        }
+        for (field, value) in [
+            ("epoch_id", self.epoch_id.as_str()),
+            ("owner_session_id", self.owner_session_id.as_str()),
+            ("lease_id", self.lease_id.as_str()),
+            ("acquired_at", self.acquired_at.as_str()),
+            ("expires_at", self.expires_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("goal run lease requires non-empty {field}");
+            }
+        }
+        DateTime::parse_from_rfc3339(&self.acquired_at)
+            .context("goal run lease has invalid acquired_at")?;
+        DateTime::parse_from_rfc3339(&self.expires_at)
+            .context("goal run lease has invalid expires_at")?;
+        Ok(())
+    }
+}
+
+impl GoalEpochEvent {
+    fn seal(
+        goal_id: &str,
+        epoch_id: &str,
+        sequence: u64,
+        idempotency_key: &str,
+        kind: GoalEpochEventKind,
+        payload: Value,
+        previous_hash: String,
+    ) -> Result<Self> {
+        if goal_id.trim().is_empty()
+            || epoch_id.trim().is_empty()
+            || idempotency_key.trim().is_empty()
+        {
+            bail!("goal epoch events require non-empty goal, epoch, and idempotency ids");
+        }
+        let mut event = Self {
+            schema_version: 1,
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            sequence,
+            idempotency_key: idempotency_key.to_string(),
+            kind,
+            payload,
+            previous_hash,
+            created_at: timestamp(),
+            event_hash: String::new(),
+        };
+        event.event_hash = event.expected_hash()?;
+        Ok(event)
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.event_hash.clear();
+        let bytes = serde_json::to_vec(&payload).context("failed to serialize epoch event")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -375,6 +496,7 @@ impl StateStore {
             self.plans_dir(),
             self.plan_reviews_dir(),
             self.events_dir(),
+            self.epochs_dir(),
             self.artifacts_dir(),
             self.workers_dir(),
         ] {
@@ -410,6 +532,18 @@ impl StateStore {
 
     pub fn events_dir(&self) -> PathBuf {
         self.root.join("events")
+    }
+
+    pub fn epochs_dir(&self) -> PathBuf {
+        self.root.join("epochs")
+    }
+
+    pub fn goal_epoch_path(&self, goal_id: &str) -> PathBuf {
+        self.epochs_dir().join(format!("{goal_id}.jsonl"))
+    }
+
+    pub fn goal_run_lease_path(&self, goal_id: &str) -> PathBuf {
+        self.epochs_dir().join(format!("{goal_id}.lease.json"))
     }
 
     pub fn artifacts_dir(&self) -> PathBuf {
@@ -1029,6 +1163,173 @@ impl StateStore {
         Ok(path)
     }
 
+    pub fn append_goal_epoch_event(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        idempotency_key: &str,
+        kind: GoalEpochEventKind,
+        payload: Value,
+    ) -> Result<GoalEpochEvent> {
+        let existing = self.read_goal_epoch_events(goal_id)?;
+        if let Some(recorded) = existing
+            .iter()
+            .find(|event| event.idempotency_key == idempotency_key)
+        {
+            if recorded.epoch_id == epoch_id && recorded.kind == kind && recorded.payload == payload
+            {
+                return Ok(recorded.clone());
+            }
+            bail!("goal epoch idempotency key conflicts with an existing event");
+        }
+        let previous_hash = existing
+            .last()
+            .map(|event| event.event_hash.clone())
+            .unwrap_or_else(|| "0".repeat(64));
+        let event = GoalEpochEvent::seal(
+            goal_id,
+            epoch_id,
+            existing.len() as u64,
+            idempotency_key,
+            kind,
+            payload,
+            previous_hash,
+        )?;
+        let mut active_epoch = None;
+        for existing_event in &existing {
+            validate_goal_epoch_transition(&mut active_epoch, existing_event)?;
+        }
+        validate_goal_epoch_transition(&mut active_epoch, &event)?;
+        let path = self.goal_epoch_path(goal_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        writeln!(file, "{}", serde_json::to_string(&event)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        Ok(event)
+    }
+
+    pub fn read_goal_epoch_events(&self, goal_id: &str) -> Result<Vec<GoalEpochEvent>> {
+        let path = self.goal_epoch_path(goal_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut events = Vec::new();
+        let mut previous_hash = "0".repeat(64);
+        let mut active_epoch = None;
+        let mut idempotency_keys = HashSet::new();
+        for (sequence, line) in contents.lines().enumerate() {
+            let event: GoalEpochEvent = serde_json::from_str(line).with_context(|| {
+                format!("failed to parse {} line {}", path.display(), sequence + 1)
+            })?;
+            if event.schema_version != 1
+                || event.goal_id != goal_id
+                || event.sequence != sequence as u64
+                || event.idempotency_key.trim().is_empty()
+                || !idempotency_keys.insert(event.idempotency_key.clone())
+                || event.previous_hash != previous_hash
+                || event.event_hash != event.expected_hash()?
+            {
+                bail!("goal epoch ledger integrity check failed at sequence {sequence}");
+            }
+            validate_goal_epoch_transition(&mut active_epoch, &event)?;
+            previous_hash = event.event_hash.clone();
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    pub fn abort_incomplete_goal_epoch(
+        &self,
+        goal_id: &str,
+        reason: &str,
+    ) -> Result<Option<GoalEpochEvent>> {
+        if reason.trim().is_empty() {
+            bail!("incomplete goal epoch abort requires a reason");
+        }
+        let events = self.read_goal_epoch_events(goal_id)?;
+        let mut active_epoch = None;
+        for event in &events {
+            validate_goal_epoch_transition(&mut active_epoch, event)?;
+        }
+        let Some(epoch_id) = active_epoch else {
+            return Ok(None);
+        };
+        let event = self.append_goal_epoch_event(
+            goal_id,
+            &epoch_id,
+            &format!("recovery.{epoch_id}.aborted"),
+            GoalEpochEventKind::Aborted,
+            serde_json::json!({ "reason": reason }),
+        )?;
+        Ok(Some(event))
+    }
+
+    pub fn acquire_goal_run_lease(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        owner_session_id: &str,
+        duration: std::time::Duration,
+    ) -> Result<GoalRunLeaseGuard> {
+        if duration.is_zero() {
+            bail!("goal run lease duration must be greater than zero");
+        }
+        let duration =
+            Duration::from_std(duration).context("goal run lease duration is too large")?;
+        let path = self.goal_run_lease_path(goal_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open lease {}", path.display()))?;
+        if let Err(error) = file.try_lock() {
+            let active = read_json_file::<GoalRunLease>(&path).ok();
+            let owner = active
+                .as_ref()
+                .map(|lease| lease.owner_session_id.as_str())
+                .unwrap_or("unknown");
+            bail!("goal {goal_id} is already leased by session {owner}: {error}");
+        }
+
+        let now = Local::now();
+        let lease = GoalRunLease {
+            schema_version: 1,
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            owner_session_id: owner_session_id.to_string(),
+            lease_id: format!("lease_{}", id_timestamp()),
+            acquired_at: now.to_rfc3339(),
+            expires_at: (now + duration).to_rfc3339(),
+        };
+        lease.validate(goal_id)?;
+        file.set_len(0)
+            .with_context(|| format!("failed to truncate {}", path.display()))?;
+        let contents = serde_json::to_string_pretty(&lease)?;
+        file.write_all(format!("{contents}\n").as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        Ok(GoalRunLeaseGuard { lease, file, path })
+    }
+
     pub fn write_artifact(
         &self,
         goal_id: &str,
@@ -1075,6 +1376,35 @@ impl StateStore {
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
+}
+
+fn validate_goal_epoch_transition(
+    active_epoch: &mut Option<String>,
+    event: &GoalEpochEvent,
+) -> Result<()> {
+    match event.kind {
+        GoalEpochEventKind::Started => {
+            if let Some(active_epoch) = active_epoch.as_deref() {
+                bail!(
+                    "cannot start epoch {} while epoch {active_epoch} is active",
+                    event.epoch_id
+                );
+            }
+            *active_epoch = Some(event.epoch_id.clone());
+        }
+        GoalEpochEventKind::PhaseCompleted => {
+            if active_epoch.as_deref() != Some(event.epoch_id.as_str()) {
+                bail!("phase completion is not bound to the active goal epoch");
+            }
+        }
+        GoalEpochEventKind::Settled | GoalEpochEventKind::Aborted => {
+            if active_epoch.as_deref() != Some(event.epoch_id.as_str()) {
+                bail!("terminal event is not bound to the active goal epoch");
+            }
+            *active_epoch = None;
+        }
+    }
+    Ok(())
 }
 
 pub fn event(
@@ -1139,4 +1469,103 @@ where
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn goal_epoch_ledger_is_ordered_and_hash_chained() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let started = store.append_goal_epoch_event(
+            "goal-1",
+            "epoch-1",
+            "epoch-1.started",
+            GoalEpochEventKind::Started,
+            json!({ "plan_revision": 1 }),
+        )?;
+        let replay = store.append_goal_epoch_event(
+            "goal-1",
+            "epoch-1",
+            "epoch-1.started",
+            GoalEpochEventKind::Started,
+            json!({ "plan_revision": 1 }),
+        )?;
+        assert_eq!(replay.event_hash, started.event_hash);
+        assert_eq!(store.read_goal_epoch_events("goal-1")?.len(), 1);
+        assert!(
+            store
+                .append_goal_epoch_event(
+                    "goal-1",
+                    "epoch-1",
+                    "epoch-1.started",
+                    GoalEpochEventKind::Started,
+                    json!({ "plan_revision": 2 }),
+                )
+                .is_err()
+        );
+        let settled = store.append_goal_epoch_event(
+            "goal-1",
+            "epoch-1",
+            "epoch-1.settled",
+            GoalEpochEventKind::Settled,
+            json!({ "outcome": "review_required" }),
+        )?;
+
+        assert_eq!(started.sequence, 0);
+        assert_eq!(settled.sequence, 1);
+        assert_eq!(settled.previous_hash, started.event_hash);
+        assert_eq!(store.read_goal_epoch_events("goal-1")?.len(), 2);
+
+        let path = store.goal_epoch_path("goal-1");
+        let contents = fs::read_to_string(&path)?;
+        fs::write(&path, contents.replace("review_required", "complete"))?;
+        assert!(store.read_goal_epoch_events("goal-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn goal_run_lease_excludes_concurrent_epochs_and_releases_on_drop() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let duration = std::time::Duration::from_secs(60);
+
+        let first = store.acquire_goal_run_lease("goal-1", "epoch-1", "session-1", duration)?;
+        assert_eq!(first.lease().epoch_id, "epoch-1");
+        store.append_goal_epoch_event(
+            "goal-1",
+            "epoch-1",
+            "epoch-1.started",
+            GoalEpochEventKind::Started,
+            json!({ "session_id": "session-1" }),
+        )?;
+        assert!(
+            store
+                .acquire_goal_run_lease("goal-1", "epoch-2", "session-2", duration)
+                .is_err()
+        );
+
+        drop(first);
+        let second = store.acquire_goal_run_lease("goal-1", "epoch-2", "session-2", duration)?;
+        assert_eq!(second.lease().owner_session_id, "session-2");
+        let aborted = store
+            .abort_incomplete_goal_epoch("goal-1", "simulated process crash")?
+            .context("incomplete epoch should be aborted")?;
+        assert_eq!(aborted.epoch_id, "epoch-1");
+        store.append_goal_epoch_event(
+            "goal-1",
+            "epoch-2",
+            "epoch-2.started",
+            GoalEpochEventKind::Started,
+            json!({ "session_id": "session-2" }),
+        )?;
+        second.release()?;
+        Ok(())
+    }
 }
