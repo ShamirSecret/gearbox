@@ -1741,7 +1741,11 @@ impl Orchestrator {
                 }
             };
             let managed_worker_task_id = match start_result {
-                Ok(task_id) => task_id,
+                Ok(task_id) => {
+                    #[cfg(test)]
+                    test_seams::increment_worker_dispatch();
+                    task_id
+                }
                 Err(error) => {
                     if let Some(broker) = executor_broker {
                         let _ = broker.cancel();
@@ -2750,7 +2754,11 @@ impl Orchestrator {
                 "final_report_path": final_report_path.to_string_lossy(),
             }),
         )?;
+        #[cfg(test)]
+        test_seams::goal_settled(&goal_id, &epoch_id);
         goal_run_lease.release()?;
+        #[cfg(test)]
+        test_seams::goal_lease_released(&goal_id, &epoch_id);
 
         let status = goal.status;
         Ok(RunOutcome {
@@ -2906,6 +2914,10 @@ fn run_objective_controller(
             Some(active_node.goal_id.clone()),
             Some(active_node.epoch_id.clone()),
         )?;
+        #[cfg(test)]
+        if test_seams::should_intercept_settled_to_graph_commit() {
+            bail!("test seam: simulated crash after goal settled but before objective graph commit");
+        }
         let strategist_receipt = outcome.strategist_receipt.clone();
         let strategist_receipt_hash = strategist_receipt
             .as_ref()
@@ -2919,6 +2931,8 @@ fn run_objective_controller(
             Some(format!("goal status: {}", outcome.status.as_str())),
         )?;
         store.write_objective_graph(&graph)?;
+        #[cfg(test)]
+        test_seams::objective_graph_commit(&objective_id, &graph);
         goal_outcomes.push(outcome.clone());
 
         if outcome.status != GoalStatus::Complete {
@@ -3009,6 +3023,8 @@ fn run_objective_controller(
                         "acceptance_signals": receipt.verdict.acceptance_signals,
                     }),
                 )?;
+                #[cfg(test)]
+                test_seams::continue_event(&objective_id, &receipt.receipt_hash);
                 if store.continuation_is_stopped_for_session(&root_session_id)? {
                     let reason = "objective continuation was stopped by the user before child dispatch";
                     graph.set_terminal(ObjectiveStatus::Stopped, reason.to_string())?;
@@ -3144,6 +3160,8 @@ fn run_objective_controller(
                 )?;
                 graph.attach_child(child_node)?;
                 store.write_objective_graph(&graph)?;
+                #[cfg(test)]
+                test_seams::child_attach(&objective_id, &child_goal_id);
                 store.append_objective_event(
                     &objective_id,
                     &format!("goal-attached:{child_goal_id}"),
@@ -8022,6 +8040,118 @@ fn worker_transcript_summary(worker_result: &WorkerResult) -> String {
 fn _keep_diff_snapshot_for_docs(_: &DiffSnapshot) {}
 
 #[cfg(test)]
+mod test_seams {
+    use std::cell::RefCell;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::state::ObjectiveGraph;
+
+    pub struct ObjectiveControllerTestSeam {
+        pub on_goal_settled: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+        pub on_goal_lease_released: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+        pub on_objective_graph_commit: Option<Arc<dyn Fn(&str, &ObjectiveGraph) + Send + Sync>>,
+        pub on_continue_event: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+        pub on_child_attach: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+        pub intercept_settled_to_graph_commit: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        pub worker_dispatch_count: Arc<AtomicUsize>,
+    }
+
+    thread_local! {
+        static SEAM: RefCell<Option<ObjectiveControllerTestSeam>> = RefCell::new(None);
+    }
+
+    pub fn with_seam<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut Option<ObjectiveControllerTestSeam>) -> R,
+    {
+        SEAM.with(|seam| {
+            let mut borrow = seam.borrow_mut();
+            f(&mut *borrow)
+        })
+    }
+
+    pub fn reset() {
+        with_seam(|seam| *seam = None);
+    }
+
+    pub fn install(seam: ObjectiveControllerTestSeam) {
+        with_seam(|s| *s = Some(seam));
+    }
+
+    pub fn goal_settled(goal_id: &str, epoch_id: &str) {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                if let Some(cb) = seam.on_goal_settled.as_ref() {
+                    cb(goal_id, epoch_id);
+                }
+            }
+        });
+    }
+
+    pub fn goal_lease_released(goal_id: &str, epoch_id: &str) {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                if let Some(cb) = seam.on_goal_lease_released.as_ref() {
+                    cb(goal_id, epoch_id);
+                }
+            }
+        });
+    }
+
+    pub fn objective_graph_commit(objective_id: &str, graph: &ObjectiveGraph) {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                if let Some(cb) = seam.on_objective_graph_commit.as_ref() {
+                    cb(objective_id, graph);
+                }
+            }
+        });
+    }
+
+    pub fn continue_event(objective_id: &str, receipt_hash: &str) {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                if let Some(cb) = seam.on_continue_event.as_ref() {
+                    cb(objective_id, receipt_hash);
+                }
+            }
+        });
+    }
+
+    pub fn child_attach(objective_id: &str, child_goal_id: &str) {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                if let Some(cb) = seam.on_child_attach.as_ref() {
+                    cb(objective_id, child_goal_id);
+                }
+            }
+        });
+    }
+
+    pub fn should_intercept_settled_to_graph_commit() -> bool {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                if let Some(cb) = seam.intercept_settled_to_graph_commit.as_ref() {
+                    return cb();
+                }
+            }
+            false
+        })
+    }
+
+    pub fn increment_worker_dispatch() {
+        with_seam(|seam| {
+            if let Some(seam) = seam.as_ref() {
+                seam.worker_dispatch_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::sync::{
@@ -12660,6 +12790,485 @@ mod tests {
             "no worker should have been dispatched for a tampered/gated plan"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn objective_production_gap_repro() -> Result<()> {
+        let cli_runtime = PhaseRuntime::legacy();
+        assert!(
+            cli_runtime.broker_factory.is_none(),
+            "CLI objective path uses PhaseRuntime::legacy() which lacks broker_factory"
+        );
+        assert!(
+            cli_runtime.broker.is_none(),
+            "CLI objective path uses PhaseRuntime::legacy() which lacks broker"
+        );
+        let cli_routes_hash = cli_runtime.routes.hash()?;
+        let legacy_routes_hash = PhaseRouteTable::legacy_defaults().hash()?;
+        assert_eq!(
+            cli_routes_hash, legacy_routes_hash,
+            "CLI objective path routes must be legacy_defaults"
+        );
+
+        let profiles = crate::phase_routing::OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        };
+        let gui_routes = PhaseRouteTable::opencode_only(profiles)?;
+        let gui_routes_hash = gui_routes.hash()?;
+        assert_ne!(
+            cli_routes_hash, gui_routes_hash,
+            "CLI legacy routes must differ from GUI opencode_only production routes"
+        );
+
+        let temp_dir = tempfile::tempdir()?;
+        let backend = Arc::new(ts::FakeNativeWorkerBackend::new());
+        let registry = Arc::new(crate::workers::WorkerRegistry::with_native_backend(backend));
+        let broker_factory = Arc::new(crate::worker_broker::PhaseBrokerFactory::new(
+            registry,
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let gui_runtime = PhaseRuntime {
+            routes: gui_routes,
+            inventory: LiveModelInventory::default(),
+            current_model: None,
+            planner: None,
+            intent_fold_hook: None,
+            planner_hook: None,
+            plan_critic_hook: None,
+            plan_revision_hook: None,
+            strategist_next_goal_hook: None,
+            require_plan_approval: false,
+            max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
+            broker: None,
+            broker_factory: Some(broker_factory),
+        };
+        assert!(
+            gui_runtime.broker_factory.is_some(),
+            "GUI production path must have broker_factory"
+        );
+        assert_ne!(
+            cli_runtime.routes, gui_runtime.routes,
+            "CLI and GUI PhaseRuntime routes must not be equivalent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn objective_crash_after_goal_settle_repro() -> Result<()> {
+        test_seams::reset();
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let critic_hook: PlanCriticHook = Arc::new(|input| {
+            plan_critic_submission(&input, 1, PlanCriticDecision::Approve)
+        });
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = deterministic_fallback_draft(
+                &input.request,
+                &input.scope,
+                &input.verification_commands,
+            );
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("repro_planner"),
+                artifact_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
+            let verdict = StrategistNextGoalVerdict {
+                schema_version: 1,
+                goal_id: input.goal_id,
+                epoch_id: input.epoch_id,
+                reviewed_status: input.status,
+                decision: StrategistNextGoalDecision::Continue,
+                next_objective: Some("Create the successor objective".to_string()),
+                acceptance_signals: vec!["The successor has a durable edge".to_string()],
+                required_questions: Vec::new(),
+                evidence_refs: vec![input.final_report_path],
+                rationale: "The first epoch passed and has a bounded successor".to_string(),
+            };
+            Ok(StrategistNextGoalSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                strategist: phase_identity("repro_strategist"),
+                artifact_path: None,
+            })
+        }));
+
+        let intercept_flag = Arc::new(Mutex::new(true));
+        let write_order = Arc::new(Mutex::new(Vec::new()));
+        let write_order_clone_a = write_order.clone();
+        let write_order_clone_b = write_order.clone();
+        let intercept_flag_clone = intercept_flag.clone();
+
+        test_seams::install(test_seams::ObjectiveControllerTestSeam {
+            on_goal_settled: Some(Arc::new(move |goal_id, epoch_id| {
+                write_order_clone_a
+                    .lock()
+                    .unwrap()
+                    .push(format!("goal_settled:{goal_id}:{epoch_id}"));
+            })),
+            on_goal_lease_released: Some(Arc::new(move |goal_id, epoch_id| {
+                write_order_clone_b
+                    .lock()
+                    .unwrap()
+                    .push(format!("goal_lease_released:{goal_id}:{epoch_id}"));
+            })),
+            on_objective_graph_commit: Some(Arc::new(move |objective_id, _graph| {
+                write_order
+                    .lock()
+                    .unwrap()
+                    .push(format!("objective_graph_commit:{objective_id}"));
+            })),
+            intercept_settled_to_graph_commit: Some(Arc::new(move || {
+                *intercept_flag_clone.lock().unwrap()
+            })),
+            worker_dispatch_count: Arc::new(AtomicUsize::new(0)),
+            on_continue_event: None,
+            on_child_attach: None,
+        });
+
+        let result = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Reproduce crash after goal settle".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("crash-repro-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime.clone(),
+            ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 3,
+                max_calls: 96,
+                max_tokens: 12_288_000,
+                max_cost_micros: 10_000_000,
+                max_unknown_usage_calls: 32,
+                max_consecutive_no_progress: 2,
+                max_consecutive_failures: 3,
+                cooldown_seconds: 0,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "test seam must simulate a crash after goal settle"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("simulated crash after goal settled but before objective graph commit"),
+            "error must describe the crash gap: {error_msg}"
+        );
+
+        let objective_id = objective_id_for(
+            "crash-repro-session",
+            temp_dir.path(),
+            "Reproduce crash after goal settle",
+        )?;
+
+        let graph = store
+            .read_objective_graph(&objective_id)?
+            .context("objective graph must exist after crash")?;
+        let active_node = graph.active_node().context("active node must exist")?;
+        assert!(
+            !active_node.status.is_terminal(),
+            "crash gap: objective graph must NOT reflect settled goal status; found {:?}",
+            active_node.status
+        );
+
+        let goal_epoch_events = store.read_goal_epoch_events(&active_node.goal_id)?;
+        assert!(
+            goal_epoch_events.iter().any(|e| e.kind == GoalEpochEventKind::Settled),
+            "goal epoch must have Settled event proving the goal did complete"
+        );
+
+        let worker_dispatches = test_seams::with_seam(|seam| {
+            seam.as_ref()
+                .map(|s| s.worker_dispatch_count.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        });
+        assert!(
+            worker_dispatches > 0,
+            "worker must have been dispatched during the goal run"
+        );
+
+        test_seams::reset();
+
+        let mut graph = store.read_objective_graph(&objective_id)?.context("graph must exist")?;
+        reconcile_objective_frontier(&store, &objective_id, "crash-repro-session", &mut graph)?;
+        assert!(
+            graph.active_goal_id.is_some(),
+            "reconcile must leave active frontier because graph was never updated to terminal"
+        );
+
+        let resumed_result = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Reproduce crash after goal settle".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("crash-repro-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+            ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 3,
+                max_calls: 96,
+                max_tokens: 12_288_000,
+                max_cost_micros: 10_000_000,
+                max_unknown_usage_calls: 32,
+                max_consecutive_no_progress: 2,
+                max_consecutive_failures: 3,
+                cooldown_seconds: 0,
+            },
+        );
+
+        assert!(
+            resumed_result.is_err(),
+            "resumed controller must fail because it tries to re-enter a settled goal"
+        );
+        let resumed_err = resumed_result.unwrap_err().to_string();
+        assert!(
+            resumed_err.contains("cannot start epoch")
+                || resumed_err.contains("active epoch")
+                || resumed_err.contains("phase completion is not bound to the active goal epoch")
+                || resumed_err.contains("idempotency key conflicts with an existing event"),
+            "resumed run must fail due to epoch state conflict, got: {resumed_err}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn objective_budget_reservation_repro() -> Result<()> {
+        test_seams::reset();
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let critic_hook: PlanCriticHook = Arc::new(|input| {
+            plan_critic_submission(&input, 1, PlanCriticDecision::Approve)
+        });
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = deterministic_fallback_draft(
+                &input.request,
+                &input.scope,
+                &input.verification_commands,
+            );
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("repro_planner"),
+                artifact_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
+            let verdict = StrategistNextGoalVerdict {
+                schema_version: 1,
+                goal_id: input.goal_id,
+                epoch_id: input.epoch_id,
+                reviewed_status: input.status,
+                decision: StrategistNextGoalDecision::Continue,
+                next_objective: Some("Create the successor objective".to_string()),
+                acceptance_signals: vec!["The successor has a durable edge".to_string()],
+                required_questions: Vec::new(),
+                evidence_refs: vec![input.final_report_path],
+                rationale: "The first epoch passed and has a bounded successor".to_string(),
+            };
+            Ok(StrategistNextGoalSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                strategist: phase_identity("repro_strategist"),
+                artifact_path: None,
+            })
+        }));
+
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        let dispatch_count_clone = dispatch_count.clone();
+        test_seams::install(test_seams::ObjectiveControllerTestSeam {
+            on_goal_settled: None,
+            on_goal_lease_released: None,
+            on_objective_graph_commit: None,
+            on_continue_event: None,
+            on_child_attach: Some(Arc::new(move |_objective_id, _child_goal_id| {
+                dispatch_count_clone.fetch_add(1, Ordering::SeqCst);
+            })),
+            intercept_settled_to_graph_commit: None,
+            worker_dispatch_count: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let outcome = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Reproduce budget reservation gap".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("budget-repro-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+            ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 3,
+                max_calls: 96,
+                max_tokens: 12_288_000,
+                max_cost_micros: 10_000_000,
+                max_unknown_usage_calls: 32,
+                max_consecutive_no_progress: 2,
+                max_consecutive_failures: 3,
+                cooldown_seconds: 0,
+            },
+        )?;
+
+        test_seams::reset();
+
+        assert!(
+            outcome.goal_outcomes.len() >= 2,
+            "auto_continue must produce at least two goal outcomes, got {}",
+            outcome.goal_outcomes.len()
+        );
+        assert!(
+            dispatch_count.load(Ordering::SeqCst) >= 1,
+            "at least one child attach must have occurred"
+        );
+
+        let objective_id = objective_id_for(
+            "budget-repro-session",
+            temp_dir.path(),
+            "Reproduce budget reservation gap",
+        )?;
+
+        let objectives_dir = store.objectives_dir();
+        let reservation_ledger_path = objectives_dir.join(format!("{objective_id}.reservations.json"));
+        assert!(
+            !reservation_ledger_path.exists(),
+            "no objective-wide reservation ledger must exist before child dispatch: {reservation_ledger_path:?}"
+        );
+
+        let graph = store
+            .read_objective_graph(&objective_id)?
+            .context("objective graph must exist")?;
+        let (calls, _tokens, _cost, _unknown_calls) = objective_budget_totals(&store, &graph)?;
+        assert!(
+            calls > 0,
+            "objective_budget_totals must aggregate from settled goal ledgers (calls={calls})"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn objective_cli_profile_assertion() -> Result<()> {
+        let cli_runtime = PhaseRuntime::legacy();
+        assert!(
+            cli_runtime.broker_factory.is_none(),
+            "CLI --objective path must not have broker_factory (legacy is not production)"
+        );
+        assert!(
+            cli_runtime.broker.is_none(),
+            "CLI --objective path must not have broker (legacy is not production)"
+        );
+
+        let profiles = crate::phase_routing::OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        };
+        let production_routes = PhaseRouteTable::opencode_only(profiles)?;
+        let production_routes_hash = production_routes.hash()?;
+        let cli_routes_hash = cli_runtime.routes.hash()?;
+        assert_ne!(
+            cli_routes_hash, production_routes_hash,
+            "CLI legacy routes must differ from OpenCode production routes"
+        );
+
+        let temp_dir = tempfile::tempdir()?;
+        let backend = Arc::new(ts::FakeNativeWorkerBackend::new());
+        let registry = Arc::new(crate::workers::WorkerRegistry::with_native_backend(backend));
+        let broker_factory = Arc::new(crate::worker_broker::PhaseBrokerFactory::new(
+            registry,
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let production_runtime = PhaseRuntime {
+            routes: production_routes,
+            inventory: LiveModelInventory::default(),
+            current_model: None,
+            planner: None,
+            intent_fold_hook: None,
+            planner_hook: None,
+            plan_critic_hook: None,
+            plan_revision_hook: None,
+            strategist_next_goal_hook: None,
+            require_plan_approval: false,
+            max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
+            broker: None,
+            broker_factory: Some(broker_factory),
+        };
+        assert!(
+            production_runtime.broker_factory.is_some(),
+            "production PhaseRuntime for --objective + OpenCode profile requires Gear-owned broker_factory"
+        );
+        assert!(
+            cli_runtime.broker_factory.is_none(),
+            "PhaseRuntime::legacy() is NOT production"
+        );
         Ok(())
     }
 }
