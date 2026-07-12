@@ -205,9 +205,9 @@ fn build_broker_phase_request(
         .context("failed to hash phase route decision for broker")?;
     let requested_model = match &phase_decision.requested_model {
         Some(model) => ModelAvailability::Available(model.clone()),
-        None => ModelAvailability::Unavailable(
-            crate::worker_broker::UnavailableReason::NotConfigured,
-        ),
+        None => {
+            ModelAvailability::Unavailable(crate::worker_broker::UnavailableReason::NotConfigured)
+        }
     };
     Ok(BrokerPhaseRequest {
         schema_version: crate::worker_broker::BROKER_SCHEMA_VERSION,
@@ -235,8 +235,8 @@ fn write_direct_execution_receipt(
         identity.clone()
     } else {
         crate::worker_broker::BrokerSessionIdentity {
-            backend_kind: crate::workers::WorkerKind::Opencode,
-            session_id: format!("direct-{}", crate::state::timestamp()),
+            backend_kind: crate::workers::WorkerKind::Custom,
+            session_id: format!("direct-model-{}", crate::state::timestamp()),
             started_at: crate::state::timestamp(),
             capabilities: None,
         }
@@ -259,11 +259,19 @@ fn write_direct_execution_receipt(
     .context("failed to seal direct execution receipt")?;
     let artifacts_root = broker.artifacts_root();
     let receipt_dir = artifacts_root.join("direct-execution-receipts");
-    std::fs::create_dir_all(&receipt_dir)
-        .with_context(|| format!("failed to create direct execution receipt dir at {}", receipt_dir.display()))?;
+    std::fs::create_dir_all(&receipt_dir).with_context(|| {
+        format!(
+            "failed to create direct execution receipt dir at {}",
+            receipt_dir.display()
+        )
+    })?;
     let receipt_path = receipt_dir.join(format!("{}.json", crate::state::timestamp()));
-    crate::state::write_json(&receipt_path, &receipt)
-        .with_context(|| format!("failed to write direct execution receipt at {}", receipt_path.display()))?;
+    crate::state::write_json(&receipt_path, &receipt).with_context(|| {
+        format!(
+            "failed to write direct execution receipt at {}",
+            receipt_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -279,13 +287,8 @@ fn run_phase_via_broker_inner<T>(
     let Some(broker) = broker else {
         return f();
     };
-    let phase_request = build_broker_phase_request(
-        phase_decision,
-        goal_id,
-        plan_id,
-        plan_revision,
-        task_id,
-    )?;
+    let phase_request =
+        build_broker_phase_request(phase_decision, goal_id, plan_id, plan_revision, task_id)?;
     let phase_request_clone = phase_request.clone();
     broker
         .resolve(phase_request)
@@ -299,8 +302,12 @@ fn run_phase_via_broker_inner<T>(
                         .wait_for_outcome()
                         .context("broker wait_for_outcome failed after phase actor")?;
                 } else if state.lifecycle.name() == LifecycleStateName::Resolved {
-                    write_direct_execution_receipt(broker, &phase_request_clone, BrokerOutcome::Completed)
-                        .context("failed to write direct execution receipt")?;
+                    write_direct_execution_receipt(
+                        broker,
+                        &phase_request_clone,
+                        BrokerOutcome::Completed,
+                    )
+                    .context("failed to write direct execution receipt")?;
                 }
             }
         }
@@ -368,9 +375,7 @@ fn run_phase_via_broker<T>(
     )
 }
 
-fn check_phase_terminal_state(
-    decision: &PhaseRouteDecision,
-) -> Result<()> {
+fn check_phase_terminal_state(decision: &PhaseRouteDecision) -> Result<()> {
     let phase_name = format!("{:?}", decision.phase);
     if let Some(requested) = &decision.requested_model {
         if decision.candidate.model.is_available() {
@@ -1107,43 +1112,10 @@ impl Orchestrator {
                     .resolve(phase_request)
                     .context("broker resolve failed for executor phase")?;
             }
-            let start_result = if let Some(broker) = executor_broker {
-                let start_request = WorkerStartRequest {
-                    store: &store,
-                    workspace: &workspace,
-                    task: &worker_task,
-                    route_attempt: worker_task.attempt,
-                    goal: &worker_request,
-                    verification_commands: &detection.verification_commands,
-                    config: &effective_worker,
-                    cancellation_token: options.cancellation_token.clone(),
-                    coordinator_model: goal.coordinator_model.as_ref(),
-                    coordinator_brief: goal.coordinator_brief.as_deref(),
-                    route_hint: resolved_worker_route_hint,
-                };
-                broker
-                    .start_via_broker(start_request)
-                    .and_then(|_handle| {
-                        task_manager
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("task manager mutex poisoned"))?
-                            .start(WorkerStartRequest {
-                                store: &store,
-                                workspace: &workspace,
-                                task: &worker_task,
-                                route_attempt: worker_task.attempt,
-                                goal: &worker_request,
-                                verification_commands: &detection.verification_commands,
-                                config: &effective_worker,
-                                cancellation_token: options.cancellation_token.clone(),
-                                coordinator_model: goal.coordinator_model.as_ref(),
-                                coordinator_brief: goal.coordinator_brief.as_deref(),
-                                route_hint: resolved_worker_route_hint,
-                            })
-                    })
-            } else {
-                match task_manager.lock() {
-                    Ok(mut task_manager) => task_manager.start(WorkerStartRequest {
+            let start_result = match task_manager.lock() {
+                Ok(mut task_manager) => {
+                    task_manager.set_worker_broker(executor_broker_arc.clone());
+                    task_manager.start(WorkerStartRequest {
                         store: &store,
                         workspace: &workspace,
                         task: &worker_task,
@@ -1155,11 +1127,11 @@ impl Orchestrator {
                         coordinator_model: goal.coordinator_model.as_ref(),
                         coordinator_brief: goal.coordinator_brief.as_deref(),
                         route_hint: resolved_worker_route_hint,
-                    }),
-                    Err(_) => {
-                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                        bail!("task manager mutex poisoned");
-                    }
+                    })
+                }
+                Err(_) => {
+                    stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                    bail!("task manager mutex poisoned");
                 }
             };
             let managed_worker_task_id = match start_result {
@@ -1170,7 +1142,12 @@ impl Orchestrator {
                     }
                     if let Some(ref identity) = executor_broker_identity {
                         if let Some(ref factory) = phase_runtime.broker_factory {
-                            let _ = factory.remove_session(identity, &goal_id, &worker_task_id, plan_graph.revision);
+                            let _ = factory.remove_session(
+                                identity,
+                                &goal_id,
+                                &worker_task_id,
+                                plan_graph.revision,
+                            );
                         }
                     }
                     stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
@@ -1242,16 +1219,38 @@ impl Orchestrator {
             if let Some(broker) = executor_broker {
                 if let Ok(state) = broker.current_state() {
                     if state.lifecycle.name() == LifecycleStateName::Active {
-                        broker
-                            .wait_for_outcome()
-                            .context("broker wait_for_outcome failed for executor")?;
+                        if let Err(error) = broker.wait_for_outcome() {
+                            if let (Some(identity), Some(factory)) = (
+                                executor_broker_identity.as_ref(),
+                                phase_runtime.broker_factory.as_deref(),
+                            ) {
+                                let _ = factory.remove_session(
+                                    identity,
+                                    &goal_id,
+                                    &worker_task_id,
+                                    plan_graph.revision,
+                                );
+                            }
+                            return Err(error)
+                                .context("broker wait_for_outcome failed for executor");
+                        }
                     }
                 }
             }
-            if let Some(ref identity) = executor_broker_identity {
-                if let Some(ref factory) = phase_runtime.broker_factory {
-                    let _ = factory.remove_session(identity, &goal_id, &worker_task_id, plan_graph.revision);
-                }
+            if let (Some(broker), Some(identity), Some(factory)) = (
+                executor_broker,
+                executor_broker_identity.as_ref(),
+                phase_runtime.broker_factory.as_deref(),
+            ) {
+                factory
+                    .finalize_session(
+                        broker,
+                        identity,
+                        &goal_id,
+                        &worker_task_id,
+                        plan_graph.revision,
+                    )
+                    .context("broker terminal ledger finalization failed for executor")?;
             }
             let worker_session_id = managed_worker_run.record.session_id.clone();
             let worker_task_record = managed_worker_run.record;
@@ -1646,6 +1645,8 @@ impl Orchestrator {
                 if let Some(receipt_failure) = verify_broker_receipts_for_goal(
                     phase_runtime.broker.as_deref(),
                     phase_runtime.broker_factory.as_deref(),
+                    &goal_id,
+                    true,
                 ) {
                     evaluation = GoalEvaluation {
                         status: GoalStatus::NeedsUser,
@@ -2096,6 +2097,8 @@ fn build_approved_plan_graph(
                 if let Some(receipt_failure) = verify_broker_receipts_for_goal(
                     phase_runtime.broker.as_deref(),
                     phase_runtime.broker_factory.as_deref(),
+                    &goal.id,
+                    false,
                 ) {
                     bail!("Approval gate blocked by broker receipt failure: {receipt_failure}");
                 }
@@ -2177,7 +2180,10 @@ fn build_approved_plan_graph(
                 let broker = phase_runtime.broker.as_deref();
                 let broker_factory = phase_runtime.broker_factory.as_deref();
                 let revision_identity = PhaseExecutionIdentity {
-                    execution_id: format!("planner_revision:{}:{}:{}", goal.id, plan.plan_id, plan.revision),
+                    execution_id: format!(
+                        "planner_revision:{}:{}:{}",
+                        goal.id, plan.plan_id, plan.revision
+                    ),
                     phase_session_id: format!("planner_revision:{}:{}", goal.id, plan.revision),
                     backend: PhaseExecutionBackend::DeterministicRules,
                     agent_id: None,
@@ -4872,13 +4878,14 @@ fn evaluate_goal_with_source(
 fn verify_broker_receipts_for_goal(
     broker: Option<&WorkerBroker>,
     broker_factory: Option<&PhaseBrokerFactory>,
+    goal_id: &str,
+    require_terminal_receipt: bool,
 ) -> Option<String> {
-    // When a broker factory is available, each phase creates its own
-    // independent broker. The shared broker may be unused (Discovered
-    // state), so skip the check — factory brokers manage their own
-    // lifecycle and receipt validation per-phase.
-    if broker_factory.is_some() {
-        return None;
+    if let Some(factory) = broker_factory {
+        return factory
+            .validate_goal_receipts(goal_id, require_terminal_receipt)
+            .map_err(|error| format!("factory broker receipt validation failed: {error}"))
+            .err();
     }
     let broker = broker?;
     let lifecycle = match broker.lifecycle_state() {
@@ -4894,23 +4901,22 @@ fn verify_broker_receipts_for_goal(
                 return Some("broker session terminated with Cancelled outcome".to_string());
             }
         }
-        LifecycleState::Active | LifecycleState::Resolved => {}
+        LifecycleState::Active | LifecycleState::Resolved if !require_terminal_receipt => {}
+        LifecycleState::Active | LifecycleState::Resolved => {
+            return Some("broker session did not reach Terminal".to_string());
+        }
         _ => return Some(format!("broker receipt state is {:?}", lifecycle.name())),
     }
-    match broker.session_identity() {
-        Ok(identity) => {
-            let artifacts_root = broker.artifacts_root();
-            let session_dir = artifacts_root.join("broker-sessions").join(&identity.session_id);
-            if session_dir.exists() {
-                crate::worker_broker::validate_session_ledger(&session_dir)
-                    .map_err(|e| format!("broker receipt validation failed: {e}"))
-                    .err()
-            } else {
-                None
-            }
+    let session_dir = match broker.session_ledger_dir() {
+        Ok(session_dir) => session_dir,
+        Err(error) if require_terminal_receipt => {
+            return Some(format!("broker session ledger is missing: {error}"));
         }
-        Err(_) => None,
-    }
+        Err(_) => return None,
+    };
+    crate::worker_broker::validate_session_ledger(&session_dir)
+        .map_err(|error| format!("broker receipt validation failed: {error}"))
+        .err()
 }
 
 fn evaluate_goal_with_review_target(
@@ -9157,9 +9163,7 @@ mod tests {
         let mut goal = planning_goal(&draft)?;
 
         let backend = Arc::new(crate::test_support::test_support::FakeNativeWorkerBackend::new());
-        let registry = Arc::new(
-            crate::workers::WorkerRegistry::with_native_backend(backend),
-        );
+        let registry = Arc::new(crate::workers::WorkerRegistry::with_native_backend(backend));
         let broker = Arc::new(WorkerBroker::new(
             registry,
             temp_dir.path().join(".gearbox-agent"),
@@ -9248,8 +9252,7 @@ mod tests {
             "broker-backed flow must produce an approved plan"
         );
         assert_eq!(
-            approval.plan_hash,
-            plan.plan_hash,
+            approval.plan_hash, plan.plan_hash,
             "approval must match the sealed plan hash"
         );
         assert!(
@@ -9260,7 +9263,8 @@ mod tests {
         let broker_state = broker.current_state()?;
         assert!(
             broker_state.session_identity.is_some()
-                || broker_state.lifecycle.name() != crate::worker_broker::LifecycleStateName::Discovered,
+                || broker_state.lifecycle.name()
+                    != crate::worker_broker::LifecycleStateName::Discovered,
             "broker must have made progress through resolve/start"
         );
 
@@ -9292,7 +9296,8 @@ mod tests {
         let broker_state_after = broker.current_state()?;
         assert!(
             broker_state_after.interaction_ordinal > 0
-                || broker_state_after.lifecycle.name() != crate::worker_broker::LifecycleStateName::Discovered,
+                || broker_state_after.lifecycle.name()
+                    != crate::worker_broker::LifecycleStateName::Discovered,
             "broker must record at least one interaction or lifecycle transition"
         );
 

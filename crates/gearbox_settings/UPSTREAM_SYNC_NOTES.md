@@ -115,6 +115,12 @@ Each crate has a local helper that checks `GEARBOX_GUI` and returns Chinese or E
 | `crates/extensions_ui/src/extension_version_selector.rs` | Compatibility labels | |
 | `crates/oauth_callback_server/src/oauth_callback_server.rs` | OAuth success/failure browser pages | Zed wording kept when not `GEARBOX_GUI` |
 
+### LSP store (memory leak fix)
+
+| File | Change |
+|------|--------|
+| `crates/project/src/lsp_store.rs` | Fix memory leak: `lsp_requests` and `chunk_lsp_requests` in `BufferLspData` were never cleaned up when a language server stops/restarts, causing unbounded growth of in-flight LSP task references across all buffers. Added `retain` to filter out entries for the stopped server in `remove_server_data()`.
+
 ### Settings UI
 
 All files are `[MOD]` — Gearbox text layers added inside `GEARBOX_GUI=1` guards; upstream data model and JSON paths unchanged.

@@ -129,7 +129,9 @@ impl BrokerPhaseRequest {
             bail!("broker request requested_agent cannot be empty");
         }
         match &self.requested_model {
-            ModelAvailability::Available(selector) => selector.validate().context("requested_model")?,
+            ModelAvailability::Available(selector) => {
+                selector.validate().context("requested_model")?
+            }
             ModelAvailability::Unavailable(_) => {}
         }
         for (i, fallback) in self.allowed_fallback_models.iter().enumerate() {
@@ -396,7 +398,9 @@ impl BrokerLifecycleReceipt {
             );
         }
         if self.permission_evidence.is_some()
-            && !self.session_identity.supports(&BrokerCapability::Permission)
+            && !self
+                .session_identity
+                .supports(&BrokerCapability::Permission)
         {
             bail!(
                 "broker receipt records permission evidence but session does not \
@@ -417,10 +421,7 @@ impl BrokerLifecycleReceipt {
                 match &self.request.requested_model {
                     ModelAvailability::Available(requested) => {
                         if actual != requested
-                            && !self
-                                .request
-                                .allowed_fallback_models
-                                .contains(actual)
+                            && !self.request.allowed_fallback_models.contains(actual)
                         {
                             bail!(
                                 "broker receipt actual model {:?}/{:?}/{:?} is not the requested \
@@ -434,11 +435,7 @@ impl BrokerLifecycleReceipt {
                     ModelAvailability::Unavailable(reason) => {
                         // When the requested model was explicitly unavailable,
                         // any actual model must be in the allowed fallback list.
-                        if !self
-                            .request
-                            .allowed_fallback_models
-                            .contains(actual)
-                        {
+                        if !self.request.allowed_fallback_models.contains(actual) {
                             bail!(
                                 "broker receipt actual model {:?}/{:?}/{:?} is not listed as an \
                                  allowed fallback (requested model was unavailable: {reason:?})",
@@ -635,7 +632,10 @@ pub enum LifecycleState {
     Starting,
     Active,
     IdleSteering,
-    Terminal { outcome: BrokerOutcome, reason: Option<String> },
+    Terminal {
+        outcome: BrokerOutcome,
+        reason: Option<String>,
+    },
 }
 
 impl LifecycleState {
@@ -787,8 +787,12 @@ impl BrokerLedgerPaths {
 
     /// Create all directories for the session ledger.
     fn ensure_dirs(&self) -> Result<()> {
-        fs::create_dir_all(self.session_dir.join("receipts"))
-            .with_context(|| format!("failed to create ledger dirs at {}", self.session_dir.display()))?;
+        fs::create_dir_all(self.session_dir.join("receipts")).with_context(|| {
+            format!(
+                "failed to create ledger dirs at {}",
+                self.session_dir.display()
+            )
+        })?;
         Ok(())
     }
 }
@@ -838,6 +842,16 @@ impl WorkerBroker {
     /// Return the artifacts root path.
     pub fn artifacts_root(&self) -> &Path {
         &self.artifacts_root
+    }
+
+    pub fn session_ledger_dir(&self) -> Result<PathBuf> {
+        self.state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("broker state mutex poisoned: {e}"))?
+            .ledger_paths
+            .as_ref()
+            .map(|paths| paths.session_dir.clone())
+            .ok_or_else(|| anyhow::anyhow!("broker session ledger is unavailable"))
     }
 
     // ── State accessors ──────────────────────────────────────────────────
@@ -935,10 +949,9 @@ impl WorkerBroker {
             .map_err(|e| anyhow::anyhow!("broker state mutex poisoned: {e}"))?;
 
         // Must have a resolved phase request to start.
-        let phase_request = inner
-            .phase_request
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("cannot start: no phase request (call resolve() first)"))?;
+        let phase_request = inner.phase_request.clone().ok_or_else(|| {
+            anyhow::anyhow!("cannot start: no phase request (call resolve() first)")
+        })?;
 
         // State machine: Resolved → Starting
         inner
@@ -976,7 +989,12 @@ impl WorkerBroker {
             .with_context(|| "ledger write error")?;
 
         // Lifecycle event: Starting
-        self.append_lifecycle_event_to(Some(&LifecycleStateName::Resolved), "session starting", LifecycleStateName::Starting, &ledger_paths)?;
+        self.append_lifecycle_event_to(
+            Some(&LifecycleStateName::Resolved),
+            "session starting",
+            LifecycleStateName::Starting,
+            &ledger_paths,
+        )?;
 
         // Transition from Starting → Active (lock again).
         {
@@ -984,15 +1002,18 @@ impl WorkerBroker {
                 .state
                 .lock()
                 .map_err(|e| anyhow::anyhow!("broker state mutex poisoned: {e}"))?;
-            inner
-                .lifecycle
-                .can_transition_to(&LifecycleState::Active)?;
+            inner.lifecycle.can_transition_to(&LifecycleState::Active)?;
             inner.lifecycle = LifecycleState::Active;
             let _ordinal = inner.next_ordinal();
         }
 
         // Lifecycle event: Active
-        self.append_lifecycle_event_to(Some(&LifecycleStateName::Starting), "session active", LifecycleStateName::Active, &ledger_paths)?;
+        self.append_lifecycle_event_to(
+            Some(&LifecycleStateName::Starting),
+            "session active",
+            LifecycleStateName::Active,
+            &ledger_paths,
+        )?;
 
         // Determine binding status from the identity's backend kind before
         // identity is consumed by the receipt struct.
@@ -1119,9 +1140,7 @@ impl WorkerBroker {
                 .map_err(|e| anyhow::anyhow!("broker state mutex poisoned: {e}"))?;
 
             // IdleSteering → Active transition.
-            inner
-                .lifecycle
-                .can_transition_to(&LifecycleState::Active)?;
+            inner.lifecycle.can_transition_to(&LifecycleState::Active)?;
 
             let identity = inner
                 .session_identity
@@ -1168,14 +1187,8 @@ impl WorkerBroker {
         )?;
 
         // Write receipt.
-        let receipt = self.make_interaction_receipt(
-            ordinal,
-            BrokerOutcome::Steered,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let receipt =
+            self.make_interaction_receipt(ordinal, BrokerOutcome::Steered, None, None, None, None)?;
         write_json(&ledger_paths.receipt_path(ordinal), &receipt)
             .map_err(|e| LedgerWriteError {
                 path: ledger_paths.receipt_path(ordinal),
@@ -1199,19 +1212,23 @@ impl WorkerBroker {
                 .map_err(|e| anyhow::anyhow!("broker state mutex poisoned: {e}"))?;
 
             // Idempotent: already terminal/cancelled → Ok.
-            if matches!(inner.lifecycle, LifecycleState::Terminal { outcome: BrokerOutcome::Cancelled, .. }) {
+            if matches!(
+                inner.lifecycle,
+                LifecycleState::Terminal {
+                    outcome: BrokerOutcome::Cancelled,
+                    ..
+                }
+            ) {
                 return Ok(());
             }
 
             // Any non-terminal state can be cancelled.
             inner
                 .lifecycle
-                .can_transition_to(
-                    &LifecycleState::Terminal {
-                        outcome: BrokerOutcome::Cancelled,
-                        reason: Some("cancelled by user".to_string()),
-                    },
-                )?;
+                .can_transition_to(&LifecycleState::Terminal {
+                    outcome: BrokerOutcome::Cancelled,
+                    reason: Some("cancelled by user".to_string()),
+                })?;
 
             let state_name = inner.lifecycle.name();
             let handle = inner.session_handle.as_ref().map(|h| h.clone());
@@ -1228,7 +1245,14 @@ impl WorkerBroker {
                 reason: Some("cancelled by user".to_string()),
             };
 
-            (handle, state_name, ledger_paths, BrokerOutcome::Cancelled, ordinal, identity)
+            (
+                handle,
+                state_name,
+                ledger_paths,
+                BrokerOutcome::Cancelled,
+                ordinal,
+                identity,
+            )
         }; // Lock released.
 
         // Call external cancel without lock held (best-effort).
@@ -1262,7 +1286,11 @@ impl WorkerBroker {
                 .with_context(|| "ledger write error")?;
 
             // Write final receipt.
-            match self.build_receipt_from_state(ordinal, BrokerOutcome::Cancelled, Some("cancelled by user".to_string())) {
+            match self.build_receipt_from_state(
+                ordinal,
+                BrokerOutcome::Cancelled,
+                Some("cancelled by user".to_string()),
+            ) {
                 Ok(receipt) => {
                     write_json(&ledger_paths.receipt_path(ordinal), &receipt)
                         .map_err(|e| LedgerWriteError {
@@ -1350,7 +1378,14 @@ impl WorkerBroker {
             let identity = inner.session_identity.clone();
             let phase_request = inner.phase_request.clone();
 
-            (handle, state_name, ledger_paths, ordinal, identity, phase_request)
+            (
+                handle,
+                state_name,
+                ledger_paths,
+                ordinal,
+                identity,
+                phase_request,
+            )
         }; // Lock released.
 
         // Call external method without lock.
@@ -1445,13 +1480,33 @@ impl WorkerBroker {
     /// Requires that `resolve()` was called first with a `BrokerPhaseRequest`.
     pub fn start_via_broker(
         &self,
-        _request: crate::workers::WorkerStartRequest<'_>,
+        request: crate::workers::WorkerStartRequest<'_>,
     ) -> Result<Arc<dyn WorkerSessionHandle>> {
-        // Lifecycle preparation only — the actual worker is started by the
-        // orchestrator via task_manager.start() immediately after this call.
-        // We return a no-op handle whose only function is to satisfy the
-        // Result type; the handle is discarded by the caller.
-        Ok(Arc::new(NoopWorkerSessionHandle))
+        let selected_route = request
+            .config
+            .selected_route_for_hint(request.route_attempt, request.route_hint);
+        let worker_kind = selected_route.worker_kind;
+        let task_id = request.task.id.clone();
+
+        // The factory-owned registry must dispatch the real handle exactly
+        // once. Clearing its optional broker avoids recursively starting a
+        // different broker when this method is reused outside the factory.
+        let registry = self.registry.without_broker();
+        let has_native_backend = registry.has_native_backend();
+        let handle = registry.start(request)?;
+        let identity = BrokerSessionIdentity {
+            backend_kind: worker_kind,
+            session_id: handle
+                .session_id()
+                .unwrap_or_else(|| format!("{}-{task_id}", worker_kind.as_str())),
+            started_at: timestamp(),
+            capabilities: Some(broker_capabilities_for_kind(
+                worker_kind,
+                has_native_backend,
+            )),
+        };
+
+        self.start(handle, identity)
     }
 
     // ── Ledger helpers ───────────────────────────────────────────────────
@@ -1612,13 +1667,15 @@ impl WorkerBroker {
 /// Resident backends with native verification (ZedAgent with native backend)
 /// produce ACP-verified `Applied` bindings. OpencodeSession models are
 /// backend-declared but within the session scope.
-fn binding_status_for_kind(kind: WorkerKind, has_native_backend: bool) -> Option<ModelBindingStatus> {
+fn binding_status_for_kind(
+    kind: WorkerKind,
+    has_native_backend: bool,
+) -> Option<ModelBindingStatus> {
     match kind {
         // CLI backends — model is declared by the tool, not ACP-verified
-        WorkerKind::Opencode
-        | WorkerKind::Codex
-        | WorkerKind::Claude
-        | WorkerKind::Custom => Some(ModelBindingStatus::DeclaredUnverified),
+        WorkerKind::Opencode | WorkerKind::Codex | WorkerKind::Claude | WorkerKind::Custom => {
+            Some(ModelBindingStatus::DeclaredUnverified)
+        }
         // Resident session — model is declared within the session scope
         WorkerKind::OpencodeSession => Some(ModelBindingStatus::DeclaredUnverified),
         // ZedAgent with native backend — model is ACP-verified
@@ -1657,8 +1714,7 @@ where
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open {} for append", path.display()))?;
-    writeln!(file, "{line}")
-        .with_context(|| format!("failed to write to {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("failed to write to {}", path.display()))?;
     Ok(())
 }
 
@@ -1695,10 +1751,8 @@ pub fn validate_session_ledger(session_dir: &Path) -> Result<()> {
             if line.trim().is_empty() {
                 continue;
             }
-            let _event: BrokerLifecycleEvent =
-                serde_json::from_str(line).with_context(|| {
-                    format!("failed to parse lifecycle event line {}", i + 1)
-                })?;
+            let _event: BrokerLifecycleEvent = serde_json::from_str(line)
+                .with_context(|| format!("failed to parse lifecycle event line {}", i + 1))?;
         }
     }
 
@@ -1740,10 +1794,7 @@ pub fn validate_session_ledger(session_dir: &Path) -> Result<()> {
     for (ordinal, path) in &receipt_entries {
         // 3a. Ordinal sequence: strictly contiguous (1, 2, 3, ...).
         if prev_ordinal == 0 && *ordinal != 1 {
-            bail!(
-                "receipt sequence must start at ordinal 1, got {}",
-                ordinal
-            );
+            bail!("receipt sequence must start at ordinal 1, got {}", ordinal);
         }
         if prev_ordinal > 0 && *ordinal != prev_ordinal + 1 {
             bail!(
@@ -1840,9 +1891,7 @@ pub fn validate_session_ledger(session_dir: &Path) -> Result<()> {
                 prev_ordinal
             );
         }
-        if outcome.session_identity.session_id
-            != common_session_id.as_deref().unwrap_or_default()
-        {
+        if outcome.session_identity.session_id != common_session_id.as_deref().unwrap_or_default() {
             bail!(
                 "terminal-outcome.json session_id mismatch: expected {} got {}",
                 common_session_id.as_deref().unwrap_or_default(),
@@ -1852,40 +1901,6 @@ pub fn validate_session_ledger(session_dir: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// A no-op session handle returned by `WorkerBroker::start_via_broker`.
-///
-/// The handle is discarded by the orchestrator, which separately starts the
-/// actual worker via `task_manager.start()`. All interaction methods return
-/// an error to make misuse obvious at runtime.
-struct NoopWorkerSessionHandle;
-
-impl WorkerSessionHandle for NoopWorkerSessionHandle {
-    fn session_id(&self) -> Option<String> {
-        None
-    }
-    fn send_follow_up(&self, _prompt: String) -> Result<()> {
-        bail!("NoopWorkerSessionHandle does not support follow-up");
-    }
-    fn steer(&self, _prompt: String) -> Result<()> {
-        bail!("NoopWorkerSessionHandle does not support steering");
-    }
-    fn interrupt(&self) -> Result<()> {
-        bail!("NoopWorkerSessionHandle does not support interrupt");
-    }
-    fn cancel(&self) -> Result<()> {
-        Ok(())
-    }
-    fn wait_for_outcome(&self) -> Result<crate::workers::WorkerOutcome> {
-        bail!("NoopWorkerSessionHandle does not support outcome waiting");
-    }
-    fn wait_for_result(&self) -> Result<crate::workers::WorkerResult> {
-        bail!("NoopWorkerSessionHandle does not support result waiting");
-    }
-    fn last_output(&self) -> Option<String> {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,10 +1922,9 @@ fn sanitize_for_path(s: &str) -> String {
 
 /// Read and deserialize a JSON file.
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1932,6 +1946,17 @@ struct ActiveSessionEntry {
     plan_revision: usize,
     /// Independence group (e.g. "planning", "execution").
     phase_group: String,
+    /// The phase whose ledger this entry owns.
+    phase: PhaseProfile,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedSessionEntry {
+    goal_id: String,
+    task_id: String,
+    plan_revision: usize,
+    phase: PhaseProfile,
+    session_dir: PathBuf,
 }
 
 /// Return the independence group for a phase profile.
@@ -1980,6 +2005,8 @@ pub struct PhaseBrokerFactory {
     artifacts_root: PathBuf,
     /// Track active session entries to prevent reuse/cross-role sharing.
     active_sessions: Arc<Mutex<Vec<ActiveSessionEntry>>>,
+    /// Terminal ledgers accepted by the completion gate for this run.
+    completed_sessions: Arc<Mutex<Vec<CompletedSessionEntry>>>,
 }
 
 impl PhaseBrokerFactory {
@@ -1989,6 +2016,7 @@ impl PhaseBrokerFactory {
             registry,
             artifacts_root,
             active_sessions: Arc::new(Mutex::new(Vec::new())),
+            completed_sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2023,10 +2051,7 @@ impl PhaseBrokerFactory {
     ) -> Result<Arc<WorkerBroker>> {
         let session_key = format!(
             "{}:{}:{}:{}",
-            execution_identity.execution_id,
-            goal_id,
-            task_id,
-            plan_revision,
+            execution_identity.execution_id, goal_id, task_id, plan_revision,
         );
 
         let phase_group = independence_group_for_phase(&phase_decision.phase);
@@ -2035,7 +2060,10 @@ impl PhaseBrokerFactory {
             anyhow::anyhow!("PhaseBrokerFactory active_sessions lock poisoned: {e}")
         })?;
 
-        if sessions.iter().any(|s: &ActiveSessionEntry| s.session_key == session_key) {
+        if sessions
+            .iter()
+            .any(|s: &ActiveSessionEntry| s.session_key == session_key)
+        {
             bail!(
                 "broker session already exists for execution identity {}",
                 execution_identity.execution_id
@@ -2089,6 +2117,7 @@ impl PhaseBrokerFactory {
             task_id: task_id.to_string(),
             plan_revision,
             phase_group: phase_group.to_string(),
+            phase: phase_decision.phase.clone(),
         });
 
         Ok(broker)
@@ -2108,15 +2137,129 @@ impl PhaseBrokerFactory {
     ) -> Result<()> {
         let session_key = format!(
             "{}:{}:{}:{}",
-            execution_identity.execution_id,
-            goal_id,
-            task_id,
-            plan_revision,
+            execution_identity.execution_id, goal_id, task_id, plan_revision,
         );
         let mut sessions = self.active_sessions.lock().map_err(|e| {
             anyhow::anyhow!("PhaseBrokerFactory active_sessions lock poisoned: {e}")
         })?;
         sessions.retain(|s| s.session_key != session_key);
+        Ok(())
+    }
+
+    /// Seal one terminal phase ledger into the factory manifest.
+    ///
+    /// The completion gate validates this manifest rather than trusting a
+    /// phase directory to merely exist. A broker is recorded only after its
+    /// own terminal state and on-disk receipt chain have both been verified.
+    pub fn finalize_session(
+        &self,
+        broker: &WorkerBroker,
+        execution_identity: &PhaseExecutionIdentity,
+        goal_id: &str,
+        task_id: &str,
+        plan_revision: usize,
+    ) -> Result<()> {
+        let lifecycle = broker.lifecycle_state()?;
+        if !matches!(lifecycle, LifecycleState::Terminal { .. }) {
+            bail!("cannot finalize broker session before it reaches Terminal");
+        }
+
+        let session_identity = broker.session_identity()?;
+        let session_dir = broker.session_ledger_dir()?;
+        validate_session_ledger(&session_dir)?;
+
+        let terminal_path = session_dir.join("terminal-outcome.json");
+        if !terminal_path.is_file() {
+            bail!("broker terminal ledger missing {}", terminal_path.display());
+        }
+        let terminal: TerminalOutcomeRecord = read_json_file(&terminal_path)?;
+        if terminal.session_identity.session_id != session_identity.session_id {
+            bail!("broker terminal ledger session identity mismatch");
+        }
+
+        let session_key = format!(
+            "{}:{}:{}:{}",
+            execution_identity.execution_id, goal_id, task_id, plan_revision,
+        );
+        let active = {
+            let mut sessions = self.active_sessions.lock().map_err(|e| {
+                anyhow::anyhow!("PhaseBrokerFactory active_sessions lock poisoned: {e}")
+            })?;
+            let position = sessions
+                .iter()
+                .position(|entry| entry.session_key == session_key)
+                .ok_or_else(|| anyhow::anyhow!("missing active broker session for finalization"))?;
+            sessions.remove(position)
+        };
+
+        let mut completed = self.completed_sessions.lock().map_err(|e| {
+            anyhow::anyhow!("PhaseBrokerFactory completed_sessions lock poisoned: {e}")
+        })?;
+        if completed
+            .iter()
+            .any(|entry| entry.session_dir == session_dir)
+        {
+            bail!("broker terminal ledger was finalized twice");
+        }
+        completed.push(CompletedSessionEntry {
+            goal_id: active.goal_id,
+            task_id: active.task_id,
+            plan_revision: active.plan_revision,
+            phase: active.phase,
+            session_dir,
+        });
+        Ok(())
+    }
+
+    /// Validate all terminal broker ledgers that participated in one goal.
+    pub fn validate_goal_receipts(
+        &self,
+        goal_id: &str,
+        require_terminal_receipt: bool,
+    ) -> Result<()> {
+        let entries: Vec<_> = self
+            .completed_sessions
+            .lock()
+            .map_err(|e| {
+                anyhow::anyhow!("PhaseBrokerFactory completed_sessions lock poisoned: {e}")
+            })?
+            .iter()
+            .filter(|entry| entry.goal_id == goal_id)
+            .cloned()
+            .collect();
+
+        if entries.is_empty() {
+            if require_terminal_receipt {
+                bail!("goal {goal_id} has no terminal broker receipt");
+            }
+            return Ok(());
+        }
+
+        for entry in entries {
+            validate_session_ledger(&entry.session_dir).with_context(|| {
+                format!(
+                    "broker ledger validation failed for phase {:?}, task {}, revision {}",
+                    entry.phase, entry.task_id, entry.plan_revision
+                )
+            })?;
+            let terminal_path = entry.session_dir.join("terminal-outcome.json");
+            let terminal: TerminalOutcomeRecord =
+                read_json_file(&terminal_path).with_context(|| {
+                    format!(
+                        "broker terminal outcome missing for phase {:?}, task {}",
+                        entry.phase, entry.task_id
+                    )
+                })?;
+            if terminal.outcome != BrokerOutcome::Completed {
+                bail!(
+                    "broker phase {:?} task {} ended as {:?}",
+                    entry.phase,
+                    entry.task_id,
+                    terminal.outcome
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -2127,8 +2270,7 @@ mod tests {
 
     /// Create a simple model selector for test use.
     fn test_model(qualified_id: &str) -> ModelSelectorId {
-        ModelSelectorId::from_qualified("test-agent", qualified_id)
-            .expect("test model id is valid")
+        ModelSelectorId::from_qualified("test-agent", qualified_id).expect("test model id is valid")
     }
 
     /// Hex string of the correct length that passes validate_sha256.
@@ -2216,8 +2358,7 @@ mod tests {
         sealed.validate()?;
 
         // The capability matrix should include all capabilities.
-        let caps =
-            broker_capabilities_for_kind(WorkerKind::OpencodeSession, false);
+        let caps = broker_capabilities_for_kind(WorkerKind::OpencodeSession, false);
         assert!(caps.contains(&BrokerCapability::ModelSelection));
         assert!(caps.contains(&BrokerCapability::FollowUp));
         assert!(caps.contains(&BrokerCapability::Steer));
@@ -2450,10 +2591,11 @@ mod tests {
 
         // 3. Start
         let fake_state = Arc::new(Mutex::new(
-            FakeWorkerState::new("ses-test-full")
-                .with_result(crate::test_support::test_support::fake_worker_result(
+            FakeWorkerState::new("ses-test-full").with_result(
+                crate::test_support::test_support::fake_worker_result(
                     crate::workers::WorkerStatus::Succeeded,
-                )),
+                ),
+            ),
         ));
         let handle = Arc::new(FakeWorkerSessionHandle::new(fake_state));
         let identity = full_session();
@@ -2553,7 +2695,9 @@ mod tests {
         assert!(result.is_err(), "tampered receipt should fail validation");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("hash mismatch") || err.contains("integrity") || err.contains("failed integrity"),
+            err.contains("hash mismatch")
+                || err.contains("integrity")
+                || err.contains("failed integrity"),
             "error should mention hash integrity: {err}"
         );
 
@@ -2692,7 +2836,11 @@ mod tests {
         broker_a.cancel()?;
 
         // Copy session A's receipt directory to "ses-b" dir.
-        let dst_dir = tmp.path().join("goal-1").join("broker-sessions").join("ses-b");
+        let dst_dir = tmp
+            .path()
+            .join("goal-1")
+            .join("broker-sessions")
+            .join("ses-b");
         let src_receipts = tmp
             .path()
             .join("goal-1")
@@ -2721,8 +2869,7 @@ mod tests {
         let receipt_path = dst_receipts.join("1.json");
         let raw = std::fs::read_to_string(&receipt_path)?;
         let mut receipt: serde_json::Value = serde_json::from_str(&raw)?;
-        receipt["session_identity"]["session_id"] =
-            serde_json::Value::String("ses-b".to_string());
+        receipt["session_identity"]["session_id"] = serde_json::Value::String("ses-b".to_string());
         receipt["receipt_hash"] = serde_json::Value::String(String::new());
         write_json(&receipt_path, &receipt)?;
 
@@ -2912,12 +3059,10 @@ mod tests {
     // Lifecycle contract tests — per-backend capability matrices
     // -----------------------------------------------------------------------
 
-    use crate::worker_broker::{
-        binding_status_for_kind,
-    };
+    use crate::worker_broker::binding_status_for_kind;
     use crate::workers::{
-        ClaudeCommandWorker, CodexCommandWorker, CustomCommandWorker,
-        OpencodeCommandWorker, OpencodeSessionWorker,
+        ClaudeCommandWorker, CodexCommandWorker, CustomCommandWorker, OpencodeCommandWorker,
+        OpencodeSessionWorker,
     };
 
     /// Helper: build a BrokerSessionIdentity for a given WorkerKind with
@@ -3047,9 +3192,7 @@ mod tests {
                 ..identity
             };
 
-            let fake_state = Arc::new(Mutex::new(
-                FakeWorkerState::new(session_id.clone()),
-            ));
+            let fake_state = Arc::new(Mutex::new(FakeWorkerState::new(session_id.clone())));
             let handle = Arc::new(FakeWorkerSessionHandle::new(fake_state));
             let _returned = broker.start(handle, identity)?;
 
@@ -3093,9 +3236,10 @@ mod tests {
             let request = basic_request(ModelAvailability::Available(model));
             broker.resolve(request)?;
             let identity = session_for_kind(kind);
-            let fake_state = Arc::new(Mutex::new(
-                FakeWorkerState::new(format!("ses-{}", kind.as_str())),
-            ));
+            let fake_state = Arc::new(Mutex::new(FakeWorkerState::new(format!(
+                "ses-{}",
+                kind.as_str()
+            ))));
             let handle = Arc::new(FakeWorkerSessionHandle::new(fake_state));
             broker.start(handle, identity)?;
 
@@ -3122,14 +3266,17 @@ mod tests {
             let request = basic_request(ModelAvailability::Available(model));
             broker.resolve(request)?;
             let identity = session_for_kind(WorkerKind::OpencodeSession);
-            let fake_state = Arc::new(Mutex::new(
-                FakeWorkerState::new("ses-follow-opencode-resident"),
-            ));
+            let fake_state = Arc::new(Mutex::new(FakeWorkerState::new(
+                "ses-follow-opencode-resident",
+            )));
             let handle = Arc::new(FakeWorkerSessionHandle::new(fake_state));
             broker.start(handle, identity)?;
 
             let result = broker.follow_up("continue please".to_string());
-            assert!(result.is_ok(), "follow_up should succeed for OpencodeSession");
+            assert!(
+                result.is_ok(),
+                "follow_up should succeed for OpencodeSession"
+            );
         }
 
         Ok(())
@@ -3183,11 +3330,7 @@ mod tests {
     fn missing_model_selector_typed_unavailable() {
         // Verify that backends which don't support ModelSelection
         // correctly report it as unavailable.
-        for kind in &[
-            WorkerKind::Opencode,
-            WorkerKind::Claude,
-            WorkerKind::Custom,
-        ] {
+        for kind in &[WorkerKind::Opencode, WorkerKind::Claude, WorkerKind::Custom] {
             let caps = broker_capabilities_for_kind(*kind, false);
             assert!(
                 !caps.contains(&BrokerCapability::ModelSelection),
@@ -3196,10 +3339,14 @@ mod tests {
             );
         }
         // Codex and OpencodeSession SHOULD have ModelSelection.
-        assert!(broker_capabilities_for_kind(WorkerKind::Codex, false)
-            .contains(&BrokerCapability::ModelSelection));
-        assert!(broker_capabilities_for_kind(WorkerKind::OpencodeSession, false)
-            .contains(&BrokerCapability::ModelSelection));
+        assert!(
+            broker_capabilities_for_kind(WorkerKind::Codex, false)
+                .contains(&BrokerCapability::ModelSelection)
+        );
+        assert!(
+            broker_capabilities_for_kind(WorkerKind::OpencodeSession, false)
+                .contains(&BrokerCapability::ModelSelection)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3288,13 +3435,12 @@ mod tests {
 
         let tmp = tempdir()?;
         // Use a registry that has both native backend and broker configured.
-        let registry = Arc::new(
-            worker_registry_for_test()
-                .with_broker(Arc::new(WorkerBroker::new(
-                    Arc::new(worker_registry_for_test()),
-                    tmp.path().to_path_buf(),
-                ))),
-        );
+        let registry = Arc::new(worker_registry_for_test().with_broker(Arc::new(
+            WorkerBroker::new(
+                Arc::new(worker_registry_for_test()),
+                tmp.path().to_path_buf(),
+            ),
+        )));
         let broker = WorkerBroker::new(registry, tmp.path().to_path_buf());
 
         let model = test_model("provider/model");
@@ -3324,7 +3470,9 @@ mod tests {
     // PhaseBrokerFactory tests
     // -----------------------------------------------------------------------
 
-    use crate::phase_routing::{PhaseBackend, PhaseModelBinding, PhaseRouteCandidate, PhaseRouteSource};
+    use crate::phase_routing::{
+        PhaseBackend, PhaseModelBinding, PhaseRouteCandidate, PhaseRouteSource,
+    };
     use crate::plan_graph::PhaseProfile;
     use crate::plan_review::{PhaseExecutionBackend, PhaseExecutionIdentity};
     use crate::workers::WorkerCategory;
@@ -3433,7 +3581,11 @@ mod tests {
             .collect();
         for i in 0..paths.len() {
             for j in (i + 1)..paths.len() {
-                assert_ne!(paths[i], paths[j], "broker {} and {} share the same path", i, j);
+                assert_ne!(
+                    paths[i], paths[j],
+                    "broker {} and {} share the same path",
+                    i, j
+                );
             }
         }
 
@@ -3624,6 +3776,60 @@ mod tests {
     }
 
     #[test]
+    fn phase_broker_factory_completion_gate_rejects_tampered_terminal_ledger() -> Result<()> {
+        use crate::test_support::test_support::{
+            FakeWorkerSessionHandle, FakeWorkerState, fake_worker_outcome, worker_registry_for_test,
+        };
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let registry = Arc::new(worker_registry_for_test());
+        let factory = PhaseBrokerFactory::new(registry, tmp.path().to_path_buf());
+        let execution_identity = test_exec_identity(
+            "executor-completion",
+            "executor-session",
+            "executor-actual-session",
+        );
+        let broker = factory.create_broker(
+            &test_phase_decision(PhaseProfile::ExecutorQuick),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &execution_identity,
+        )?;
+        broker.resolve(basic_request(ModelAvailability::Available(test_model(
+            "provider/model",
+        ))))?;
+
+        let session_identity = session_for_kind(WorkerKind::OpencodeSession);
+        let fake_state = Arc::new(Mutex::new(
+            FakeWorkerState::new(&session_identity.session_id)
+                .with_outcome(fake_worker_outcome(crate::workers::WorkerStatus::Succeeded)),
+        ));
+        broker.start(
+            Arc::new(FakeWorkerSessionHandle::new(fake_state)),
+            session_identity,
+        )?;
+        broker.wait_for_outcome()?;
+        factory.finalize_session(broker.as_ref(), &execution_identity, "goal-1", "task-1", 1)?;
+        factory.validate_goal_receipts("goal-1", true)?;
+
+        let receipt_path = broker.session_ledger_dir()?.join("receipts").join("2.json");
+        let mut receipt: BrokerLifecycleReceipt = read_json_file(&receipt_path)?;
+        receipt.receipt_hash = "tampered".to_string();
+        write_json(&receipt_path, &receipt)?;
+
+        assert!(
+            factory.validate_goal_receipts("goal-1", true).is_err(),
+            "completion gate must reject a tampered factory ledger"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn phase_broker_factory_rejects_terminal_revive() -> Result<()> {
         use crate::test_support::test_support::{
             FakeWorkerSessionHandle, FakeWorkerState, worker_registry_for_test,
@@ -3639,14 +3845,8 @@ mod tests {
         let phase_decision = test_phase_decision(PhaseProfile::Planner);
 
         // Create broker, go through full lifecycle to terminal.
-        let broker = factory.create_broker(
-            &phase_decision,
-            "goal-1",
-            "plan-1",
-            1,
-            "task-1",
-            &identity,
-        )?;
+        let broker =
+            factory.create_broker(&phase_decision, "goal-1", "plan-1", 1, "task-1", &identity)?;
 
         // Resolve and start the broker (to create on-disk ledger data).
         let model = test_model("provider/model");
@@ -3693,16 +3893,14 @@ mod tests {
     #[test]
     fn unavailable_reason_propagation() {
         // Verify the typed unavailable variants exist and are usable.
-        let backend_unavail = UnavailableReason::BackendUnavailable(
-            "binary not found on PATH".to_string(),
-        );
+        let backend_unavail =
+            UnavailableReason::BackendUnavailable("binary not found on PATH".to_string());
         assert!(matches!(
             backend_unavail,
             UnavailableReason::BackendUnavailable(_)
         ));
 
-        let model_not_found =
-            UnavailableReason::ModelNotFound("gpt-5 not loadable".to_string());
+        let model_not_found = UnavailableReason::ModelNotFound("gpt-5 not loadable".to_string());
         assert!(matches!(
             model_not_found,
             UnavailableReason::ModelNotFound(_)

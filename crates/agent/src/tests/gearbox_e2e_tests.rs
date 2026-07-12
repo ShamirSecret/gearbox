@@ -736,6 +736,8 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
         "broker-sessions/ must contain at least one phase directory"
     );
 
+    let mut validated_ledgers = 0;
+    let mut session_ids = Vec::new();
     for entry in &phase_entries {
         let phase_name = entry.file_name().to_string_lossy().to_string();
 
@@ -811,11 +813,42 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
                                 receipt_count >= 1,
                                 "At least one receipt must exist"
                             );
+                            assert!(
+                                session_dir.join("terminal-outcome.json").is_file(),
+                                "A production phase ledger must record its terminal outcome"
+                            );
+                            let identity_contents =
+                                std::fs::read_to_string(session_dir.join("session-identity.json"))
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "failed to read session identity for {}: {error}",
+                                            session_dir.display()
+                                        )
+                                    });
+                            let identity: BrokerSessionIdentity =
+                                serde_json::from_str(&identity_contents).unwrap_or_else(|error| {
+                                panic!(
+                                    "failed to parse session identity for {}: {error}",
+                                    session_dir.display()
+                                )
+                            });
+                            session_ids.push(identity.session_id);
+                            validated_ledgers += 1;
                         }
                     }
                 }
             }
         }
+    }
+    assert!(
+        validated_ledgers >= 1,
+        "Production E2E must validate at least one terminal broker ledger; empty phase directories are not evidence of a lifecycle"
+    );
+    for (index, session_id) in session_ids.iter().enumerate() {
+        assert!(
+            !session_ids[..index].contains(session_id),
+            "Each validated broker ledger must have a distinct session identity: {session_id}"
+        );
     }
 
     let final_report_path = std::fs::read_dir(gearbox_root.join("artifacts"))

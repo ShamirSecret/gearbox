@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{CoordinatorModel, StateStore, Task, TaskKind, timestamp};
 use crate::tools::CancellationToken;
+use crate::worker_broker::WorkerBroker;
 use crate::workers::{
     WorkerConfig, WorkerKind, WorkerOutcome, WorkerRegistry, WorkerResult, WorkerSessionHandle,
     WorkerStartRequest, WorkerStatus, WorkerSubscription, route_identity_key,
@@ -1363,6 +1364,14 @@ impl TaskManager {
 
     pub fn set_worker_registry(&mut self, registry: WorkerRegistry) {
         self.registry = registry;
+    }
+
+    /// Bind the registry used by the next task dispatch to one phase-local
+    /// broker. The runtime replaces this before every broker-managed phase,
+    /// so the handle tracked by TaskManager is the same handle that owns the
+    /// broker receipt lifecycle.
+    pub fn set_worker_broker(&mut self, broker: Option<Arc<WorkerBroker>>) {
+        self.registry.set_broker(broker);
     }
 
     pub fn set_artifacts_root(&mut self, artifacts_root: PathBuf) {

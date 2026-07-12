@@ -1518,7 +1518,7 @@ pub trait WorkerAdapter {
     fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WorkerRegistry {
     native_backend: Option<Arc<dyn NativeWorkerBackend>>,
     /// Optional broker for lifecycle-managed worker sessions.
@@ -1546,6 +1546,16 @@ impl WorkerRegistry {
     /// Set or clear the broker reference.
     pub fn set_broker(&mut self, broker: Option<Arc<WorkerBroker>>) {
         self.broker = broker;
+    }
+
+    pub(crate) fn without_broker(&self) -> Self {
+        let mut registry = self.clone();
+        registry.broker = None;
+        registry
+    }
+
+    pub(crate) fn has_native_backend(&self) -> bool {
+        self.native_backend.is_some()
     }
 
     pub fn start(&self, request: WorkerStartRequest<'_>) -> Result<Arc<dyn WorkerSessionHandle>> {
@@ -1652,7 +1662,9 @@ impl WorkerRegistry {
             // Active and subsequent worker dispatches use the registry
             // directly to avoid illegal state transitions.
             let state = broker.current_state().ok();
-            if state.map_or(false, |s| s.lifecycle.name() == LifecycleStateName::Resolved) {
+            if state.map_or(false, |s| {
+                s.lifecycle.name() == LifecycleStateName::Resolved
+            }) {
                 let identity = BrokerSessionIdentity {
                     backend_kind: worker_kind,
                     session_id: handle
