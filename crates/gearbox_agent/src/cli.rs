@@ -126,6 +126,7 @@ pub fn run() -> Result<()> {
                 max_provider_unknown_streak: command.max_provider_unknown_streak,
                 max_child_depth: command.max_child_depth,
                 max_runtime_minutes: command.max_runtime_minutes,
+                budget: None,
                 coordinator_model: None,
                 coordinator_brief: None,
                 coordinator_review_hook: None,

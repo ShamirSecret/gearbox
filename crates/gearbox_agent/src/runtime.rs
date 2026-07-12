@@ -27,8 +27,8 @@ use crate::plan_review::{
 use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalEpochEventKind,
-    GoalStatus, Scope, Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
-    WorkLineage, event, id_timestamp, timestamp,
+    GoalStatus, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind,
+    TaskOutputs, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -454,6 +454,7 @@ pub struct RunOptions {
     pub max_provider_unknown_streak: usize,
     pub max_child_depth: usize,
     pub max_runtime_minutes: usize,
+    pub budget: Option<Budget>,
     pub coordinator_model: Option<CoordinatorModel>,
     pub coordinator_brief: Option<String>,
     pub coordinator_review_hook: Option<CoordinatorReviewHook>,
@@ -618,8 +619,11 @@ impl Orchestrator {
         )?;
         let now = timestamp();
 
-        let mut goal_budget = Budget::default();
+        let mut goal_budget = options.budget.clone().unwrap_or_default();
         goal_budget.max_provider_unknown_streak = options.max_provider_unknown_streak.max(1);
+        if options.budget.is_none() {
+            goal_budget.max_runtime_minutes = options.max_runtime_minutes.max(1);
+        }
         let mut goal = Goal {
             id: goal_id.clone(),
             title: title_from_request(&options.request),
@@ -683,8 +687,9 @@ impl Orchestrator {
         )?;
 
         let epoch_id = format!("epoch_{}", id_timestamp());
-        let lease_seconds = u64::try_from(options.max_runtime_minutes.max(1).saturating_mul(60))
-            .unwrap_or(u64::MAX);
+        let lease_seconds =
+            u64::try_from(goal.budget.max_runtime_minutes.max(1).saturating_mul(60))
+                .unwrap_or(u64::MAX);
         let goal_run_lease = store.acquire_goal_run_lease(
             &goal_id,
             &epoch_id,
@@ -878,11 +883,11 @@ impl Orchestrator {
             max_iterations,
             max_files_changed: options.max_files_changed,
             max_worker_calls: goal.budget.max_worker_calls,
-            max_premium_worker_calls: options.worker.premium_worker_budget,
+            max_premium_worker_calls: goal.budget.max_premium_worker_calls,
             max_same_failure_retries: 2,
             max_provider_unknown_streak: goal.budget.max_provider_unknown_streak,
             max_child_depth: options.max_child_depth,
-            max_runtime_minutes: options.max_runtime_minutes,
+            max_runtime_minutes: goal.budget.max_runtime_minutes,
         };
         let completion_notifier = CompletionNotifier::new();
         let task_manager = options.task_manager.clone().unwrap_or_else(|| {
@@ -973,6 +978,72 @@ impl Orchestrator {
             } else {
                 RouteChangeType::RouteChange
             };
+            if let Err(reason) = budget_controller.apply_budget_for_route_change(
+                &BudgetSnapshot {
+                    worker_call_count,
+                    premium_worker_call_count,
+                    attempt_count,
+                    runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
+                    context_risk_signals: Vec::new(),
+                },
+                current_route_change_type.clone(),
+                selected_route.worker_kind.is_premium(),
+            ) {
+                goal.status = GoalStatus::Limited;
+                goal.summary = format!("Worker dispatch blocked before launch: {reason}");
+                goal.updated_at = timestamp();
+                store.write_goal(&goal)?;
+                store.append_goal_epoch_event(
+                    &goal_id,
+                    &epoch_id,
+                    &format!("{epoch_id}.budget-aborted"),
+                    GoalEpochEventKind::Aborted,
+                    json!({
+                        "reason": reason,
+                        "worker_calls": worker_call_count,
+                        "premium_worker_calls": premium_worker_call_count,
+                    }),
+                )?;
+                goal_run_lease.release()?;
+                bail!("{}", goal.summary);
+            }
+            let budget_reservation_id = format!("{epoch_id}.worker.{iteration}");
+            if let Err(error) = store.reserve_budget_call(
+                &goal_run_lease,
+                &budget_reservation_id,
+                "worker",
+                selected_route.worker_kind.is_premium(),
+                &goal.budget,
+            ) {
+                goal.status = GoalStatus::Limited;
+                goal.summary = format!("Worker dispatch reservation failed: {error}");
+                goal.updated_at = timestamp();
+                store.write_goal(&goal)?;
+                store.append_goal_epoch_event(
+                    &goal_id,
+                    &epoch_id,
+                    &format!("{epoch_id}.reservation-aborted"),
+                    GoalEpochEventKind::Aborted,
+                    json!({
+                        "reason": error.to_string(),
+                        "reservation_id": budget_reservation_id,
+                    }),
+                )?;
+                goal_run_lease.release()?;
+                bail!("{}", goal.summary);
+            }
+            store.append_goal_epoch_event(
+                &goal_id,
+                &epoch_id,
+                &format!("{budget_reservation_id}.reserved"),
+                GoalEpochEventKind::BudgetReserved,
+                json!({
+                    "reservation_id": budget_reservation_id,
+                    "phase": "worker",
+                    "premium": selected_route.worker_kind.is_premium(),
+                    "reserved_tokens": goal.budget.max_tokens_per_call,
+                }),
+            )?;
             let worker_task_id = if iteration == 1 {
                 "task_003".to_string()
             } else {
@@ -1318,6 +1389,64 @@ impl Orchestrator {
                     )
                     .context("broker terminal ledger finalization failed for executor")?;
             }
+            let settled_budget_usage = if let Some(broker) = executor_broker {
+                match broker.latest_receipt()?.and_then(|receipt| receipt.usage) {
+                    Some(usage) => {
+                        let usage_incomplete = usage.requested_tokens.is_none()
+                            || usage.actual_tokens.is_none()
+                            || usage.cost_micros.is_none();
+                        SettledBudgetUsage {
+                            requested_tokens: usage.requested_tokens,
+                            actual_tokens: usage.actual_tokens,
+                            cost_micros: usage.cost_micros,
+                            duration_ms: usage.duration_ms,
+                            cache_hit: usage.cache_hit,
+                            unavailable_reason: usage.unavailable_reason.or_else(|| {
+                                usage_incomplete
+                                    .then(|| "broker receipt reported incomplete usage".to_string())
+                            }),
+                        }
+                    }
+                    None => SettledBudgetUsage {
+                        requested_tokens: None,
+                        actual_tokens: None,
+                        cost_micros: None,
+                        duration_ms: None,
+                        cache_hit: None,
+                        unavailable_reason: Some(
+                            "broker terminal receipt omitted usage".to_string(),
+                        ),
+                    },
+                }
+            } else {
+                SettledBudgetUsage {
+                    requested_tokens: None,
+                    actual_tokens: None,
+                    cost_micros: None,
+                    duration_ms: None,
+                    cache_hit: None,
+                    unavailable_reason: Some(
+                        "worker backend does not expose usage receipts".to_string(),
+                    ),
+                }
+            };
+            let settled_reservation = store
+                .settle_budget_call(
+                    &goal_run_lease,
+                    &budget_reservation_id,
+                    settled_budget_usage,
+                )
+                .context("failed to settle worker budget reservation")?;
+            store.append_goal_epoch_event(
+                &goal_id,
+                &epoch_id,
+                &format!("{budget_reservation_id}.settled"),
+                GoalEpochEventKind::BudgetSettled,
+                json!({
+                    "reservation_id": budget_reservation_id,
+                    "usage": settled_reservation.usage,
+                }),
+            )?;
             let worker_session_id = managed_worker_run.record.session_id.clone();
             let worker_task_record = managed_worker_run.record;
             let iteration_worker_outcome = managed_worker_run.outcome;
@@ -1342,16 +1471,6 @@ impl Orchestrator {
                         .unwrap_or_else(|| worker_task_id.clone()),
                 );
             }
-            let _budget_check = budget_controller.apply_budget_for_route_change(
-                &BudgetSnapshot {
-                    worker_call_count,
-                    premium_worker_call_count,
-                    attempt_count,
-                    runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
-                    context_risk_signals: Vec::new(),
-                },
-                current_route_change_type.clone(),
-            );
             worker_call_count += 1;
             attempt_count += worker_task_record.attempts.len();
             premium_worker_call_count += worker_task_record
@@ -4059,6 +4178,7 @@ impl BudgetController {
         &self,
         snapshot: &BudgetSnapshot,
         route_change_type: RouteChangeType,
+        next_worker_is_premium: bool,
     ) -> Result<(), String> {
         if snapshot.worker_call_count >= self.max_worker_calls {
             return Err(format!(
@@ -4068,7 +4188,9 @@ impl BudgetController {
                 route_change_type.label()
             ));
         }
-        if snapshot.premium_worker_call_count >= self.max_premium_worker_calls {
+        if next_worker_is_premium
+            && snapshot.premium_worker_call_count >= self.max_premium_worker_calls
+        {
             return Err(format!(
                 "premium_worker_calls={}/{} ({})",
                 snapshot.premium_worker_call_count,
@@ -6529,7 +6651,7 @@ mod tests {
             &["echo verify-ok".to_string()],
         );
 
-        let outcome = Orchestrator::run(RunOptions {
+        let options = RunOptions {
             request: "Build a tiny task tracker".to_string(),
             workspace: temp_dir.path().to_path_buf(),
             verification_commands: vec!["echo verify-ok".to_string()],
@@ -6555,6 +6677,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: Some(event_sink),
             cancellation_token: None,
@@ -6571,7 +6694,8 @@ mod tests {
             task_manager: None,
             session_id: Some("acp-session-1".to_string()),
             continuation: true,
-        })?;
+        };
+        let outcome = Orchestrator::run(options.clone())?;
 
         assert_eq!(
             outcome.status,
@@ -6598,10 +6722,25 @@ mod tests {
             event.kind == GoalEpochEventKind::PhaseCompleted
                 && event.payload.get("phase") == Some(&json!("review"))
         }));
+        assert!(
+            epoch_events
+                .iter()
+                .any(|event| event.kind == GoalEpochEventKind::BudgetReserved)
+        );
+        assert!(
+            epoch_events
+                .iter()
+                .any(|event| event.kind == GoalEpochEventKind::BudgetSettled)
+        );
         assert_eq!(
             epoch_events.last().map(|event| &event.kind),
             Some(&GoalEpochEventKind::Settled)
         );
+        let budget_ledger = state_store.read_goal_budget_ledger(&outcome.goal_id)?;
+        assert!(!budget_ledger.reservations.is_empty());
+        assert!(budget_ledger.reservations.iter().all(|reservation| {
+            reservation.status == crate::state::BudgetReservationStatus::Settled
+        }));
         assert!(outcome.final_report_path.exists());
         assert!(outcome.events_path.exists());
         assert!(outcome.artifacts_root.join("spec.md").exists());
@@ -6636,6 +6775,21 @@ mod tests {
         assert!(final_report.contains("plan.md"));
         let verification = fs::read_to_string(outcome.artifacts_root.join("verification.md"))?;
         assert!(verification.contains("verify-ok"));
+        let blocked_marker = temp_dir.path().join("budget-worker-must-not-run");
+        let mut blocked_options = options;
+        blocked_options.session_id = Some("budget-blocked-session".to_string());
+        blocked_options.continuation = false;
+        blocked_options.budget = Some(Budget {
+            max_tokens_per_call: 100,
+            max_tokens_per_epoch: 99,
+            ..Budget::default()
+        });
+        blocked_options.worker.worker_command =
+            Some(format!("touch {}", blocked_marker.to_string_lossy()));
+        let budget_error = Orchestrator::run(blocked_options)
+            .expect_err("token reservation must block before worker launch");
+        assert!(budget_error.to_string().contains("token budget"));
+        assert!(!blocked_marker.exists());
         let store = StateStore::new(temp_dir.path());
         let mut persisted_route_receipt = None;
         for entry in fs::read_dir(store.phase_routes_dir(&outcome.goal_id))? {
@@ -7774,7 +7928,7 @@ mod tests {
         };
         assert!(
             budget
-                .apply_budget_for_route_change(&snapshot, RouteChangeType::RouteChange)
+                .apply_budget_for_route_change(&snapshot, RouteChangeType::RouteChange, false)
                 .is_ok(),
             "under budget should be Ok"
         );
@@ -7783,8 +7937,11 @@ mod tests {
             worker_call_count: 2,
             ..BudgetSnapshot::default()
         };
-        let result =
-            budget.apply_budget_for_route_change(&full_snapshot, RouteChangeType::RouteChange);
+        let result = budget.apply_budget_for_route_change(
+            &full_snapshot,
+            RouteChangeType::RouteChange,
+            false,
+        );
         assert!(result.is_err());
         assert!(
             result.as_ref().unwrap_err().contains("route change"),
@@ -7793,7 +7950,7 @@ mod tests {
         );
 
         let fallback_result =
-            budget.apply_budget_for_route_change(&full_snapshot, RouteChangeType::Fallback);
+            budget.apply_budget_for_route_change(&full_snapshot, RouteChangeType::Fallback, false);
         assert!(fallback_result.is_err());
         assert!(
             fallback_result.as_ref().unwrap_err().contains("fallback"),
@@ -7805,8 +7962,21 @@ mod tests {
             premium_worker_call_count: 1,
             ..BudgetSnapshot::default()
         };
-        let review_result =
-            budget.apply_budget_for_route_change(&premium_snapshot, RouteChangeType::ReviewTrigger);
+        assert!(
+            budget
+                .apply_budget_for_route_change(
+                    &premium_snapshot,
+                    RouteChangeType::RouteChange,
+                    false,
+                )
+                .is_ok(),
+            "an exhausted premium budget must not block a non-premium worker"
+        );
+        let review_result = budget.apply_budget_for_route_change(
+            &premium_snapshot,
+            RouteChangeType::ReviewTrigger,
+            true,
+        );
         assert!(review_result.is_err());
         assert!(
             review_result.as_ref().unwrap_err().contains("review"),
@@ -8395,6 +8565,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: None,
@@ -8502,6 +8673,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: None,
@@ -8605,6 +8777,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: None,
@@ -8782,6 +8955,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: None,
@@ -8835,6 +9009,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: None,
@@ -8894,6 +9069,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: None,
@@ -8953,6 +9129,7 @@ mod tests {
             max_files_changed: 10,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            budget: None,
             install_dependencies: false,
             event_sink: None,
             cancellation_token: Some(cancellation_token),

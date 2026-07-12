@@ -75,7 +75,7 @@ use gearbox_agent::runtime::{
     PlanRevisionSubmission, PlannerHook, PlannerInput, PlannerSubmission, RunOptions,
 };
 use gearbox_agent::state::{
-    ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
+    Budget, ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
     TaskInputs as GearTaskInputs, TaskKind as GearTaskKind, TaskOutputs as GearTaskOutputs,
     TaskStatus as GearTaskStatus, event, id_timestamp,
 };
@@ -3025,6 +3025,7 @@ impl NativeAgentConnection {
                         max_provider_unknown_streak: gear_max_provider_unknown_streak_from_env(),
                         max_child_depth: gear_max_child_depth_from_env(),
                         max_runtime_minutes: gear_max_runtime_minutes_from_env(),
+                        budget: Some(gear_budget_from_env()),
                         coordinator_model,
                         coordinator_brief,
                         coordinator_review_hook,
@@ -4696,6 +4697,35 @@ fn gear_max_runtime_minutes_from_env() -> usize {
         "GEARBOX_GEAR_MAX_RUNTIME_MINUTES",
         DEFAULT_MAX_RUNTIME_MINUTES,
     )
+}
+
+fn gear_budget_from_env() -> Budget {
+    Budget {
+        max_worker_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_WORKER_CALLS", 8),
+        max_premium_worker_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_PREMIUM_WORKER_CALLS", 8),
+        max_tokens_per_call: gear_u64_from_env("GEARBOX_GEAR_MAX_TOKENS_PER_CALL", 128_000),
+        max_tokens_per_epoch: gear_u64_from_env("GEARBOX_GEAR_MAX_TOKENS_PER_EPOCH", 1_000_000),
+        max_cost_micros_per_epoch: gear_u64_from_env(
+            "GEARBOX_GEAR_MAX_COST_MICROS_PER_EPOCH",
+            u64::MAX,
+        ),
+        max_usage_unknown_calls: gear_usize_from_env("GEARBOX_GEAR_MAX_USAGE_UNKNOWN_CALLS", 8),
+        max_runtime_minutes: gear_max_runtime_minutes_from_env(),
+        ..Budget::default()
+    }
+}
+
+fn gear_u64_from_env(name: &str, default_value: u64) -> u64 {
+    let Some(value) = trimmed_env_value(name) else {
+        return default_value;
+    };
+    match value.parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            log::warn!("Ignoring invalid {name} value `{value}`; using {default_value}");
+            default_value
+        }
+    }
 }
 
 fn gear_usize_from_env(name: &str, default_value: usize) -> usize {

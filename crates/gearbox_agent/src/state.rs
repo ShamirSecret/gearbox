@@ -154,17 +154,29 @@ pub struct Budget {
     pub max_child_depth: usize,
     #[serde(default = "default_max_runtime_minutes")]
     pub max_runtime_minutes: usize,
+    #[serde(default = "default_max_tokens_per_call")]
+    pub max_tokens_per_call: u64,
+    #[serde(default = "default_max_tokens_per_epoch")]
+    pub max_tokens_per_epoch: u64,
+    #[serde(default = "default_max_cost_micros_per_epoch")]
+    pub max_cost_micros_per_epoch: u64,
+    #[serde(default = "default_max_usage_unknown_calls")]
+    pub max_usage_unknown_calls: usize,
 }
 
 impl Default for Budget {
     fn default() -> Self {
         Self {
             max_worker_calls: 8,
-            max_premium_worker_calls: 2,
+            max_premium_worker_calls: 8,
             max_repair_attempts_per_error: 2,
             max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+            max_tokens_per_call: default_max_tokens_per_call(),
+            max_tokens_per_epoch: default_max_tokens_per_epoch(),
+            max_cost_micros_per_epoch: default_max_cost_micros_per_epoch(),
+            max_usage_unknown_calls: default_max_usage_unknown_calls(),
         }
     }
 }
@@ -179,6 +191,22 @@ fn default_max_child_depth() -> usize {
 
 fn default_max_runtime_minutes() -> usize {
     DEFAULT_MAX_RUNTIME_MINUTES
+}
+
+fn default_max_tokens_per_call() -> u64 {
+    128_000
+}
+
+fn default_max_tokens_per_epoch() -> u64 {
+    1_000_000
+}
+
+fn default_max_cost_micros_per_epoch() -> u64 {
+    u64::MAX
+}
+
+fn default_max_usage_unknown_calls() -> usize {
+    8
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +352,8 @@ pub struct Event {
 #[serde(rename_all = "snake_case")]
 pub enum GoalEpochEventKind {
     Started,
+    BudgetReserved,
+    BudgetSettled,
     PhaseCompleted,
     Settled,
     Aborted,
@@ -361,6 +391,115 @@ pub struct GoalRunLeaseGuard {
     lease: GoalRunLease,
     file: fs::File,
     path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetReservationStatus {
+    Reserved,
+    Settled,
+    Released,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettledBudgetUsage {
+    pub requested_tokens: Option<u64>,
+    pub actual_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub cache_hit: Option<bool>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl SettledBudgetUsage {
+    pub fn total_tokens(&self) -> Option<u64> {
+        Some(
+            self.requested_tokens?
+                .saturating_add(self.actual_tokens.unwrap_or(0)),
+        )
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.total_tokens().is_none() || self.cost_micros.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetReservation {
+    pub reservation_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub phase: String,
+    pub premium: bool,
+    pub reserved_tokens: u64,
+    pub reserved_cost_micros: u64,
+    pub status: BudgetReservationStatus,
+    pub usage: Option<SettledBudgetUsage>,
+    pub created_at: String,
+    pub settled_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalBudgetLedger {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub reservations: Vec<BudgetReservation>,
+    pub updated_at: String,
+    pub ledger_hash: String,
+}
+
+impl GoalBudgetLedger {
+    fn seal(mut self) -> Result<Self> {
+        self.ledger_hash.clear();
+        self.ledger_hash = self.expected_hash()?;
+        Ok(self)
+    }
+
+    fn validate(&self, goal_id: &str) -> Result<()> {
+        if self.schema_version != 1 || self.goal_id != goal_id {
+            bail!("goal budget ledger has an invalid schema or goal binding");
+        }
+        if self.ledger_hash != self.expected_hash()? {
+            bail!("goal budget ledger integrity hash mismatch");
+        }
+        let mut reservation_ids = HashSet::new();
+        for reservation in &self.reservations {
+            if reservation.goal_id != goal_id
+                || reservation.reservation_id.trim().is_empty()
+                || reservation.epoch_id.trim().is_empty()
+                || reservation.phase.trim().is_empty()
+                || !reservation_ids.insert(reservation.reservation_id.as_str())
+            {
+                bail!("goal budget ledger contains an invalid reservation binding");
+            }
+            match reservation.status {
+                BudgetReservationStatus::Reserved
+                    if reservation.usage.is_some() || reservation.settled_at.is_some() =>
+                {
+                    bail!("reserved budget call cannot contain settlement fields");
+                }
+                BudgetReservationStatus::Settled
+                    if reservation.usage.is_none() || reservation.settled_at.is_none() =>
+                {
+                    bail!("settled budget call requires usage and settled_at");
+                }
+                BudgetReservationStatus::Reserved
+                | BudgetReservationStatus::Settled
+                | BudgetReservationStatus::Released => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.ledger_hash.clear();
+        let bytes = serde_json::to_vec(&payload).context("failed to serialize budget ledger")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
 }
 
 impl GoalRunLeaseGuard {
@@ -497,6 +636,7 @@ impl StateStore {
             self.plan_reviews_dir(),
             self.events_dir(),
             self.epochs_dir(),
+            self.budgets_dir(),
             self.artifacts_dir(),
             self.workers_dir(),
         ] {
@@ -536,6 +676,14 @@ impl StateStore {
 
     pub fn epochs_dir(&self) -> PathBuf {
         self.root.join("epochs")
+    }
+
+    pub fn budgets_dir(&self) -> PathBuf {
+        self.root.join("budgets")
+    }
+
+    pub fn goal_budget_ledger_path(&self, goal_id: &str) -> PathBuf {
+        self.budgets_dir().join(format!("{goal_id}.json"))
     }
 
     pub fn goal_epoch_path(&self, goal_id: &str) -> PathBuf {
@@ -1217,6 +1365,154 @@ impl StateStore {
         Ok(event)
     }
 
+    pub fn read_goal_budget_ledger(&self, goal_id: &str) -> Result<GoalBudgetLedger> {
+        let path = self.goal_budget_ledger_path(goal_id);
+        if !path.exists() {
+            return Ok(GoalBudgetLedger {
+                schema_version: 1,
+                goal_id: goal_id.to_string(),
+                reservations: Vec::new(),
+                updated_at: timestamp(),
+                ledger_hash: String::new(),
+            });
+        }
+        let ledger: GoalBudgetLedger = read_json_file(&path)?;
+        ledger.validate(goal_id)?;
+        Ok(ledger)
+    }
+
+    pub fn reserve_budget_call(
+        &self,
+        lease: &GoalRunLeaseGuard,
+        reservation_id: &str,
+        phase: &str,
+        premium: bool,
+        budget: &Budget,
+    ) -> Result<BudgetReservation> {
+        for (field, value) in [
+            ("goal_id", lease.lease.goal_id.as_str()),
+            ("epoch_id", lease.lease.epoch_id.as_str()),
+            ("reservation_id", reservation_id),
+            ("phase", phase),
+        ] {
+            if value.trim().is_empty() {
+                bail!("budget reservation requires non-empty {field}");
+            }
+        }
+        if budget.max_tokens_per_call == 0 {
+            bail!("budget max_tokens_per_call must be greater than zero");
+        }
+        let goal_id = lease.lease.goal_id.as_str();
+        let epoch_id = lease.lease.epoch_id.as_str();
+        let mut ledger = self.read_goal_budget_ledger(goal_id)?;
+        let (calls, premium_calls, tokens, cost, unknown_calls) =
+            budget_ledger_totals(&ledger, epoch_id);
+        if let Some(existing) = ledger
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+        {
+            if existing.epoch_id == epoch_id
+                && existing.phase == phase
+                && existing.premium == premium
+            {
+                return Ok(existing.clone());
+            }
+            bail!("budget reservation id conflicts with an existing reservation");
+        }
+        if calls >= budget.max_worker_calls {
+            bail!("worker call budget exhausted before reservation");
+        }
+        if premium && premium_calls >= budget.max_premium_worker_calls {
+            bail!("premium worker call budget exhausted before reservation");
+        }
+        if unknown_calls >= budget.max_usage_unknown_calls {
+            bail!("usage-unknown call budget exhausted before reservation");
+        }
+        if tokens.saturating_add(budget.max_tokens_per_call) > budget.max_tokens_per_epoch {
+            bail!("epoch token budget exhausted before reservation");
+        }
+        let reserved_cost_micros = budget.max_cost_micros_per_epoch.saturating_sub(cost);
+        if budget.max_cost_micros_per_epoch != u64::MAX && reserved_cost_micros == 0 {
+            bail!("epoch cost budget exhausted before reservation");
+        }
+        let reservation = BudgetReservation {
+            reservation_id: reservation_id.to_string(),
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            phase: phase.to_string(),
+            premium,
+            reserved_tokens: budget.max_tokens_per_call,
+            reserved_cost_micros,
+            status: BudgetReservationStatus::Reserved,
+            usage: None,
+            created_at: timestamp(),
+            settled_at: None,
+        };
+        ledger.reservations.push(reservation.clone());
+        ledger.updated_at = timestamp();
+        self.write_goal_budget_ledger(ledger)?;
+        Ok(reservation)
+    }
+
+    pub fn settle_budget_call(
+        &self,
+        lease: &GoalRunLeaseGuard,
+        reservation_id: &str,
+        usage: SettledBudgetUsage,
+    ) -> Result<BudgetReservation> {
+        if usage.is_unknown()
+            && usage
+                .unavailable_reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+        {
+            bail!("unknown budget usage requires an unavailable reason");
+        }
+        let goal_id = lease.lease.goal_id.as_str();
+        let mut ledger = self.read_goal_budget_ledger(goal_id)?;
+        let reservation = ledger
+            .reservations
+            .iter_mut()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+            .context("budget settlement references an unknown reservation")?;
+        if reservation.status == BudgetReservationStatus::Settled {
+            if reservation.usage.as_ref() == Some(&usage) {
+                return Ok(reservation.clone());
+            }
+            bail!("budget reservation was already settled with different usage");
+        }
+        if reservation.status != BudgetReservationStatus::Reserved {
+            bail!("only a reserved budget call can be settled");
+        }
+        if usage
+            .total_tokens()
+            .is_some_and(|tokens| tokens > reservation.reserved_tokens)
+        {
+            bail!("settled token usage exceeds the reservation");
+        }
+        if usage
+            .cost_micros
+            .is_some_and(|cost| cost > reservation.reserved_cost_micros)
+        {
+            bail!("settled cost exceeds the reservation");
+        }
+        reservation.status = BudgetReservationStatus::Settled;
+        reservation.usage = Some(usage);
+        reservation.settled_at = Some(timestamp());
+        let settled = reservation.clone();
+        ledger.updated_at = timestamp();
+        self.write_goal_budget_ledger(ledger)?;
+        Ok(settled)
+    }
+
+    fn write_goal_budget_ledger(&self, ledger: GoalBudgetLedger) -> Result<()> {
+        let goal_id = ledger.goal_id.clone();
+        let ledger = ledger.seal()?;
+        ledger.validate(&goal_id)?;
+        write_json_atomic(&self.goal_budget_ledger_path(&goal_id), &ledger)
+    }
+
     pub fn read_goal_epoch_events(&self, goal_id: &str) -> Result<Vec<GoalEpochEvent>> {
         let path = self.goal_epoch_path(goal_id);
         if !path.exists() {
@@ -1378,6 +1674,40 @@ impl StateStore {
     }
 }
 
+fn budget_ledger_totals(
+    ledger: &GoalBudgetLedger,
+    epoch_id: &str,
+) -> (usize, usize, u64, u64, usize) {
+    let mut calls = 0usize;
+    let mut premium_calls = 0usize;
+    let mut tokens = 0u64;
+    let mut cost = 0u64;
+    let mut unknown_calls = 0usize;
+    for reservation in ledger.reservations.iter().filter(|reservation| {
+        reservation.epoch_id == epoch_id && reservation.status != BudgetReservationStatus::Released
+    }) {
+        calls = calls.saturating_add(1);
+        premium_calls = premium_calls.saturating_add(usize::from(reservation.premium));
+        match reservation.usage.as_ref() {
+            Some(usage) => {
+                tokens = tokens
+                    .saturating_add(usage.total_tokens().unwrap_or(reservation.reserved_tokens));
+                cost = cost.saturating_add(
+                    usage
+                        .cost_micros
+                        .unwrap_or(reservation.reserved_cost_micros),
+                );
+                unknown_calls = unknown_calls.saturating_add(usize::from(usage.is_unknown()));
+            }
+            None => {
+                tokens = tokens.saturating_add(reservation.reserved_tokens);
+                cost = cost.saturating_add(reservation.reserved_cost_micros);
+            }
+        }
+    }
+    (calls, premium_calls, tokens, cost, unknown_calls)
+}
+
 fn validate_goal_epoch_transition(
     active_epoch: &mut Option<String>,
     event: &GoalEpochEvent,
@@ -1392,7 +1722,9 @@ fn validate_goal_epoch_transition(
             }
             *active_epoch = Some(event.epoch_id.clone());
         }
-        GoalEpochEventKind::PhaseCompleted => {
+        GoalEpochEventKind::BudgetReserved
+        | GoalEpochEventKind::BudgetSettled
+        | GoalEpochEventKind::PhaseCompleted => {
             if active_epoch.as_deref() != Some(event.epoch_id.as_str()) {
                 bail!("phase completion is not bound to the active goal epoch");
             }
@@ -1566,6 +1898,78 @@ mod epoch_tests {
             json!({ "session_id": "session-2" }),
         )?;
         second.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn budget_ledger_reserves_before_dispatch_and_settles_actual_usage() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let budget = Budget {
+            max_worker_calls: 4,
+            max_premium_worker_calls: 1,
+            max_tokens_per_call: 60,
+            max_tokens_per_epoch: 100,
+            max_cost_micros_per_epoch: 100,
+            max_usage_unknown_calls: 1,
+            ..Budget::default()
+        };
+        let lease = store.acquire_goal_run_lease(
+            "goal-1",
+            "epoch-1",
+            "session-1",
+            std::time::Duration::from_secs(60),
+        )?;
+
+        let first =
+            store.reserve_budget_call(&lease, "epoch-1.worker.1", "worker", true, &budget)?;
+        assert_eq!(first.reserved_tokens, 60);
+        assert_eq!(first.reserved_cost_micros, 100);
+        let replay =
+            store.reserve_budget_call(&lease, "epoch-1.worker.1", "worker", true, &budget)?;
+        assert_eq!(replay, first);
+        store.settle_budget_call(
+            &lease,
+            "epoch-1.worker.1",
+            SettledBudgetUsage {
+                requested_tokens: Some(10),
+                actual_tokens: Some(10),
+                cost_micros: Some(30),
+                duration_ms: Some(50),
+                cache_hit: Some(false),
+                unavailable_reason: None,
+            },
+        )?;
+
+        let second =
+            store.reserve_budget_call(&lease, "epoch-1.worker.2", "worker", false, &budget)?;
+        assert_eq!(second.reserved_cost_micros, 70);
+        store.settle_budget_call(
+            &lease,
+            "epoch-1.worker.2",
+            SettledBudgetUsage {
+                requested_tokens: None,
+                actual_tokens: None,
+                cost_micros: None,
+                duration_ms: None,
+                cache_hit: None,
+                unavailable_reason: Some("backend omitted usage".to_string()),
+            },
+        )?;
+        assert!(
+            store
+                .reserve_budget_call(&lease, "epoch-1.worker.3", "worker", false, &budget,)
+                .is_err()
+        );
+        let ledger_path = store.goal_budget_ledger_path("goal-1");
+        let ledger_contents = fs::read_to_string(&ledger_path)?;
+        fs::write(
+            &ledger_path,
+            ledger_contents.replace("\"cost_micros\": 30", "\"cost_micros\": 31"),
+        )?;
+        assert!(store.read_goal_budget_ledger("goal-1").is_err());
+        lease.release()?;
         Ok(())
     }
 }

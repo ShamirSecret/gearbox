@@ -315,6 +315,12 @@ pub struct BrokerUsage {
     /// Wall-clock duration of the interaction in milliseconds, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Provider-reported cost in millionths of the configured currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+    /// Whether the backend reported that cached context served the interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
     /// Reason usage could not be determined, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
@@ -910,6 +916,29 @@ impl WorkerBroker {
             session_identity: inner.session_identity.clone(),
             interaction_ordinal: inner.interaction_ordinal,
         })
+    }
+
+    pub fn latest_receipt(&self) -> Result<Option<BrokerLifecycleReceipt>> {
+        let (ledger_paths, ordinal) = {
+            let inner = self
+                .state
+                .lock()
+                .map_err(|e| anyhow::anyhow!("broker state mutex poisoned: {e}"))?;
+            (inner.ledger_paths.clone(), inner.interaction_ordinal)
+        };
+        let Some(ledger_paths) = ledger_paths else {
+            return Ok(None);
+        };
+        if ordinal == 0 {
+            return Ok(None);
+        }
+        let path = ledger_paths.receipt_path(ordinal);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let receipt: BrokerLifecycleReceipt = read_json_file(&path)?;
+        receipt.validate()?;
+        Ok(Some(receipt))
     }
 
     /// Return the current session identity, if set.
@@ -2494,6 +2523,8 @@ mod tests {
                 actual_tokens: Some(50),
                 model: "test-model".to_string(),
                 duration_ms: Some(5000),
+                cost_micros: Some(25_000),
+                cache_hit: Some(false),
                 unavailable_reason: None,
             }),
             permission_evidence: None,

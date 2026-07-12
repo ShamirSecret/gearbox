@@ -916,6 +916,8 @@ fn tamper_test_receipt() -> BrokerLifecycleReceipt {
             actual_tokens: Some(50),
             model: "test-model".to_string(),
             duration_ms: Some(5000),
+            cost_micros: Some(25_000),
+            cache_hit: Some(false),
             unavailable_reason: None,
         }),
         permission_evidence: None,
