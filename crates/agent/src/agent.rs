@@ -65,7 +65,7 @@ use gearbox_agent::phase_routing::{
 };
 use gearbox_agent::plan_graph::PhaseProfile;
 use gearbox_agent::plan_review::{
-    IntentFoldVerdict, PhaseExecutionBackend, PhaseExecutionIdentity, PlanCriticVerdict,
+    PhaseExecutionBackend, PhaseExecutionIdentity, PlanCriticVerdict,
 };
 use gearbox_agent::runtime::{
     CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
@@ -74,12 +74,10 @@ use gearbox_agent::runtime::{
     PlanCriticHook, PlanCriticInput, PlanCriticSubmission, PlanRevisionHook, PlanRevisionInput,
     PlanRevisionSubmission, PlannerHook, PlannerInput, PlannerSubmission, RunOptions,
     StrategistNextGoalHook, StrategistNextGoalInput, StrategistNextGoalSubmission,
-    StrategistNextGoalVerdict, objective_policy_from_env,
+    objective_policy_from_env,
 };
 use gearbox_agent::state::{
-    Budget, ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
-    TaskInputs as GearTaskInputs, TaskKind as GearTaskKind, TaskOutputs as GearTaskOutputs,
-    TaskStatus as GearTaskStatus, event, id_timestamp,
+    Budget, ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, event, id_timestamp,
 };
 use gearbox_agent::task_manager::{
     ActionOutcome, ManagedTaskStatus, OutcomeContext, SendOutcome, SharedTaskManager, SteerOutcome,
@@ -3515,288 +3513,35 @@ struct GearOpenCodePhaseRunner {
     cancellation_token: CancellationToken,
 }
 
-struct GearOpenCodePhaseOutput {
-    raw_output: String,
-    execution_identity: PhaseExecutionIdentity,
-    artifact_path: String,
-}
-
 impl GearOpenCodePhaseRunner {
-    fn run(
-        &self,
-        decision: &gearbox_agent::phase_routing::PhaseRouteDecision,
-        goal_id: &str,
-        plan_id: &str,
-        plan_revision: usize,
-        task_id: &str,
-        task_kind: GearTaskKind,
-        scope: Scope,
-        prompt: String,
-    ) -> Result<GearOpenCodePhaseOutput> {
-        if !matches!(
-            decision.candidate.backend,
-            PhaseBackend::Worker(WorkerKind::OpencodeSession)
-        ) {
-            anyhow::bail!("Gear OpenCode phase runner received a non-OpenCode route");
+    fn to_inner(&self) -> gearbox_agent::open_code_phase_runtime::OpenCodePhaseRunner {
+        gearbox_agent::open_code_phase_runtime::OpenCodePhaseRunner {
+            broker_factory: self.broker_factory.clone(),
+            workspace: self.workspace.clone(),
+            worker_config: self.worker_config.clone(),
+            cancellation_token: self.cancellation_token.clone(),
         }
-        let config = decision.overlay_worker_config(&self.worker_config)?;
-        let store = StateStore::new(&self.workspace);
-        store.initialize()?;
-        let task = GearTask {
-            id: task_id.to_string(),
-            goal_id: goal_id.to_string(),
-            parent_task_id: None,
-            title: format!("Gear {:?} phase", decision.phase),
-            kind: task_kind,
-            status: GearTaskStatus::Pending,
-            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
-            attempt: 1,
-            scope,
-            inputs: GearTaskInputs {
-                phase_route_locked: true,
-                ..GearTaskInputs::default()
-            },
-            outputs: GearTaskOutputs::default(),
-        };
-        let suffix = id_timestamp();
-        let execution = self.broker_factory.execute_worker_phase(
-            decision,
-            goal_id,
-            plan_id,
-            plan_revision,
-            task_id,
-            &format!("{:?}_execution_{suffix}", decision.phase).to_ascii_lowercase(),
-            &format!("{:?}_session_{suffix}", decision.phase).to_ascii_lowercase(),
-            WorkerStartRequest {
-                store: &store,
-                workspace: &self.workspace,
-                task: &task,
-                route_attempt: 1,
-                goal: &prompt,
-                verification_commands: &[],
-                config: &config,
-                cancellation_token: Some(self.cancellation_token.clone()),
-                coordinator_model: None,
-                coordinator_brief: None,
-                route_hint: None,
-            },
-        )?;
-        if execution.result.status != WorkerStatus::Succeeded {
-            anyhow::bail!(
-                "OpenCode {:?} phase failed: {}",
-                decision.phase,
-                execution.result.summary
-            );
-        }
-        let raw_output = execution
-            .result
-            .last_message_path
-            .as_ref()
-            .filter(|path| path.is_file())
-            .or_else(|| {
-                execution
-                    .result
-                    .stdout_path
-                    .as_ref()
-                    .filter(|path| path.is_file())
-            })
-            .map(std_fs::read_to_string)
-            .transpose()?
-            .unwrap_or_else(|| execution.result.summary.clone());
-        let raw_output = raw_output.trim().to_string();
-        if raw_output.is_empty() {
-            anyhow::bail!(
-                "OpenCode {:?} phase returned an empty response",
-                decision.phase
-            );
-        }
-        Ok(GearOpenCodePhaseOutput {
-            raw_output,
-            execution_identity: execution.execution_identity,
-            artifact_path: execution.result.result_path.to_string_lossy().to_string(),
-        })
     }
 
     fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
-        let prompt = gear_opencode_intent_fold_prompt(&input)?;
-        let task_id = format!("intent_fold_{}", input.goal_id);
-        let output = self.run(
-            &input.route_decision,
-            &input.goal_id,
-            &format!("pending_{}", input.goal_id),
-            0,
-            &task_id,
-            GearTaskKind::Spec,
-            input.scope,
-            prompt,
-        )?;
-        let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
-        Ok(IntentFoldSubmission {
-            verdict,
-            analyst: output.execution_identity,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        self.to_inner().fold_intent(input)
     }
 
     fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
-        let prompt = gear_opencode_planner_prompt(&input)?;
-        let task_id = format!("planner_{}", input.goal_id);
-        let output = self.run(
-            &input.route_decision,
-            &input.goal_id,
-            &format!("pending_{}", input.goal_id),
-            0,
-            &task_id,
-            GearTaskKind::Plan,
-            input.scope,
-            prompt,
-        )?;
-        let draft = gearbox_agent::plan_graph::parse_planner_draft(&output.raw_output)?;
-        Ok(PlannerSubmission {
-            draft,
-            planner: output.execution_identity,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        self.to_inner().plan(input)
     }
 
     fn critique(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
-        let prompt = gear_opencode_plan_critic_prompt(&input)?;
-        let task_id = format!("plan_critic_{}_{}", input.plan.goal_id, input.plan.revision);
-        let output = self.run(
-            &input.route_decision,
-            &input.plan.goal_id,
-            &input.plan.plan_id,
-            input.plan.revision,
-            &task_id,
-            GearTaskKind::Review,
-            Scope::new(Vec::new(), Vec::new(), 1),
-            prompt,
-        )?;
-        let verdict = PlanCriticVerdict::parse(&output.raw_output)?;
-        Ok(PlanCriticSubmission {
-            reviewer: output.execution_identity,
-            verdict,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        self.to_inner().critique(input)
     }
 
     fn revise(&self, input: PlanRevisionInput) -> Result<PlanRevisionSubmission> {
-        let prompt = gear_opencode_plan_revision_prompt(&input)?;
-        let task_id = format!(
-            "planner_revision_{}_{}",
-            input.plan.goal_id, input.plan.revision
-        );
-        let output = self.run(
-            &input.route_decision,
-            &input.plan.goal_id,
-            &input.plan.plan_id,
-            input.plan.revision,
-            &task_id,
-            GearTaskKind::Plan,
-            Scope::new(Vec::new(), Vec::new(), 1),
-            prompt,
-        )?;
-        let draft = gearbox_agent::plan_graph::parse_planner_draft(&output.raw_output)?;
-        Ok(PlanRevisionSubmission {
-            draft,
-            planner: output.execution_identity,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        self.to_inner().revise(input)
     }
 
     fn strategize(&self, input: StrategistNextGoalInput) -> Result<StrategistNextGoalSubmission> {
-        let prompt = gear_opencode_strategist_prompt(&input)?;
-        let task_id = format!("strategist_{}_{}", input.goal_id, input.epoch_id);
-        let output = self.run(
-            &input.route_decision,
-            &input.goal_id,
-            &input.plan.plan_id,
-            input.plan.revision,
-            &task_id,
-            GearTaskKind::Review,
-            Scope::new(Vec::new(), Vec::new(), 1),
-            prompt,
-        )?;
-        let verdict = StrategistNextGoalVerdict::parse(&output.raw_output)?;
-        Ok(StrategistNextGoalSubmission {
-            verdict,
-            strategist: output.execution_identity,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        self.to_inner().strategize(input)
     }
-}
-
-fn gear_opencode_strategist_prompt(input: &StrategistNextGoalInput) -> Result<String> {
-    Ok(format!(
-        "You are Gearbox StrategistNextGoal. Review the completed execution epoch and return only one strict JSON object.\n\
-Schema: {{\"schema_version\":1,\"goal_id\":string,\"epoch_id\":string,\"reviewed_status\":\"draft|planning|running|verifying|needs_user|blocked|limited|complete|failed\",\"decision\":\"complete|continue|needs_user|stop\",\"next_objective\":string|null,\"acceptance_signals\":[string],\"required_questions\":[string],\"evidence_refs\":[string],\"rationale\":string}}.\n\
-Use continue only for a bounded next objective consistent with the original request. Do not propose an unbounded loop. Use complete only when reviewed_status is complete.\n\
-Goal: {}\nEpoch: {}\nOriginal request: {}\nStatus: {}\nSummary: {}\nFinal report: {}\nPlan:\n{}\nBudget ledger:\n{}",
-        input.goal_id,
-        input.epoch_id,
-        input.request,
-        input.status.as_str(),
-        input.summary,
-        input.final_report_path,
-        serde_json::to_string_pretty(&input.plan)?,
-        serde_json::to_string_pretty(&input.budget_ledger)?,
-    ))
-}
-
-fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
-    let intent_fold = input
-        .intent_fold
-        .as_ref()
-        .map(serde_json::to_string_pretty)
-        .transpose()?
-        .unwrap_or_else(|| "none".to_string());
-    Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The draft must contain objective, must_have, must_not_have, topology_lock, tasks, and final_acceptance. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed IntentFold receipt as a binding interpretation of the goal: preserve its constraints, mitigate its risks, and turn its acceptance signals into executable checks. Do not write code.\n\nGoal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
-        input.request,
-        intent_fold,
-        serde_json::to_string_pretty(&input.scope)?,
-        serde_json::to_string_pretty(&input.verification_commands)?,
-    ))
-}
-
-fn gear_opencode_intent_fold_prompt(input: &IntentFoldInput) -> Result<String> {
-    Ok(format!(
-        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready only when required_questions is empty. Ask no question that repository inspection can answer.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
-        input.goal_id,
-        input.request,
-        serde_json::to_string_pretty(&input.scope)?,
-    ))
-}
-
-fn gear_opencode_plan_critic_prompt(input: &PlanCriticInput) -> Result<String> {
-    let evidence = serde_json::to_string_pretty(&serde_json::json!({
-        "request": input.request,
-        "plan": input.plan,
-        "planner_receipt": input.planner_receipt,
-        "deterministic_verifier": input.verifier_report,
-        "phase_route_decision": input.route_decision,
-    }))?;
-    Ok(format!(
-        "You are Gear's independent read-only PlanCritic. Return exactly one PlanCriticVerdict JSON object and no markdown fence. It must bind the exact goal, plan, revision, hash, and planner execution. Return exactly seven checks: references, executability, contradictions, scope, tdd, qa, acceptance. Approve only if all checks and deterministic verification pass. Revise must include blocking findings and concrete revision_instructions. Reject is only for a user decision and must set needs_user_reason.\n\nEvidence:\n{evidence}"
-    ))
-}
-
-fn gear_opencode_plan_revision_prompt(input: &PlanRevisionInput) -> Result<String> {
-    let evidence = serde_json::to_string_pretty(&serde_json::json!({
-        "request": input.request,
-        "current_plan": input.plan,
-        "planner_receipt": input.planner_receipt,
-        "critic_receipt": input.critic_receipt,
-        "phase_route_decision": input.route_decision,
-    }))?;
-    Ok(format!(
-        "You are Gear's read-only planner revising a rejected plan. Apply every blocking required_change and revision_instructions without expanding scope. Return exactly one complete PlanGraphDraft JSON object and no markdown fence or prose.\n\nEvidence:\n{evidence}"
-    ))
 }
 
 async fn generate_gear_coordinator_brief(

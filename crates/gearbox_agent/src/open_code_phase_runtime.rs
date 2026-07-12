@@ -1,0 +1,630 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result, bail};
+
+use crate::phase_routing::{
+    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseRouteDecision, PhaseRouteTable,
+};
+use crate::plan_graph::{parse_planner_draft, PhaseProfile};
+use crate::plan_review::{
+    IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVerdict,
+};
+use crate::runtime::{
+    IntentFoldInput, IntentFoldSubmission,
+    PlannerInput, PlannerSubmission,
+    PlanCriticInput, PlanCriticSubmission,
+    PlanRevisionInput, PlanRevisionSubmission,
+    PhaseRuntime, StrategistNextGoalInput, StrategistNextGoalSubmission,
+    StrategistNextGoalVerdict,
+};
+use crate::state::{
+    Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp,
+};
+use crate::tools::CancellationToken;
+use crate::worker_broker::PhaseBrokerFactory;
+use crate::workers::{WorkerConfig, WorkerKind, WorkerStartRequest, WorkerStatus};
+
+/// Builder for a production `PhaseRuntime` that routes all planning and review
+/// phases through independent OpenCode session workers.
+///
+/// Each phase (IntentFold, Planner, PlanCritic, PlanRevision, Strategist)
+/// receives its own `execution_id`, `session_id`, and `task_id`.  Phases
+/// never share an actual worker session.
+pub struct OpenCodePhaseRuntimeFactory {
+    workspace: PathBuf,
+    worker_config: WorkerConfig,
+    broker_factory: Arc<PhaseBrokerFactory>,
+    cancellation_token: CancellationToken,
+    phase_route_table: PhaseRouteTable,
+    inventory: LiveModelInventory,
+}
+
+impl OpenCodePhaseRuntimeFactory {
+    pub fn new(
+        workspace: PathBuf,
+        worker_config: WorkerConfig,
+        broker_factory: Arc<PhaseBrokerFactory>,
+        cancellation_token: CancellationToken,
+        phase_route_table: PhaseRouteTable,
+        inventory: LiveModelInventory,
+    ) -> Self {
+        Self {
+            workspace,
+            worker_config,
+            broker_factory,
+            cancellation_token,
+            phase_route_table,
+            inventory,
+        }
+    }
+
+    /// Build a complete `PhaseRuntime` with all OpenCode phase hooks wired.
+    pub fn build(self) -> Result<PhaseRuntime> {
+        let workspace = self.workspace.clone();
+        let worker_config = self.worker_config.clone();
+        let broker_factory = self.broker_factory.clone();
+        let cancellation_token = self.cancellation_token.clone();
+
+        let intent_fold_runner = OpenCodePhaseRunner {
+            workspace: workspace.clone(),
+            worker_config: worker_config.clone(),
+            broker_factory: broker_factory.clone(),
+            cancellation_token: cancellation_token.clone(),
+        };
+        let planner_runner = OpenCodePhaseRunner {
+            workspace: workspace.clone(),
+            worker_config: worker_config.clone(),
+            broker_factory: broker_factory.clone(),
+            cancellation_token: cancellation_token.clone(),
+        };
+        let critic_runner = OpenCodePhaseRunner {
+            workspace: workspace.clone(),
+            worker_config: worker_config.clone(),
+            broker_factory: broker_factory.clone(),
+            cancellation_token: cancellation_token.clone(),
+        };
+        let revision_runner = OpenCodePhaseRunner {
+            workspace: workspace.clone(),
+            worker_config: worker_config.clone(),
+            broker_factory: broker_factory.clone(),
+            cancellation_token: cancellation_token.clone(),
+        };
+        let strategist_runner = OpenCodePhaseRunner {
+            workspace,
+            worker_config,
+            broker_factory: broker_factory.clone(),
+            cancellation_token,
+        };
+
+        Ok(PhaseRuntime {
+            routes: self.phase_route_table,
+            inventory: self.inventory,
+            current_model: None,
+            planner: None,
+            intent_fold_hook: Some(Arc::new(move |input| {
+                intent_fold_runner.fold_intent(input)
+            })),
+            planner_hook: Some(Arc::new(move |input| planner_runner.plan(input))),
+            plan_critic_hook: Some(Arc::new(move |input| critic_runner.critique(input))),
+            plan_revision_hook: Some(Arc::new(move |input| revision_runner.revise(input))),
+            strategist_next_goal_hook: Some(Arc::new(move |input| {
+                strategist_runner.strategize(input)
+            })),
+            require_plan_approval: true,
+            max_plan_revisions: crate::runtime::DEFAULT_MAX_PLAN_REVISIONS,
+            broker: None,
+            broker_factory: Some(broker_factory),
+        })
+    }
+}
+
+/// Core runner that dispatches a single OpenCode phase through the broker
+/// factory and returns the parsed submission.
+#[derive(Clone)]
+pub struct OpenCodePhaseRunner {
+    pub broker_factory: Arc<PhaseBrokerFactory>,
+    pub workspace: PathBuf,
+    pub worker_config: WorkerConfig,
+    pub cancellation_token: CancellationToken,
+}
+
+struct OpenCodePhaseOutput {
+    raw_output: String,
+    execution_identity: PhaseExecutionIdentity,
+    artifact_path: String,
+}
+
+impl OpenCodePhaseRunner {
+    fn run(
+        &self,
+        decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+        task_kind: crate::state::TaskKind,
+        scope: Scope,
+        prompt: String,
+    ) -> Result<OpenCodePhaseOutput> {
+        if !matches!(
+            decision.candidate.backend,
+            PhaseBackend::Worker(WorkerKind::OpencodeSession)
+        ) {
+            bail!("Gear OpenCode phase runner received a non-OpenCode route");
+        }
+        let config = decision.overlay_worker_config(&self.worker_config)?;
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        let task = Task {
+            id: task_id.to_string(),
+            goal_id: goal_id.to_string(),
+            parent_task_id: None,
+            title: format!("Gear {:?} phase", decision.phase),
+            kind: task_kind,
+            status: TaskStatus::Pending,
+            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+            attempt: 1,
+            scope,
+            inputs: TaskInputs {
+                phase_route_locked: true,
+                ..TaskInputs::default()
+            },
+            outputs: TaskOutputs::default(),
+        };
+        let suffix = id_timestamp();
+        let execution = self.broker_factory.execute_worker_phase(
+            decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            &format!("{:?}_execution_{suffix}", decision.phase).to_ascii_lowercase(),
+            &format!("{:?}_session_{suffix}", decision.phase).to_ascii_lowercase(),
+            WorkerStartRequest {
+                store: &store,
+                workspace: &self.workspace,
+                task: &task,
+                route_attempt: 1,
+                goal: &prompt,
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: Some(self.cancellation_token.clone()),
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+        )?;
+        if execution.result.status != WorkerStatus::Succeeded {
+            bail!(
+                "OpenCode {:?} phase failed: {}",
+                decision.phase,
+                execution.result.summary
+            );
+        }
+        let raw_output = execution
+            .result
+            .last_message_path
+            .as_ref()
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                execution
+                    .result
+                    .stdout_path
+                    .as_ref()
+                    .filter(|path| path.is_file())
+            })
+            .map(std::fs::read_to_string)
+            .transpose()?
+            .unwrap_or_else(|| execution.result.summary.clone());
+        let raw_output = raw_output.trim().to_string();
+        if raw_output.is_empty() {
+            bail!(
+                "OpenCode {:?} phase returned an empty response",
+                decision.phase
+            );
+        }
+        Ok(OpenCodePhaseOutput {
+            raw_output,
+            execution_identity: execution.execution_identity,
+            artifact_path: execution.result.result_path.to_string_lossy().to_string(),
+        })
+    }
+
+    pub fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
+        let prompt = gear_opencode_intent_fold_prompt(&input)?;
+        let task_id = format!("intent_fold_{}", input.goal_id);
+        let output = self.run(
+            &input.route_decision,
+            &input.goal_id,
+            &format!("pending_{}", input.goal_id),
+            0,
+            &task_id,
+            crate::state::TaskKind::Spec,
+            input.scope,
+            prompt,
+        )?;
+        let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
+        Ok(IntentFoldSubmission {
+            verdict,
+            analyst: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
+    pub fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
+        let prompt = gear_opencode_planner_prompt(&input)?;
+        let task_id = format!("planner_{}", input.goal_id);
+        let output = self.run(
+            &input.route_decision,
+            &input.goal_id,
+            &format!("pending_{}", input.goal_id),
+            0,
+            &task_id,
+            crate::state::TaskKind::Plan,
+            input.scope,
+            prompt,
+        )?;
+        let draft = parse_planner_draft(&output.raw_output)?;
+        Ok(PlannerSubmission {
+            draft,
+            planner: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
+    pub fn critique(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
+        let prompt = gear_opencode_plan_critic_prompt(&input)?;
+        let task_id = format!("plan_critic_{}_{}", input.plan.goal_id, input.plan.revision);
+        let output = self.run(
+            &input.route_decision,
+            &input.plan.goal_id,
+            &input.plan.plan_id,
+            input.plan.revision,
+            &task_id,
+            crate::state::TaskKind::Review,
+            Scope::new(Vec::new(), Vec::new(), 1),
+            prompt,
+        )?;
+        let verdict = PlanCriticVerdict::parse(&output.raw_output)?;
+        Ok(PlanCriticSubmission {
+            reviewer: output.execution_identity,
+            verdict,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
+    pub fn revise(&self, input: PlanRevisionInput) -> Result<PlanRevisionSubmission> {
+        let prompt = gear_opencode_plan_revision_prompt(&input)?;
+        let task_id = format!(
+            "planner_revision_{}_{}",
+            input.plan.goal_id, input.plan.revision
+        );
+        let output = self.run(
+            &input.route_decision,
+            &input.plan.goal_id,
+            &input.plan.plan_id,
+            input.plan.revision,
+            &task_id,
+            crate::state::TaskKind::Plan,
+            Scope::new(Vec::new(), Vec::new(), 1),
+            prompt,
+        )?;
+        let draft = parse_planner_draft(&output.raw_output)?;
+        Ok(PlanRevisionSubmission {
+            draft,
+            planner: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
+    pub fn strategize(&self, input: StrategistNextGoalInput) -> Result<StrategistNextGoalSubmission> {
+        let prompt = gear_opencode_strategist_prompt(&input)?;
+        let task_id = format!("strategist_{}_{}", input.goal_id, input.epoch_id);
+        let output = self.run(
+            &input.route_decision,
+            &input.goal_id,
+            &input.plan.plan_id,
+            input.plan.revision,
+            &task_id,
+            crate::state::TaskKind::Review,
+            Scope::new(Vec::new(), Vec::new(), 1),
+            prompt,
+        )?;
+        let verdict = StrategistNextGoalVerdict::parse(&output.raw_output)?;
+        Ok(StrategistNextGoalSubmission {
+            verdict,
+            strategist: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt builders
+// ---------------------------------------------------------------------------
+
+fn gear_opencode_strategist_prompt(input: &StrategistNextGoalInput) -> Result<String> {
+    Ok(format!(
+        "You are Gearbox StrategistNextGoal. Review the completed execution epoch and return only one strict JSON object.\n\
+Schema: {{\"schema_version\":1,\"goal_id\":string,\"epoch_id\":string,\"reviewed_status\":\"draft|planning|running|verifying|needs_user|blocked|limited|complete|failed\",\"decision\":\"complete|continue|needs_user|stop\",\"next_objective\":string|null,\"acceptance_signals\":[string],\"required_questions\":[string],\"evidence_refs\":[string],\"rationale\":string}}.\n\
+Use continue only for a bounded next objective consistent with the original request. Do not propose an unbounded loop. Use complete only when reviewed_status is complete.\n\
+Goal: {}\nEpoch: {}\nOriginal request: {}\nStatus: {}\nSummary: {}\nFinal report: {}\nPlan:\n{}\nBudget ledger:\n{}",
+        input.goal_id,
+        input.epoch_id,
+        input.request,
+        input.status.as_str(),
+        input.summary,
+        input.final_report_path,
+        serde_json::to_string_pretty(&input.plan)?,
+        serde_json::to_string_pretty(&input.budget_ledger)?,
+    ))
+}
+
+fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
+    let intent_fold = input
+        .intent_fold
+        .as_ref()
+        .map(serde_json::to_string_pretty)
+        .transpose()?
+        .unwrap_or_else(|| "none".to_string());
+    Ok(format!(
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The draft must contain objective, must_have, must_not_have, topology_lock, tasks, and final_acceptance. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed IntentFold receipt as a binding interpretation of the goal: preserve its constraints, mitigate its risks, and turn its acceptance signals into executable checks. Do not write code.\n\nGoal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        input.request,
+        intent_fold,
+        serde_json::to_string_pretty(&input.scope)?,
+        serde_json::to_string_pretty(&input.verification_commands)?,
+    ))
+}
+
+fn gear_opencode_intent_fold_prompt(input: &IntentFoldInput) -> Result<String> {
+    Ok(format!(
+        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready only when required_questions is empty. Ask no question that repository inspection can answer.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
+        input.goal_id,
+        input.request,
+        serde_json::to_string_pretty(&input.scope)?,
+    ))
+}
+
+fn gear_opencode_plan_critic_prompt(input: &PlanCriticInput) -> Result<String> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "deterministic_verifier": input.verifier_report,
+        "phase_route_decision": input.route_decision,
+    }))?;
+    Ok(format!(
+        "You are Gear's independent read-only PlanCritic. Return exactly one PlanCriticVerdict JSON object and no markdown fence. It must bind the exact goal, plan, revision, hash, and planner execution. Return exactly seven checks: references, executability, contradictions, scope, tdd, qa, acceptance. Approve only if all checks and deterministic verification pass. Revise must include blocking findings and concrete revision_instructions. Reject is only for a user decision and must set needs_user_reason.\n\nEvidence:\n{evidence}"
+    ))
+}
+
+fn gear_opencode_plan_revision_prompt(input: &PlanRevisionInput) -> Result<String> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "current_plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "critic_receipt": input.critic_receipt,
+        "phase_route_decision": input.route_decision,
+    }))?;
+    Ok(format!(
+        "You are Gear's read-only planner revising a rejected plan. Apply every blocking required_change and revision_instructions without expanding scope. Return exactly one complete PlanGraphDraft JSON object and no markdown fence or prose.\n\nEvidence:\n{evidence}"
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Env helpers
+// ---------------------------------------------------------------------------
+
+/// Read OpenCode phase model profiles from environment variables.
+///
+/// Checks `GEARBOX_GEAR_OPENCODE_PHASES` for explicit enablement, then
+/// `GEARBOX_GEAR_OPENCODE_PLANNER_MODEL`, `GEARBOX_GEAR_OPENCODE_EXECUTOR_MODEL`,
+/// `GEARBOX_GEAR_OPENCODE_REVIEWER_MODEL`, with fallback to
+/// `GEARBOX_GEAR_WORKER_MODEL`.
+pub fn open_code_model_profiles_from_env() -> Result<Option<OpenCodeModelProfiles>> {
+    let explicitly_enabled = trimmed_env_value("GEARBOX_GEAR_OPENCODE_PHASES")
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    open_code_model_profiles_from_values(
+        explicitly_enabled,
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_PLANNER_MODEL"),
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_EXECUTOR_MODEL"),
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_REVIEWER_MODEL"),
+        trimmed_env_value("GEARBOX_GEAR_WORKER_MODEL"),
+    )
+}
+
+pub fn open_code_model_profiles_from_values(
+    explicitly_enabled: bool,
+    planner: Option<String>,
+    executor: Option<String>,
+    reviewer: Option<String>,
+    default_worker_model: Option<String>,
+) -> Result<Option<OpenCodeModelProfiles>> {
+    let has_phase_model = planner.is_some() || executor.is_some() || reviewer.is_some();
+    if !explicitly_enabled && !has_phase_model {
+        return Ok(None);
+    }
+    let planner = planner.or(default_worker_model).context(
+        "OpenCode phase mode requires GEARBOX_GEAR_OPENCODE_PLANNER_MODEL or GEARBOX_GEAR_WORKER_MODEL",
+    )?;
+    let profiles = OpenCodeModelProfiles {
+        executor: executor.unwrap_or_else(|| planner.clone()),
+        reviewer: reviewer.unwrap_or_else(|| planner.clone()),
+        planner,
+    };
+    profiles.validate()?;
+    Ok(Some(profiles))
+}
+
+fn trimmed_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::phase_routing::OpenCodeModelProfiles;
+    use crate::plan_graph::PlanGraphDraft;
+    use crate::state::Scope;
+    use crate::workers::WorkerRegistry;
+
+    fn test_worker_config() -> WorkerConfig {
+        WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("sh -c 'echo test'".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        }
+    }
+
+    #[test]
+    fn factory_returns_phase_runtime_with_broker_factory() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let factory = OpenCodePhaseRuntimeFactory::new(
+            temp_dir.path().to_path_buf(),
+            test_worker_config(),
+            broker_factory.clone(),
+            CancellationToken::new(),
+            routes,
+            LiveModelInventory::default(),
+        );
+        let runtime = factory.build()?;
+        assert!(runtime.broker_factory.is_some());
+        assert!(runtime.intent_fold_hook.is_some());
+        assert!(runtime.planner_hook.is_some());
+        assert!(runtime.plan_critic_hook.is_some());
+        assert!(runtime.plan_revision_hook.is_some());
+        assert!(runtime.strategist_next_goal_hook.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn runner_produces_independent_execution_identities_per_phase() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let output_path = temp_dir.path().join("output.json");
+        std::fs::write(
+            &output_path,
+            serde_json::to_string(&PlanGraphDraft {
+                objective: "test".to_string(),
+                must_have: Vec::new(),
+                must_not_have: Vec::new(),
+                topology_lock: Vec::new(),
+                tasks: Vec::new(),
+                final_acceptance: Vec::new(),
+            })?,
+        )?;
+        let command = format!(
+            "sh -c 'cp {} \"$GEARBOX_WORKER_LAST_MESSAGE\"'",
+            output_path.to_string_lossy()
+        );
+        let mut config = test_worker_config();
+        config.worker_command = Some(command);
+
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory: broker_factory.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config.clone(),
+            cancellation_token: CancellationToken::new(),
+        };
+
+        let planner_decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let first = runner.plan(PlannerInput {
+            goal_id: "goal_a".to_string(),
+            request: "Build a plan".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            verification_commands: vec!["echo verify".to_string()],
+            route_decision: planner_decision.clone(),
+            intent_fold: None,
+        })?;
+        let second = runner.plan(PlannerInput {
+            goal_id: "goal_b".to_string(),
+            request: "Build another plan".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            verification_commands: vec!["echo verify".to_string()],
+            route_decision: planner_decision,
+            intent_fold: None,
+        })?;
+
+        // Two invocations must have independent execution identities.
+        assert_ne!(
+            first.planner.execution_id,
+            second.planner.execution_id,
+            "consecutive planner calls must not share execution_id"
+        );
+        assert_ne!(
+            first.planner.phase_session_id,
+            second.planner.phase_session_id,
+            "consecutive planner calls must not share phase_session_id"
+        );
+        assert_ne!(
+            first.planner.actual_session_id,
+            second.planner.actual_session_id,
+            "consecutive planner calls must not share actual_session_id"
+        );
+
+        // Model binding must be recorded.
+        assert_eq!(first.planner.provider_id.as_deref(), Some("openai"));
+        assert_eq!(first.planner.model_id.as_deref(), Some("gpt-planner"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn env_helper_falls_back_to_planner_when_executor_reviewer_unset() -> Result<()> {
+        let profiles = open_code_model_profiles_from_values(
+            true,
+            Some("openai/gpt-4".to_string()),
+            None,
+            None,
+            None,
+        )?
+        .context("profiles should be Some")?;
+        assert_eq!(profiles.planner, "openai/gpt-4");
+        assert_eq!(profiles.executor, "openai/gpt-4");
+        assert_eq!(profiles.reviewer, "openai/gpt-4");
+        Ok(())
+    }
+
+    #[test]
+    fn env_helper_returns_none_when_not_enabled_and_no_models() -> Result<()> {
+        let profiles = open_code_model_profiles_from_values(false, None, None, None, None)?;
+        assert!(profiles.is_none());
+        Ok(())
+    }
+}

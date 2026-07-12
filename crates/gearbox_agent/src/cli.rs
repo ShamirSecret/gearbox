@@ -1,14 +1,22 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
+use crate::open_code_phase_runtime::{
+    OpenCodePhaseRuntimeFactory, open_code_model_profiles_from_env,
+    open_code_model_profiles_from_values,
+};
+use crate::phase_routing::PhaseRouteTable;
 use crate::runtime::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
     Orchestrator, PhaseRuntime, RunOptions,
 };
 use crate::state::ObjectivePolicy;
-use crate::workers::{WorkerConfig, WorkerKind, WorkerRoute};
+use crate::tools::CancellationToken;
+use crate::worker_broker::PhaseBrokerFactory;
+use crate::workers::{WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
 
 #[derive(Debug, Parser)]
 #[command(name = "gear")]
@@ -134,6 +142,18 @@ struct RunCommand {
 
     #[arg(long, default_value_t = DEFAULT_MAX_RUNTIME_MINUTES)]
     max_runtime_minutes: usize,
+
+    #[arg(long)]
+    opencode_phases: bool,
+
+    #[arg(long)]
+    opencode_planner_model: Option<String>,
+
+    #[arg(long)]
+    opencode_executor_model: Option<String>,
+
+    #[arg(long)]
+    opencode_reviewer_model: Option<String>,
 }
 
 pub fn run() -> Result<()> {
@@ -142,6 +162,37 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Run(command) => {
             let worker = worker_config_from_command(&command)?;
+            let workspace = command.workspace.clone();
+            let phase_runtime = if command.objective && command.opencode_phases {
+                let profiles = open_code_model_profiles_from_values(
+                    true,
+                    command.opencode_planner_model.clone(),
+                    command.opencode_executor_model.clone(),
+                    command.opencode_reviewer_model.clone(),
+                    None,
+                )?
+                .or_else(|| open_code_model_profiles_from_env().ok().flatten())
+                .context(
+                    "--opencode-phases requires --opencode-planner-model or GEARBOX_GEAR_OPENCODE_PLANNER_MODEL",
+                )?;
+                let routes = PhaseRouteTable::opencode_only(profiles)?;
+                let broker_registry = Arc::new(WorkerRegistry::default());
+                let broker_factory = Arc::new(PhaseBrokerFactory::new(
+                    broker_registry,
+                    workspace.join(".gearbox-agent"),
+                ));
+                OpenCodePhaseRuntimeFactory::new(
+                    workspace,
+                    worker.clone(),
+                    broker_factory,
+                    CancellationToken::new(),
+                    routes,
+                    crate::phase_routing::LiveModelInventory::default(),
+                )
+                .build()?
+            } else {
+                PhaseRuntime::legacy()
+            };
             let options = RunOptions {
                 request: command.prompt,
                 workspace: command.workspace,
@@ -169,7 +220,7 @@ pub fn run() -> Result<()> {
             let outcome = if command.objective {
                 Orchestrator::run_objective_with_phase_runtime(
                     options,
-                    PhaseRuntime::legacy(),
+                    phase_runtime,
                     ObjectivePolicy {
                         auto_continue: command.auto_continue,
                         max_epochs: command.max_epochs,
@@ -354,6 +405,10 @@ mod tests {
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
             install_dependencies: false,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            opencode_phases: false,
+            opencode_planner_model: None,
+            opencode_executor_model: None,
+            opencode_reviewer_model: None,
         }
     }
 
