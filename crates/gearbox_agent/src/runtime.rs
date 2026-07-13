@@ -1,7 +1,7 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     env, fs as std_fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,15 +28,18 @@ use crate::plan_review::{
 };
 use crate::product;
 use crate::state::{
-    Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, FinalVerificationDimension,
-    FinalVerificationResult, FinalVerificationWaveReceipt, Goal, GoalEpochEventKind, GoalGraphNode,
-    GoalRunLeaseGuard, GoalStatus, ObjectiveEpochOutcomeReceipt, ObjectiveEventKind,
-    ObjectiveGraph, ObjectivePolicy, ObjectiveStatus, PlanNodeRunLedger, PlanNodeRunStatus, Scope,
-    Session, SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
-    WorkLineage, event, id_timestamp, timestamp,
+    Budget, ContinuationStatus, CoordinatorModel, CriterionEvidenceStatus, Event, EventKind,
+    FinalVerificationDimension, FinalVerificationResult, FinalVerificationWaveReceipt, Goal,
+    GoalEpochEventKind, GoalGraphNode, GoalRunLeaseGuard, GoalStatus, ModelCallKind,
+    ObjectiveEpochOutcomeReceipt, ObjectiveEventKind, ObjectiveGraph, ObjectivePolicy,
+    ObjectiveStatus, PlanNodeRunLedger, PlanNodeRunStatus, PlanWaveNodeStatus, PlanWaveRunLedger,
+    PromptSettleAction, PromptSettleEvent, RepositoryObservationStatus, ReviewEpochBundle,
+    ReviewEpochRoleEvidence, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs,
+    TaskKind, TaskOutputs, TaskRouteDecisionReceipt, TaskStatus, WorkLineage, event, id_timestamp,
+    timestamp,
 };
 use crate::task_manager::{
-    CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
+    CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState, SendOutcome,
     SharedTaskManager, TaskAttempt, TaskAttemptStatus, TaskFailureKind, TaskManager,
     TaskManagerControl, TaskManagerTickLoop, TaskRecord,
 };
@@ -45,13 +48,14 @@ use crate::tools::{
     run_shell_command_with_env_and_cancellation,
 };
 use crate::worker_broker::{
-    BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest, LifecycleState, LifecycleStateName,
-    PhaseBrokerFactory, WorkerBroker,
+    BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest, BrokerUsage, LifecycleState,
+    LifecycleStateName, ModelAvailability, PhaseBrokerFactory, WorkerBroker,
+    broker_capabilities_for_kind,
 };
 use crate::workers::{
-    CategoryResolution, CategoryResolutionResult, FallbackRoute, WorkerCategory, WorkerConfig,
-    WorkerKind, WorkerOutcome, WorkerResult, WorkerStartRequest, WorkerStatus,
-    category_resolution_for_route,
+    CategoryResolution, CategoryResolutionResult, FallbackRoute, SelectedWorkerRoute,
+    WorkerCategory, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult, WorkerStartRequest,
+    WorkerStatus, category_resolution_for_route,
 };
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
@@ -66,6 +70,41 @@ pub type PlanCriticHook =
     Arc<dyn Fn(PlanCriticInput) -> Result<PlanCriticSubmission> + Send + Sync + 'static>;
 pub type PlanRevisionHook =
     Arc<dyn Fn(PlanRevisionInput) -> Result<PlanRevisionSubmission> + Send + Sync + 'static>;
+pub type DirectModelUsageProvider = Arc<
+    dyn Fn(&BrokerPhaseRequest) -> Result<Option<DirectModelUsageReport>> + Send + Sync + 'static,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectModelCostUnit {
+    Micros,
+    Millis,
+    Major,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectModelUsageReport {
+    pub usage: BrokerUsage,
+    pub actual_model: Option<ModelSelectorId>,
+    pub cost_unit: DirectModelCostUnit,
+}
+
+impl DirectModelUsageReport {
+    fn normalized_usage(mut self) -> Result<Self> {
+        if let Some(cost) = self.usage.cost_micros {
+            let multiplier = match self.cost_unit {
+                DirectModelCostUnit::Micros => 1,
+                DirectModelCostUnit::Millis => 1_000,
+                DirectModelCostUnit::Major => 1_000_000,
+            };
+            self.usage.cost_micros = Some(
+                cost.checked_mul(multiplier)
+                    .context("direct-model provider cost overflow during normalization")?,
+            );
+        }
+        self.cost_unit = DirectModelCostUnit::Micros;
+        Ok(self)
+    }
+}
 pub type StrategistNextGoalHook = Arc<
     dyn Fn(StrategistNextGoalInput) -> Result<StrategistNextGoalSubmission> + Send + Sync + 'static,
 >;
@@ -140,6 +179,7 @@ pub struct IntentFoldSubmission {
     pub analyst: PhaseExecutionIdentity,
     pub raw_output: String,
     pub artifact_path: Option<String>,
+    pub repository_evidence_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +198,7 @@ pub struct PlannerSubmission {
     pub planner: PhaseExecutionIdentity,
     pub raw_output: String,
     pub artifact_path: Option<String>,
+    pub repository_evidence_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +216,7 @@ pub struct PlanCriticSubmission {
     pub verdict: PlanCriticVerdict,
     pub raw_output: String,
     pub artifact_path: Option<String>,
+    pub repository_evidence_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +429,9 @@ pub struct PhaseRuntime {
     /// state transitions (e.g. `Resolved → Resolved`) when multiple
     /// phases run sequentially against the same broker.
     pub broker_factory: Option<Arc<PhaseBrokerFactory>>,
+    /// Optional provider callback for native/direct model usage telemetry.
+    /// ACP workers continue to report through their session handle.
+    pub direct_model_usage_provider: Option<DirectModelUsageProvider>,
 }
 
 impl PhaseRuntime {
@@ -406,6 +451,7 @@ impl PhaseRuntime {
             max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
             broker: None,
             broker_factory: None,
+            direct_model_usage_provider: None,
         }
     }
 }
@@ -436,6 +482,7 @@ fn write_direct_execution_receipt(
     broker: &WorkerBroker,
     phase_request: &BrokerPhaseRequest,
     outcome: BrokerOutcome,
+    store: &StateStore,
 ) -> Result<()> {
     let state = broker.current_state()?;
     let session_identity = if let Some(identity) = state.session_identity.as_ref() {
@@ -445,7 +492,37 @@ fn write_direct_execution_receipt(
             backend_kind: crate::workers::WorkerKind::Custom,
             session_id: format!("direct-model-{}", crate::state::timestamp()),
             started_at: crate::state::timestamp(),
-            capabilities: None,
+            capabilities: Some(broker_capabilities_for_kind(
+                crate::workers::WorkerKind::Custom,
+                false,
+            )),
+        }
+    };
+    let direct_usage = broker.direct_model_usage(&phase_request.phase_decision_hash)?;
+    let (usage, actual_model) = if let Some(receipt) = direct_usage {
+        (Some(receipt.usage), receipt.actual_model)
+    } else {
+        match &phase_request.requested_model {
+            ModelAvailability::Available(model)
+                if session_identity.supports(&crate::worker_broker::BrokerCapability::Usage) =>
+            {
+                (
+                    Some(BrokerUsage {
+                        requested_tokens: None,
+                        actual_tokens: None,
+                        model: format!("{}/{}", model.provider_id, model.model_id),
+                        duration_ms: None,
+                        cost_micros: None,
+                        cache_hit: None,
+                        unavailable_reason: Some(
+                            "direct-model backend completed without provider usage telemetry"
+                                .to_string(),
+                        ),
+                    }),
+                    Some(model.clone()),
+                )
+            }
+            _ => (None, None),
         }
     };
     let receipt = BrokerLifecycleReceipt {
@@ -456,9 +533,9 @@ fn write_direct_execution_receipt(
         request: phase_request.clone(),
         outcome,
         terminal_reason: None,
-        usage: None,
+        usage,
         permission_evidence: None,
-        actual_model: None,
+        actual_model,
         binding_status: None,
         receipt_hash: String::new(),
     }
@@ -479,11 +556,75 @@ fn write_direct_execution_receipt(
             receipt_path.display()
         )
     })?;
+    let ledger_model =
+        receipt
+            .actual_model
+            .as_ref()
+            .or_else(|| match &phase_request.requested_model {
+                ModelAvailability::Available(model) => Some(model),
+                ModelAvailability::Unavailable(_) => None,
+            });
+    let (provider_id, model_id) = ledger_model.map_or((None, None), |model| {
+        (
+            Some(model.provider_id.clone()),
+            Some(model.model_id.clone()),
+        )
+    });
+    let usage = receipt.usage.as_ref();
+    let status = serde_json::to_value(&receipt.outcome)?
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let ledger_entry = crate::state::ModelCallLedgerEntry {
+        schema_version: crate::state::MODEL_CALL_LEDGER_SCHEMA_VERSION,
+        call_id: format!(
+            "direct:{}:{}:{}:{}",
+            phase_request.goal_id,
+            phase_request.task_id,
+            phase_request.phase_decision_hash,
+            receipt.interaction_ordinal,
+        ),
+        parent_call_id: None,
+        goal_id: phase_request.goal_id.clone(),
+        plan_id: if phase_request.plan_id.trim().is_empty() {
+            "direct".to_string()
+        } else {
+            phase_request.plan_id.clone()
+        },
+        plan_revision: phase_request.plan_revision,
+        phase: format!("direct:{}", phase_request.requested_agent),
+        task_id: phase_request.task_id.clone(),
+        kind: ModelCallKind::Primary,
+        worker_kind: phase_request.requested_agent.clone(),
+        provider_id,
+        model_id,
+        session_id: receipt.session_identity.session_id.clone(),
+        status,
+        artifact_path: Some(receipt_path.to_string_lossy().to_string()),
+        transcript_path: None,
+        transcript_sha256: None,
+        observed_tool_count: 0,
+        observed_paths: Vec::new(),
+        observation_events: Vec::new(),
+        requested_tokens: usage.and_then(|usage| usage.requested_tokens),
+        actual_tokens: usage.and_then(|usage| usage.actual_tokens),
+        cost_micros: usage.and_then(|usage| usage.cost_micros),
+        duration_ms: usage.and_then(|usage| usage.duration_ms),
+        cache_hit: usage.and_then(|usage| usage.cache_hit),
+        unavailable_reason: usage.and_then(|usage| usage.unavailable_reason.clone()),
+        started_at: receipt.session_identity.started_at.clone(),
+        finished_at: timestamp(),
+    };
+    store
+        .append_model_call_ledger_entry(&ledger_entry)
+        .context("failed to append direct-model usage to ModelCallLedger")?;
     Ok(())
 }
 
 fn run_phase_via_broker_inner<T>(
     broker: Option<&WorkerBroker>,
+    store: &StateStore,
+    direct_model_usage_provider: Option<&DirectModelUsageProvider>,
     phase_decision: &PhaseRouteDecision,
     goal_id: &str,
     plan_id: &str,
@@ -509,10 +650,23 @@ fn run_phase_via_broker_inner<T>(
                         .wait_for_outcome()
                         .context("broker wait_for_outcome failed after phase actor")?;
                 } else if state.lifecycle.name() == LifecycleStateName::Resolved {
+                    if let Some(provider) = direct_model_usage_provider {
+                        if let Some(report) = provider(&phase_request_clone)?
+                            .map(DirectModelUsageReport::normalized_usage)
+                            .transpose()?
+                        {
+                            broker.record_direct_model_usage(
+                                &phase_request_clone.phase_decision_hash,
+                                report.usage,
+                                report.actual_model,
+                            )?;
+                        }
+                    }
                     write_direct_execution_receipt(
                         broker,
                         &phase_request_clone,
                         BrokerOutcome::Completed,
+                        store,
                     )
                     .context("failed to write direct execution receipt")?;
                 }
@@ -536,6 +690,8 @@ fn run_phase_via_broker_inner<T>(
 /// Falls back to the shared `broker` when no factory is available.
 fn run_phase_via_broker<T>(
     broker: Option<&WorkerBroker>,
+    store: &StateStore,
+    direct_model_usage_provider: Option<&DirectModelUsageProvider>,
     broker_factory: Option<&PhaseBrokerFactory>,
     phase_decision: &PhaseRouteDecision,
     goal_id: &str,
@@ -559,6 +715,8 @@ fn run_phase_via_broker<T>(
         )?;
         let result = run_phase_via_broker_inner(
             Some(phase_broker.as_ref()),
+            store,
+            direct_model_usage_provider,
             phase_decision,
             goal_id,
             plan_id,
@@ -576,6 +734,8 @@ fn run_phase_via_broker<T>(
 
     run_phase_via_broker_inner(
         broker,
+        store,
+        direct_model_usage_provider,
         phase_decision,
         goal_id,
         plan_id,
@@ -719,6 +879,306 @@ struct ObjectiveEpochContext {
     objective_id: String,
     scope_hash: String,
     policy_hash: String,
+}
+
+/// A worker that was submitted as part of the current PlanGraph wave and is
+/// waiting for the runtime to reduce its result in deterministic task order.
+/// The worker itself may already be terminal; retaining the managed run here
+/// prevents a later loop turn from dispatching the same node a second time.
+#[derive(Clone)]
+struct PrestartedPlanWorker {
+    plan_task_id: String,
+    worker_task_id: String,
+    managed_worker_task_id: String,
+    worker_task: Task,
+    worker_phase: PhaseProfile,
+    route_hint: Option<String>,
+    phase_decision: PhaseRouteDecision,
+    effective_worker: WorkerConfig,
+    session_binding_attempt: usize,
+    phase_route_ordinal: usize,
+    phase_decision_path: PathBuf,
+    route_receipt: TaskRouteDecisionReceipt,
+    route_receipt_path: PathBuf,
+    budget_reservation_id: String,
+    completed_run: Option<crate::task_manager::ManagedWorkerRun>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_parallel_plan_siblings(
+    scheduled_plan_wave: &mut VecDeque<String>,
+    prestarted_plan_workers: &mut HashMap<String, PrestartedPlanWorker>,
+    prestarted_plan_wave: &mut VecDeque<String>,
+    tasks: &mut Vec<Task>,
+    plan_node_runs: &mut PlanNodeRunLedger,
+    plan_graph: &PlanGraph,
+    goal_id: &str,
+    epoch_id: &str,
+    task_namespace: Option<&str>,
+    workspace: &std::path::Path,
+    store: &StateStore,
+    phase_runtime: &PhaseRuntime,
+    options: &RunOptions,
+    goal: &Goal,
+    detection: &LanguageDetection,
+    task_manager: &SharedTaskManager,
+    lineage: &mut WorkLineage,
+    current_plan_wave: &mut Option<PlanWaveRunLedger>,
+    budget_controller: &BudgetController,
+    worker_call_count: usize,
+    premium_worker_call_count: usize,
+    attempt_count: usize,
+    run_started_at: Instant,
+    goal_run_lease: &GoalRunLeaseGuard,
+    iteration: usize,
+    session_id: &str,
+) -> Result<()> {
+    let capacity = options.worker.max_parallel_workers.saturating_sub(1);
+    if capacity == 0 || scheduled_plan_wave.is_empty() {
+        return Ok(());
+    }
+    let sibling_count = capacity.min(scheduled_plan_wave.len());
+    for sibling_index in 0..sibling_count {
+        let plan_task_id = scheduled_plan_wave
+            .pop_front()
+            .context("parallel wave sibling queue ended unexpectedly")?;
+        let plan_task = plan_graph
+            .task(&plan_task_id)
+            .context("parallel wave sibling disappeared from PlanGraph")?;
+        if !plan_task.dependencies.is_empty() {
+            bail!("parallel wave sibling `{plan_task_id}` unexpectedly has dependencies");
+        }
+        let worker_route_hint = plan_task.recommended_route_hint();
+        let worker_phase =
+            worker_phase_for_route_hint(&plan_task.preferred_phase_profile, worker_route_hint);
+        let phase_decision = phase_runtime.routes.resolve_for_worker(
+            &worker_phase,
+            &phase_runtime.inventory,
+            phase_runtime.current_model.as_ref(),
+            &options.worker,
+        )?;
+        if !matches!(phase_decision.candidate.backend, PhaseBackend::Worker(_)) {
+            bail!("parallel wave sibling `{plan_task_id}` resolved to a non-worker backend");
+        }
+        let effective_worker = phase_decision.overlay_worker_config(&options.worker)?;
+        let selected_route =
+            effective_worker.selected_route_for_hint(1, Some(phase_decision.category.as_str()));
+        let route_change_type = if !phase_decision.rejected_candidates.is_empty()
+            || selected_route.route_reason.contains("fell back to")
+        {
+            RouteChangeType::Fallback
+        } else {
+            RouteChangeType::RouteChange
+        };
+        budget_controller
+            .apply_budget_for_route_change(
+                &BudgetSnapshot {
+                    worker_call_count: worker_call_count.saturating_add(sibling_index),
+                    premium_worker_call_count: premium_worker_call_count
+                        .saturating_add(usize::from(selected_route.worker_kind.is_premium())),
+                    attempt_count: attempt_count.saturating_add(sibling_index),
+                    runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
+                    context_risk_signals: Vec::new(),
+                },
+                route_change_type,
+                selected_route.worker_kind.is_premium(),
+            )
+            .map_err(|reason| anyhow::anyhow!("parallel sibling dispatch blocked: {reason}"))?;
+
+        let budget_reservation_id = format!(
+            "{epoch_id}.worker.wave-{iteration}.{}",
+            plan_task_id.replace(':', "_")
+        );
+        store.reserve_budget_call(
+            goal_run_lease,
+            &budget_reservation_id,
+            "worker",
+            true,
+            selected_route.worker_kind.is_premium(),
+            &goal.budget,
+        )?;
+        store.append_goal_epoch_event(
+            goal_id,
+            epoch_id,
+            &format!("{budget_reservation_id}.reserved"),
+            GoalEpochEventKind::BudgetReserved,
+            json!({
+                "reservation_id": budget_reservation_id,
+                "phase": "worker",
+                "wave": true,
+                "task_id": plan_task_id,
+                "premium": selected_route.worker_kind.is_premium(),
+                "reserved_tokens": goal.budget.max_tokens_per_call,
+            }),
+        )?;
+
+        let ordinal = 100 + iteration.saturating_mul(1000) + sibling_index + 1;
+        let phase_decision_path =
+            store.write_phase_route_decision(goal_id, ordinal, &phase_decision)?;
+        let route_attempt = plan_node_runs
+            .nodes
+            .iter()
+            .find(|node| node.task_id == plan_task_id)
+            .map(|node| node.attempt.saturating_add(1))
+            .unwrap_or(1);
+        let route_receipt = TaskRouteDecisionReceipt::seal(
+            goal_id,
+            epoch_id,
+            plan_graph,
+            plan_task,
+            route_attempt,
+            worker_phase.clone(),
+            worker_route_hint.map(ToString::to_string),
+            selected_route.worker_kind.as_str().to_string(),
+            selected_route.worker_model.map(ToString::to_string),
+            selected_route.category.as_str().to_string(),
+            selected_route.route_reason.clone(),
+            phase_decision.selected_candidate,
+            phase_decision.rejected_candidates.len(),
+            phase_decision_path.to_string_lossy().to_string(),
+            Some(budget_reservation_id.clone()),
+        )?;
+        let route_receipt_path = store.write_task_route_decision_receipt(&route_receipt)?;
+
+        let worker_task_id = scoped_task_id(task_namespace, &plan_task_id);
+        let mut worker_task = tasks
+            .iter()
+            .find(|task| task.id == worker_task_id)
+            .context("parallel wave sibling runtime task is missing")?
+            .clone();
+        worker_task.inputs.phase_route_locked = !matches!(
+            phase_decision.candidate.backend,
+            PhaseBackend::LegacyCategory
+        );
+        if let Some(runtime_task) = tasks.iter_mut().find(|task| task.id == worker_task_id) {
+            runtime_task.inputs.phase_route_locked = worker_task.inputs.phase_route_locked;
+        }
+        if let Some(plan_task) = worker_task.inputs.plan_task.as_mut() {
+            plan_task.task_id = worker_task_id.clone();
+        }
+        if matches!(
+            plan_task.test.strategy,
+            crate::plan_graph::TestStrategy::Tdd
+        ) {
+            let red_path = run_plan_red_evidence(
+                workspace,
+                store,
+                goal_id,
+                &plan_task_id,
+                plan_graph.revision,
+                plan_task,
+                options.cancellation_token.as_ref(),
+            )?;
+            let node = plan_node_runs.node_mut(&plan_task_id)?;
+            node.red_evidence_path = Some(red_path.to_string_lossy().to_string());
+            node.status = PlanNodeRunStatus::RedVerified;
+            node.updated_at = timestamp();
+            plan_node_runs.updated_at = timestamp();
+        }
+        start_task(tasks, &worker_task_id);
+        if let Some(runtime_task) = tasks.iter_mut().find(|task| task.id == worker_task_id) {
+            runtime_task.inputs.phase_route_locked = worker_task.inputs.phase_route_locked;
+        }
+        store.write_tasks(goal_id, tasks)?;
+
+        {
+            let node = plan_node_runs.node_mut(&plan_task_id)?;
+            if node.status == PlanNodeRunStatus::Pending {
+                node.status = PlanNodeRunStatus::Runnable;
+            }
+            node.attempt = route_attempt;
+            node.worker_task_id = Some(worker_task_id.clone());
+            node.implementation_task_id = Some(worker_task_id.clone());
+            node.status = PlanNodeRunStatus::Running;
+            node.updated_at = timestamp();
+            plan_node_runs.updated_at = timestamp();
+        }
+        store.write_plan_node_runs(plan_node_runs)?;
+
+        let managed_worker_task_id = match task_manager.lock() {
+            Ok(mut manager) => {
+                manager.set_worker_broker(None);
+                manager.start(WorkerStartRequest {
+                    store,
+                    workspace,
+                    task: &worker_task,
+                    route_attempt,
+                    goal: &goal.request,
+                    verification_commands: &detection.verification_commands,
+                    config: &effective_worker,
+                    cancellation_token: options.cancellation_token.clone(),
+                    coordinator_model: goal.coordinator_model.as_ref(),
+                    coordinator_brief: goal.coordinator_brief.as_deref(),
+                    route_hint: Some(phase_decision.category.as_str()),
+                })?
+            }
+            Err(_) => bail!("task manager mutex poisoned during parallel dispatch"),
+        };
+        persist_live_plan_node_session_binding(
+            store,
+            goal_id,
+            epoch_id,
+            plan_graph,
+            &plan_task_id,
+            route_attempt,
+            &managed_worker_task_id,
+            &selected_route,
+            &route_receipt.receipt_hash,
+        )?;
+        if let Some(wave_ledger) = current_plan_wave.as_mut() {
+            wave_ledger.mark_dispatched(
+                &plan_task_id,
+                route_attempt,
+                managed_worker_task_id.clone(),
+            )?;
+            wave_ledger.mark_started(&plan_task_id)?;
+            store.write_plan_wave_run(wave_ledger)?;
+        }
+        if !lineage.active_task_ids.contains(&worker_task_id) {
+            lineage.active_task_ids.push(worker_task_id.clone());
+        }
+        append_event(
+            store,
+            &options.event_sink,
+            event(
+                session_id,
+                Some(goal_id),
+                Some(&worker_task_id),
+                EventKind::PhaseRouteSelected,
+                format!("Parallel wave route selected for {worker_task_id}"),
+                json!({
+                    "phase": worker_phase,
+                    "wave": true,
+                    "decision_path": phase_decision_path.to_string_lossy(),
+                    "task_route_receipt_path": route_receipt_path.to_string_lossy(),
+                    "selected_candidate": phase_decision.selected_candidate,
+                    "fallback_count": phase_decision.rejected_candidates.len(),
+                }),
+            ),
+        )?;
+        prestarted_plan_wave.push_back(plan_task_id.clone());
+        prestarted_plan_workers.insert(
+            plan_task_id.clone(),
+            PrestartedPlanWorker {
+                plan_task_id,
+                worker_task_id,
+                managed_worker_task_id,
+                worker_task,
+                worker_phase,
+                route_hint: worker_route_hint.map(ToString::to_string),
+                phase_decision,
+                effective_worker,
+                session_binding_attempt: route_attempt,
+                phase_route_ordinal: ordinal,
+                phase_decision_path,
+                route_receipt,
+                route_receipt_path,
+                budget_reservation_id,
+                completed_run: None,
+            },
+        );
+    }
+    Ok(())
 }
 
 impl ObjectiveRunOutcome {
@@ -959,9 +1419,49 @@ impl Orchestrator {
         let goal_id = fixed_goal_id.unwrap_or_else(|| format!("goal_{id_suffix}"));
 
         if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
+            store.record_prompt_settle_decision(
+                &goal_id,
+                "continuation",
+                &session_id,
+                0,
+                "runtime.continuation.start",
+                PromptSettleEvent::UserStopped,
+            )?;
             bail!(
                 "Gear continuation is stopped; explicitly restart the continuation before running again"
             );
+        }
+        if options.continuation {
+            let resume_decision = store.prepare_continuation_resume(&session_id, &goal_id)?;
+            if !resume_decision.should_resume {
+                let reason = resume_decision
+                    .state
+                    .stuck_reason
+                    .unwrap_or_else(|| "continuation resume budget exhausted".to_string());
+                store.record_prompt_settle_decision(
+                    &goal_id,
+                    "continuation",
+                    &session_id,
+                    0,
+                    "runtime.continuation.resume",
+                    PromptSettleEvent::Error,
+                )?;
+                bail!("Gear continuation is stuck: {reason}");
+            }
+            let settle = store.record_prompt_settle_decision(
+                &goal_id,
+                "continuation",
+                &session_id,
+                0,
+                "runtime.continuation.resume",
+                PromptSettleEvent::Idle,
+            )?;
+            if settle.decision.action != PromptSettleAction::Dispatch {
+                bail!(
+                    "continuation dispatch blocked by settle decision: {}",
+                    settle.decision.reason
+                );
+            }
         }
 
         let scope = Scope::new(
@@ -1046,6 +1546,25 @@ impl Orchestrator {
         )?;
 
         let epoch_id = fixed_epoch_id.unwrap_or_else(|| format!("epoch_{}", id_timestamp()));
+        if options.continuation {
+            let guard =
+                store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
+                    // An in-flight marker belongs to the previous process;
+                    // a restarted runtime must not treat it as a live turn.
+                    guard.in_flight = false;
+                })?;
+            if let Some(reason) = guard.blocking_reason() {
+                store.record_prompt_settle_decision(
+                    &goal_id,
+                    "continuation",
+                    &session_id,
+                    0,
+                    "runtime.continuation.guard",
+                    prompt_settle_event_for_guard_reason(reason),
+                )?;
+                bail!("Gear continuation guard blocked dispatch: {reason}");
+            }
+        }
         let lease_seconds =
             u64::try_from(goal.budget.max_runtime_minutes.max(1).saturating_mul(60))
                 .unwrap_or(u64::MAX);
@@ -1160,7 +1679,19 @@ impl Orchestrator {
         }));
         store.write_tasks(&goal_id, &tasks)?;
 
-        let mut plan_node_runs = PlanNodeRunLedger::from_plan(&goal_id, &epoch_id, &plan_graph)?;
+        let mut plan_node_runs = if let Some(existing) = store.read_plan_node_runs(&goal_id)? {
+            existing.validate()?;
+            if existing.epoch_id != epoch_id
+                || existing.plan_id != plan_graph.plan_id
+                || existing.plan_revision != plan_graph.revision
+                || existing.plan_hash != plan_graph.plan_hash
+            {
+                bail!("persisted PlanNodeRunLedger does not match the active PlanGraph");
+            }
+            existing
+        } else {
+            PlanNodeRunLedger::from_plan(&goal_id, &epoch_id, &plan_graph)?
+        };
         store.write_plan_node_runs(&plan_node_runs)?;
 
         let spec_path =
@@ -1246,6 +1777,7 @@ impl Orchestrator {
         let mut verification_history: Vec<Vec<ShellCommandResult>> = Vec::new();
         let mut repair_request_history: Vec<String> = Vec::new();
         let mut worker_output_history: Vec<String> = Vec::new();
+        let mut context_pressure_seen = false;
         let run_started_at = Instant::now();
         let mut worker_call_count = 0usize;
         let mut premium_worker_call_count = 0usize;
@@ -1277,6 +1809,11 @@ impl Orchestrator {
             task_manager.set_artifacts_root(artifacts_root.clone());
             task_manager.recover_orphaned_records(&store)?;
             task_manager.apply_worker_config(&options.worker);
+            task_manager.set_goal_epoch_context(
+                session_id.clone(),
+                goal_id.clone(),
+                epoch_id.clone(),
+            )?;
         }
         let task_manager_tick_loop =
             TaskManagerTickLoop::start(task_manager.clone(), Duration::from_millis(50));
@@ -1302,11 +1839,22 @@ impl Orchestrator {
         let mut completed_plan_tasks = plan_node_runs.completed_task_ids();
         let mut current_plan_task_id: Option<String> = None;
         let mut scheduled_plan_wave: VecDeque<String> = VecDeque::new();
+        let mut current_plan_wave: Option<PlanWaveRunLedger> = None;
+        let mut prestarted_plan_workers: HashMap<String, PrestartedPlanWorker> = HashMap::new();
+        let mut prestarted_plan_wave: VecDeque<String> = VecDeque::new();
 
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
             if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
+                store.record_prompt_settle_decision(
+                    &goal_id,
+                    current_plan_task_id.as_deref().unwrap_or("continuation"),
+                    &session_id,
+                    iteration,
+                    "runtime.continuation.loop",
+                    PromptSettleEvent::UserStopped,
+                )?;
                 final_evaluation = Some(GoalEvaluation {
                     status: GoalStatus::NeedsUser,
                     should_continue: false,
@@ -1316,7 +1864,35 @@ impl Orchestrator {
                 });
                 break;
             }
+            if options.continuation {
+                let guard =
+                    store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
+                        guard.in_flight = false
+                    })?;
+                if let Some(reason) = guard.blocking_reason() {
+                    store.record_prompt_settle_decision(
+                        &goal_id,
+                        current_plan_task_id.as_deref().unwrap_or("continuation"),
+                        &session_id,
+                        iteration,
+                        "runtime.continuation.guard",
+                        prompt_settle_event_for_guard_reason(reason),
+                    )?;
+                    final_evaluation = Some(GoalEvaluation {
+                        status: GoalStatus::NeedsUser,
+                        should_continue: false,
+                        summary: format!(
+                            "Continuation was held by the persisted OMO guard: {reason}."
+                        ),
+                        route_hint_override: None,
+                    });
+                    break;
+                }
+            }
             let plan_task_id = if let Some(task_id) = current_plan_task_id.clone() {
+                task_id
+            } else if let Some(task_id) = prestarted_plan_wave.pop_front() {
+                current_plan_task_id = Some(task_id.clone());
                 task_id
             } else {
                 let active = plan_node_runs.active_task_ids();
@@ -1331,6 +1907,17 @@ impl Orchestrator {
                             .iter()
                             .map(|task| task.task_id.clone())
                             .collect::<Vec<_>>();
+                        let wave_id = format!("wave-{iteration}");
+                        let mut wave_ledger = PlanWaveRunLedger::new(
+                            &goal_id,
+                            &epoch_id,
+                            &plan_graph,
+                            &wave_id,
+                            wave_ids.clone(),
+                        )?;
+                        wave_ledger.open_barrier()?;
+                        store.write_plan_wave_run(&wave_ledger)?;
+                        current_plan_wave = Some(wave_ledger);
                         scheduled_plan_wave.extend(wave_ids.iter().cloned());
                         store.append_goal_epoch_event(
                             &goal_id,
@@ -1363,27 +1950,64 @@ impl Orchestrator {
                 current_plan_task_id = Some(task_id.clone());
                 task_id
             };
+            if options.continuation {
+                store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
+                    guard.in_flight = true
+                })?;
+            }
+            let mut prestarted_worker = prestarted_plan_workers.remove(&plan_task_id);
+            let current_plan_task = plan_graph
+                .task(&plan_task_id)
+                .context("scheduled PlanGraph task disappeared before routing")?;
             let parent_task_id = goal.current_task_id.clone();
-            let worker_route_hint = next_route_hint_override
-                .as_deref()
+            let worker_route_hint_owned = prestarted_worker
+                .as_ref()
+                .and_then(|worker| worker.route_hint.as_deref())
+                .map(ToString::to_string)
+                .or_else(|| next_route_hint_override.clone())
                 .or_else(|| {
                     last_coordinator_review
                         .as_ref()
                         .and_then(|review| review.route_hint.as_deref())
+                        .map(ToString::to_string)
                 })
-                .or(initial_plan_route_hint);
+                .or_else(|| {
+                    current_plan_task
+                        .recommended_route_hint()
+                        .map(ToString::to_string)
+                })
+                .or_else(|| initial_plan_route_hint.map(ToString::to_string));
+            let worker_route_hint = worker_route_hint_owned.as_deref();
             let worker_route_is_review = worker_route_hint == Some("review");
-            let worker_phase =
-                worker_phase_for_route_hint(&initial_preferred_phase, worker_route_hint);
-            let phase_decision = phase_runtime.routes.resolve_for_worker(
-                &worker_phase,
-                &phase_runtime.inventory,
-                phase_runtime.current_model.as_ref(),
-                &options.worker,
-            )?;
-            let effective_worker = phase_decision.overlay_worker_config(&options.worker)?;
-            let phase_decision_path =
-                store.write_phase_route_decision(&goal_id, 100 + iteration, &phase_decision)?;
+            let worker_phase = prestarted_worker
+                .as_ref()
+                .map(|worker| worker.worker_phase.clone())
+                .unwrap_or_else(|| {
+                    worker_phase_for_route_hint(
+                        &current_plan_task.preferred_phase_profile,
+                        worker_route_hint,
+                    )
+                });
+            let phase_decision = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.phase_decision.clone()
+            } else {
+                phase_runtime.routes.resolve_for_worker(
+                    &worker_phase,
+                    &phase_runtime.inventory,
+                    phase_runtime.current_model.as_ref(),
+                    &options.worker,
+                )?
+            };
+            let effective_worker = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.effective_worker.clone()
+            } else {
+                phase_decision.overlay_worker_config(&options.worker)?
+            };
+            let phase_decision_path = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.phase_decision_path.clone()
+            } else {
+                store.write_phase_route_decision(&goal_id, 100 + iteration, &phase_decision)?
+            };
             let resolved_worker_route_hint = Some(phase_decision.category.as_str());
             let selected_route =
                 effective_worker.selected_route_for_hint(1, resolved_worker_route_hint);
@@ -1402,79 +2026,123 @@ impl Orchestrator {
             } else {
                 RouteChangeType::RouteChange
             };
-            if let Err(reason) = budget_controller.apply_budget_for_route_change(
-                &BudgetSnapshot {
-                    worker_call_count,
-                    premium_worker_call_count,
-                    attempt_count,
-                    runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
-                    context_risk_signals: Vec::new(),
-                },
-                current_route_change_type.clone(),
-                selected_route.worker_kind.is_premium(),
-            ) {
-                goal.status = GoalStatus::Limited;
-                goal.summary = format!("Worker dispatch blocked before launch: {reason}");
-                goal.updated_at = timestamp();
-                store.write_goal(&goal)?;
-                store.append_goal_epoch_event(
-                    &goal_id,
-                    &epoch_id,
-                    &format!("{epoch_id}.budget-aborted"),
-                    GoalEpochEventKind::Aborted,
-                    json!({
-                        "reason": reason,
-                        "worker_calls": worker_call_count,
-                        "premium_worker_calls": premium_worker_call_count,
-                    }),
-                )?;
-                goal_run_lease.release()?;
-                bail!("{}", goal.summary);
+            if prestarted_worker.is_none() {
+                if let Err(reason) = budget_controller.apply_budget_for_route_change(
+                    &BudgetSnapshot {
+                        worker_call_count,
+                        premium_worker_call_count,
+                        attempt_count,
+                        runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
+                        context_risk_signals: Vec::new(),
+                    },
+                    current_route_change_type.clone(),
+                    selected_route.worker_kind.is_premium(),
+                ) {
+                    goal.status = GoalStatus::Limited;
+                    goal.summary = format!("Worker dispatch blocked before launch: {reason}");
+                    goal.updated_at = timestamp();
+                    store.write_goal(&goal)?;
+                    store.append_goal_epoch_event(
+                        &goal_id,
+                        &epoch_id,
+                        &format!("{epoch_id}.budget-aborted"),
+                        GoalEpochEventKind::Aborted,
+                        json!({
+                            "reason": reason,
+                            "worker_calls": worker_call_count,
+                            "premium_worker_calls": premium_worker_call_count,
+                        }),
+                    )?;
+                    goal_run_lease.release()?;
+                    bail!("{}", goal.summary);
+                }
             }
-            let budget_reservation_id = format!("{epoch_id}.worker.{iteration}");
-            if let Err(error) = store.reserve_budget_call(
-                &goal_run_lease,
-                &budget_reservation_id,
-                "worker",
-                true,
-                selected_route.worker_kind.is_premium(),
-                &goal.budget,
-            ) {
-                goal.status = GoalStatus::Limited;
-                goal.summary = format!("Worker dispatch reservation failed: {error}");
-                goal.updated_at = timestamp();
-                store.write_goal(&goal)?;
+            let budget_reservation_id = prestarted_worker
+                .as_ref()
+                .map(|worker| worker.budget_reservation_id.clone())
+                .unwrap_or_else(|| format!("{epoch_id}.worker.{iteration}"));
+            if prestarted_worker.is_none() {
+                if let Err(error) = store.reserve_budget_call(
+                    &goal_run_lease,
+                    &budget_reservation_id,
+                    "worker",
+                    true,
+                    selected_route.worker_kind.is_premium(),
+                    &goal.budget,
+                ) {
+                    goal.status = GoalStatus::Limited;
+                    goal.summary = format!("Worker dispatch reservation failed: {error}");
+                    goal.updated_at = timestamp();
+                    store.write_goal(&goal)?;
+                    store.append_goal_epoch_event(
+                        &goal_id,
+                        &epoch_id,
+                        &format!("{epoch_id}.reservation-aborted"),
+                        GoalEpochEventKind::Aborted,
+                        json!({
+                            "reason": error.to_string(),
+                            "reservation_id": budget_reservation_id,
+                        }),
+                    )?;
+                    goal_run_lease.release()?;
+                    bail!("{}", goal.summary);
+                }
                 store.append_goal_epoch_event(
                     &goal_id,
                     &epoch_id,
-                    &format!("{epoch_id}.reservation-aborted"),
-                    GoalEpochEventKind::Aborted,
+                    &format!("{budget_reservation_id}.reserved"),
+                    GoalEpochEventKind::BudgetReserved,
                     json!({
-                        "reason": error.to_string(),
                         "reservation_id": budget_reservation_id,
+                        "phase": "worker",
+                        "premium": selected_route.worker_kind.is_premium(),
+                        "reserved_tokens": goal.budget.max_tokens_per_call,
                     }),
                 )?;
-                goal_run_lease.release()?;
-                bail!("{}", goal.summary);
             }
-            store.append_goal_epoch_event(
-                &goal_id,
-                &epoch_id,
-                &format!("{budget_reservation_id}.reserved"),
-                GoalEpochEventKind::BudgetReserved,
-                json!({
-                    "reservation_id": budget_reservation_id,
-                    "phase": "worker",
-                    "premium": selected_route.worker_kind.is_premium(),
-                    "reserved_tokens": goal.budget.max_tokens_per_call,
-                }),
-            )?;
-            let first_plan_attempt = plan_node_runs
+            let first_plan_attempt = prestarted_worker.is_some()
+                || plan_node_runs
+                    .nodes
+                    .iter()
+                    .find(|node| node.task_id == plan_task_id)
+                    .is_some_and(|node| node.attempt == 0);
+            let route_attempt = plan_node_runs
                 .nodes
                 .iter()
                 .find(|node| node.task_id == plan_task_id)
-                .is_some_and(|node| node.attempt == 0);
-            let worker_task_id = if first_plan_attempt {
+                .map(|node| node.attempt.saturating_add(1))
+                .unwrap_or(1);
+            let route_receipt = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.route_receipt.clone()
+            } else {
+                crate::state::TaskRouteDecisionReceipt::seal(
+                    &goal_id,
+                    &epoch_id,
+                    &plan_graph,
+                    plan_graph
+                        .task(&plan_task_id)
+                        .context("missing PlanGraph task for route receipt")?,
+                    route_attempt,
+                    worker_phase.clone(),
+                    worker_route_hint.map(ToString::to_string),
+                    selected_route.worker_kind.as_str().to_string(),
+                    selected_route.worker_model.map(ToString::to_string),
+                    selected_route.category.as_str().to_string(),
+                    selected_route.route_reason.clone(),
+                    phase_decision.selected_candidate,
+                    phase_decision.rejected_candidates.len(),
+                    phase_decision_path.to_string_lossy().to_string(),
+                    Some(budget_reservation_id.clone()),
+                )?
+            };
+            let route_receipt_path = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.route_receipt_path.clone()
+            } else {
+                store.write_task_route_decision_receipt(&route_receipt)?
+            };
+            let worker_task_id = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.worker_task_id.clone()
+            } else if first_plan_attempt {
                 scoped_task_id(task_namespace.as_deref(), &plan_task_id)
             } else {
                 let verification_path = last_verification_path
@@ -1515,7 +2183,7 @@ impl Orchestrator {
                 )?;
                 repair_task_id
             };
-            {
+            if prestarted_worker.is_none() {
                 let node = plan_node_runs.node_mut(&plan_task_id)?;
                 node.attempt = node.attempt.saturating_add(1);
                 node.worker_task_id = Some(worker_task_id.clone());
@@ -1527,8 +2195,8 @@ impl Orchestrator {
                 node.status = PlanNodeRunStatus::Running;
                 node.updated_at = timestamp();
                 plan_node_runs.updated_at = timestamp();
+                store.write_plan_node_runs(&plan_node_runs)?;
             }
-            store.write_plan_node_runs(&plan_node_runs)?;
 
             append_event(
                 &store,
@@ -1542,6 +2210,7 @@ impl Orchestrator {
                     json!({
                         "phase": worker_phase,
                         "decision_path": phase_decision_path.to_string_lossy(),
+                        "task_route_receipt_path": route_receipt_path.to_string_lossy(),
                         "selected_candidate": phase_decision.selected_candidate,
                         "fallback_count": phase_decision.rejected_candidates.len(),
                     }),
@@ -1558,40 +2227,44 @@ impl Orchestrator {
                 decided_at: crate::state::timestamp(),
             };
 
-            start_task(&mut tasks, &worker_task_id);
+            if prestarted_worker.is_none() {
+                start_task(&mut tasks, &worker_task_id);
+            }
             goal.status = GoalStatus::Running;
             goal.current_task_id = Some(worker_task_id.clone());
             goal.updated_at = timestamp();
             store.write_goal(&goal)?;
             store.write_tasks(&goal_id, &tasks)?;
-            append_event(
-                &store,
-                &options.event_sink,
-                event(
-                    &session_id,
-                    Some(&goal_id),
-                    Some(&worker_task_id),
-                    EventKind::WorkerStarted,
-                    if first_plan_attempt {
-                        "Prepared implementation worker packet".to_string()
-                    } else {
-                        "Prepared repair worker packet".to_string()
-                    },
-                    json!({
-                        "iteration": iteration,
-                        "phase": worker_phase,
-                        "phase_route_decision_path": phase_decision_path.to_string_lossy(),
-                        "before": &before_diff,
-                        "current": &after_diff,
-                        "route_hint": worker_route_hint,
-                        "resolved_route_hint": resolved_worker_route_hint,
-                        "worker_kind": selected_route.worker_kind.as_str(),
-                        "worker_model": selected_route.worker_model,
-                        "worker_category": selected_route.category.as_str(),
-                        "route_reason": &selected_route.route_reason,
-                    }),
-                ),
-            )?;
+            if prestarted_worker.is_none() {
+                append_event(
+                    &store,
+                    &options.event_sink,
+                    event(
+                        &session_id,
+                        Some(&goal_id),
+                        Some(&worker_task_id),
+                        EventKind::WorkerStarted,
+                        if first_plan_attempt {
+                            "Prepared implementation worker packet".to_string()
+                        } else {
+                            "Prepared repair worker packet".to_string()
+                        },
+                        json!({
+                            "iteration": iteration,
+                            "phase": worker_phase,
+                            "phase_route_decision_path": phase_decision_path.to_string_lossy(),
+                            "before": &before_diff,
+                            "current": &after_diff,
+                            "route_hint": worker_route_hint,
+                            "resolved_route_hint": resolved_worker_route_hint,
+                            "worker_kind": selected_route.worker_kind.as_str(),
+                            "worker_model": selected_route.worker_model,
+                            "worker_category": selected_route.category.as_str(),
+                            "route_reason": &selected_route.route_reason,
+                        }),
+                    ),
+                )?;
+            }
 
             let reviewed_execution_id = if worker_route_hint == Some("review") {
                 Some(
@@ -1602,20 +2275,29 @@ impl Orchestrator {
             } else {
                 None
             };
-            let mut worker_task = tasks
-                .iter()
-                .find(|task| task.id == worker_task_id)
-                .context("missing worker task")?
-                .clone();
-            worker_task.inputs.phase_route_locked = !matches!(
-                phase_decision.candidate.backend,
-                PhaseBackend::LegacyCategory
-            );
-            if let Some(persisted_task) = tasks.iter_mut().find(|task| task.id == worker_task_id) {
-                persisted_task.inputs.phase_route_locked = worker_task.inputs.phase_route_locked;
+            let mut worker_task = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.worker_task.clone()
+            } else {
+                tasks
+                    .iter()
+                    .find(|task| task.id == worker_task_id)
+                    .context("missing worker task")?
+                    .clone()
+            };
+            if prestarted_worker.is_none() {
+                worker_task.inputs.phase_route_locked = !matches!(
+                    phase_decision.candidate.backend,
+                    PhaseBackend::LegacyCategory
+                );
+                if let Some(persisted_task) =
+                    tasks.iter_mut().find(|task| task.id == worker_task_id)
+                {
+                    persisted_task.inputs.phase_route_locked =
+                        worker_task.inputs.phase_route_locked;
+                }
+                store.write_tasks(&goal_id, &tasks)?;
             }
-            store.write_tasks(&goal_id, &tasks)?;
-            if first_plan_attempt {
+            if prestarted_worker.is_none() && first_plan_attempt {
                 if let Some(plan_task) = worker_task.inputs.plan_task.as_ref() {
                     if matches!(
                         plan_task.test.strategy,
@@ -1663,6 +2345,42 @@ impl Orchestrator {
                     ];
                 }
             }
+            if prestarted_worker.is_none()
+                && first_plan_attempt
+                && !worker_route_is_review
+                && selected_route.require_worker
+            {
+                dispatch_parallel_plan_siblings(
+                    &mut scheduled_plan_wave,
+                    &mut prestarted_plan_workers,
+                    &mut prestarted_plan_wave,
+                    &mut tasks,
+                    &mut plan_node_runs,
+                    &plan_graph,
+                    &goal_id,
+                    &epoch_id,
+                    task_namespace.as_deref(),
+                    &workspace,
+                    &store,
+                    &phase_runtime,
+                    &options,
+                    &goal,
+                    &detection,
+                    &task_manager,
+                    &mut lineage,
+                    &mut current_plan_wave,
+                    &budget_controller,
+                    worker_call_count,
+                    premium_worker_call_count,
+                    attempt_count,
+                    run_started_at,
+                    &goal_run_lease,
+                    iteration,
+                    &session_id,
+                )?;
+                lineage.updated_at = timestamp();
+                store.write_lineage(&lineage)?;
+            }
             let base_worker_request = if first_plan_attempt {
                 options.request.clone()
             } else {
@@ -1679,10 +2397,42 @@ impl Orchestrator {
                     review_worker_request(&base_worker_request, id)
                 });
             repair_request_history.push(worker_request.clone());
+            let resumed_managed_worker_task_id = if !first_plan_attempt && !worker_route_is_review {
+                try_resume_plan_session(
+                    &task_manager,
+                    &store,
+                    &goal_id,
+                    &epoch_id,
+                    &plan_graph,
+                    &plan_task_id,
+                    route_attempt,
+                    &selected_route,
+                    &worker_request,
+                )?
+            } else {
+                None
+            };
+            if let Some(resumed_task_id) = resumed_managed_worker_task_id.as_deref() {
+                store.append_goal_epoch_event(
+                    &goal_id,
+                    &epoch_id,
+                    &format!("{epoch_id}.worker.{iteration}.follow_up"),
+                    GoalEpochEventKind::PhaseCompleted,
+                    json!({
+                        "phase": "worker_follow_up",
+                        "task_id": plan_task_id,
+                        "managed_worker_task_id": resumed_task_id,
+                        "attempt": route_attempt,
+                        "role": selected_route.worker_kind.as_str(),
+                    }),
+                )?;
+            }
             check_phase_terminal_state(&phase_decision)
                 .context("worker phase terminal state check failed")?;
             let (executor_broker_arc, executor_broker_identity) =
-                if let Some(factory) = phase_runtime.broker_factory.as_deref() {
+                if prestarted_worker.is_some() || resumed_managed_worker_task_id.is_some() {
+                    (None, None)
+                } else if let Some(factory) = phase_runtime.broker_factory.as_deref() {
                     let identity = PhaseExecutionIdentity {
                         execution_id: format!("executor_iter_{}", iteration),
                         phase_session_id: format!("executor_iter_{}", iteration),
@@ -1719,53 +2469,79 @@ impl Orchestrator {
                     .resolve(phase_request)
                     .context("broker resolve failed for executor phase")?;
             }
-            let start_result = match task_manager.lock() {
-                Ok(mut task_manager) => {
-                    task_manager.set_worker_broker(executor_broker_arc.clone());
-                    task_manager.start(WorkerStartRequest {
-                        store: &store,
-                        workspace: &workspace,
-                        task: &worker_task,
-                        route_attempt: worker_task.attempt,
-                        goal: &worker_request,
-                        verification_commands: &detection.verification_commands,
-                        config: &effective_worker,
-                        cancellation_token: options.cancellation_token.clone(),
-                        coordinator_model: goal.coordinator_model.as_ref(),
-                        coordinator_brief: goal.coordinator_brief.as_deref(),
-                        route_hint: resolved_worker_route_hint,
-                    })
-                }
-                Err(_) => {
-                    stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                    bail!("task manager mutex poisoned");
-                }
-            };
-            let managed_worker_task_id = match start_result {
-                Ok(task_id) => {
-                    #[cfg(test)]
-                    test_seams::increment_worker_dispatch();
-                    task_id
-                }
-                Err(error) => {
-                    if let Some(broker) = executor_broker {
-                        let _ = broker.cancel();
+            let managed_worker_task_id = if let Some(worker) = prestarted_worker.as_ref() {
+                worker.managed_worker_task_id.clone()
+            } else if let Some(resumed_task_id) = resumed_managed_worker_task_id {
+                resumed_task_id
+            } else {
+                let start_result = match task_manager.lock() {
+                    Ok(mut task_manager) => {
+                        task_manager.set_worker_broker(executor_broker_arc.clone());
+                        task_manager.start(WorkerStartRequest {
+                            store: &store,
+                            workspace: &workspace,
+                            task: &worker_task,
+                            route_attempt,
+                            goal: &worker_request,
+                            verification_commands: &detection.verification_commands,
+                            config: &effective_worker,
+                            cancellation_token: options.cancellation_token.clone(),
+                            coordinator_model: goal.coordinator_model.as_ref(),
+                            coordinator_brief: goal.coordinator_brief.as_deref(),
+                            route_hint: resolved_worker_route_hint,
+                        })
                     }
-                    if let Some(ref identity) = executor_broker_identity {
-                        if let Some(ref factory) = phase_runtime.broker_factory {
-                            let _ = factory.remove_session(
-                                identity,
-                                &goal_id,
-                                &worker_task_id,
-                                plan_graph.revision,
-                            );
+                    Err(_) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        bail!("task manager mutex poisoned");
+                    }
+                };
+                match start_result {
+                    Ok(task_id) => {
+                        #[cfg(test)]
+                        test_seams::increment_worker_dispatch();
+                        if let Some(wave_ledger) = current_plan_wave.as_mut() {
+                            wave_ledger.mark_dispatched(
+                                &plan_task_id,
+                                route_attempt,
+                                task_id.clone(),
+                            )?;
+                            wave_ledger.mark_started(&plan_task_id)?;
+                            store.write_plan_wave_run(wave_ledger)?;
                         }
+                        task_id
                     }
-                    stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                    return Err(error)
-                        .context("ownership: worker start failed, goal remains incomplete");
+                    Err(error) => {
+                        if let Some(broker) = executor_broker {
+                            let _ = broker.cancel();
+                        }
+                        if let Some(ref identity) = executor_broker_identity {
+                            if let Some(ref factory) = phase_runtime.broker_factory {
+                                let _ = factory.remove_session(
+                                    identity,
+                                    &goal_id,
+                                    &worker_task_id,
+                                    plan_graph.revision,
+                                );
+                            }
+                        }
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        return Err(error)
+                            .context("ownership: worker start failed, goal remains incomplete");
+                    }
                 }
             };
+            let mut live_binding_persisted = persist_live_plan_node_session_binding(
+                &store,
+                &goal_id,
+                &epoch_id,
+                &plan_graph,
+                &plan_task_id,
+                route_attempt,
+                &managed_worker_task_id,
+                &selected_route,
+                &route_receipt.receipt_hash,
+            )?;
             if !lineage.active_task_ids.contains(&worker_task_id) {
                 lineage.active_task_ids.push(worker_task_id.clone());
             }
@@ -1790,43 +2566,110 @@ impl Orchestrator {
                 cancel_result?;
                 check_run_cancelled(options.cancellation_token.as_ref())?;
             }
-            let managed_worker_run = loop {
-                if options
-                    .cancellation_token
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
-                    let cancel_result = match task_manager.lock() {
-                        Ok(mut task_manager) => task_manager.cancel_task(&managed_worker_task_id),
+            let managed_worker_run = if let Some(worker) = prestarted_worker.as_mut() {
+                worker
+                    .completed_run
+                    .take()
+                    .context("prestarted wave worker was not reduced at the barrier")?
+            } else {
+                let run = loop {
+                    if !live_binding_persisted {
+                        live_binding_persisted = persist_live_plan_node_session_binding(
+                            &store,
+                            &goal_id,
+                            &epoch_id,
+                            &plan_graph,
+                            &plan_task_id,
+                            route_attempt,
+                            &managed_worker_task_id,
+                            &selected_route,
+                            &route_receipt.receipt_hash,
+                        )?;
+                    }
+                    if options
+                        .cancellation_token
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        let cancel_result = match task_manager.lock() {
+                            Ok(mut task_manager) => {
+                                task_manager.cancel_task(&managed_worker_task_id)
+                            }
+                            Err(_) => {
+                                stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                                bail!("task manager mutex poisoned");
+                            }
+                        };
+                        if let Some(broker) = executor_broker {
+                            let _ = broker.cancel();
+                        }
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        cancel_result?;
+                        check_run_cancelled(options.cancellation_token.as_ref())?;
+                    }
+                    let wait_result = match task_manager.lock() {
+                        Ok(mut task_manager) => task_manager.try_wait_for(&managed_worker_task_id),
                         Err(_) => {
                             stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
                             bail!("task manager mutex poisoned");
                         }
                     };
-                    if let Some(broker) = executor_broker {
-                        let _ = broker.cancel();
+                    match wait_result {
+                        Ok(Some(run)) => break run,
+                        Ok(None) => {}
+                        Err(error) => {
+                            stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                            return Err(error).context("failed while waiting for Gear worker task");
+                        }
                     }
-                    stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                    cancel_result?;
-                    check_run_cancelled(options.cancellation_token.as_ref())?;
-                }
-                let wait_result = match task_manager.lock() {
-                    Ok(mut task_manager) => task_manager.try_wait_for(&managed_worker_task_id),
-                    Err(_) => {
-                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                        bail!("task manager mutex poisoned");
-                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 };
-                match wait_result {
-                    Ok(Some(run)) => break run,
-                    Ok(None) => {}
-                    Err(error) => {
-                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                        return Err(error).context("failed while waiting for Gear worker task");
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(10));
+                run
             };
+            // A wave is reduced only after every prestarted sibling has
+            // reached a terminal worker state. This prevents verification of
+            // the first node from observing a partially-written sibling.
+            let sibling_ids = prestarted_plan_wave.iter().cloned().collect::<Vec<_>>();
+            for sibling_id in sibling_ids {
+                let Some(sibling) = prestarted_plan_workers.get_mut(&sibling_id) else {
+                    bail!("prestarted wave worker `{sibling_id}` lost its durable metadata");
+                };
+                if sibling.completed_run.is_none() {
+                    let sibling_route = sibling
+                        .effective_worker
+                        .selected_route_for_hint(1, Some(sibling.phase_decision.category.as_str()));
+                    persist_live_plan_node_session_binding(
+                        &store,
+                        &goal_id,
+                        &epoch_id,
+                        &plan_graph,
+                        &sibling.plan_task_id,
+                        sibling.session_binding_attempt,
+                        &sibling.managed_worker_task_id,
+                        &sibling_route,
+                        &sibling.route_receipt.receipt_hash,
+                    )?;
+                    let sibling_run = match task_manager.lock() {
+                        Ok(mut task_manager) => {
+                            task_manager.wait_for(&sibling.managed_worker_task_id)
+                        }
+                        Err(_) => bail!("task manager mutex poisoned at wave barrier"),
+                    }?;
+                    if let Some(wave_ledger) = current_plan_wave.as_mut() {
+                        let terminal_status = match sibling_run.result.status {
+                            WorkerStatus::Succeeded | WorkerStatus::Skipped => {
+                                PlanWaveNodeStatus::Completed
+                            }
+                            WorkerStatus::Failed => PlanWaveNodeStatus::Failed,
+                        };
+                        let error = (terminal_status == PlanWaveNodeStatus::Failed)
+                            .then(|| sibling_run.result.summary.clone());
+                        wave_ledger.mark_terminal(&sibling.plan_task_id, terminal_status, error)?;
+                        store.write_plan_wave_run(wave_ledger)?;
+                    }
+                    sibling.completed_run = Some(sibling_run);
+                }
+            }
             if let Some(broker) = executor_broker {
                 if let Ok(state) = broker.current_state() {
                     if state.lifecycle.name() == LifecycleStateName::Active {
@@ -1926,6 +2769,77 @@ impl Orchestrator {
             let iteration_worker_outcome = managed_worker_run.outcome;
             let iteration_worker_result = managed_worker_run.result;
             let iteration_worker_result_for_risk = iteration_worker_result.clone();
+            if let Some(session_id) = worker_session_id.clone() {
+                let binding = crate::state::PlanNodeSessionBinding {
+                    schema_version: crate::state::PLAN_NODE_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: format!("{goal_id}:{epoch_id}:{plan_task_id}:{}", route_attempt),
+                    goal_id: goal_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    plan_id: plan_graph.plan_id.clone(),
+                    plan_revision: plan_graph.revision,
+                    plan_hash: plan_graph.plan_hash.clone(),
+                    task_id: plan_task_id.clone(),
+                    attempt: route_attempt,
+                    worker_task_id: managed_worker_task_id.clone(),
+                    worker_kind: selected_route.worker_kind.as_str().to_string(),
+                    provider_id: executor_broker_identity
+                        .as_ref()
+                        .and_then(|identity| identity.provider_id.clone())
+                        .or_else(|| {
+                            selected_route
+                                .worker_model
+                                .and_then(|model| model.split_once('/'))
+                                .map(|(provider, _)| provider.to_string())
+                        }),
+                    model_id: selected_route.worker_model.map(str::to_string),
+                    session_id,
+                    capability_fingerprint: iteration_worker_outcome
+                        .session_capability
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    route_receipt_hash: Some(route_receipt.receipt_hash.clone()),
+                    status: match worker_task_record.residency_state {
+                        crate::task_manager::ResidencyState::Resident
+                        | crate::task_manager::ResidencyState::RpcDetached => {
+                            crate::state::PlanNodeSessionBindingStatus::Active
+                        }
+                        crate::task_manager::ResidencyState::Evicted => {
+                            crate::state::PlanNodeSessionBindingStatus::Suspended
+                        }
+                        crate::task_manager::ResidencyState::Disposed
+                        | crate::task_manager::ResidencyState::PersistedOnly => {
+                            crate::state::PlanNodeSessionBindingStatus::Terminal
+                        }
+                    },
+                    supersedes_binding_id: (route_attempt > 1).then(|| {
+                        format!(
+                            "{goal_id}:{epoch_id}:{plan_task_id}:{}",
+                            route_attempt.saturating_sub(1)
+                        )
+                    }),
+                    created_at: timestamp(),
+                    updated_at: timestamp(),
+                };
+                store.write_plan_node_session_binding(&binding)?;
+            }
+            if prestarted_worker.is_none() {
+                if let Some(wave_ledger) = current_plan_wave.as_mut() {
+                    let terminal_status = match iteration_worker_result.status {
+                        WorkerStatus::Succeeded | WorkerStatus::Skipped => {
+                            PlanWaveNodeStatus::Completed
+                        }
+                        WorkerStatus::Failed => PlanWaveNodeStatus::Failed,
+                    };
+                    let error = (terminal_status == PlanWaveNodeStatus::Failed)
+                        .then(|| iteration_worker_result.summary.clone());
+                    wave_ledger.mark_terminal(&plan_task_id, terminal_status, error)?;
+                    store.write_plan_wave_run(wave_ledger)?;
+                    let wave_is_terminal = wave_ledger.status.is_terminal();
+                    if wave_is_terminal {
+                        current_plan_wave = None;
+                    }
+                }
+            }
             let (plan_green_paths, plan_green_passed) = if first_plan_attempt
                 && iteration_worker_result.status == WorkerStatus::Succeeded
             {
@@ -1965,9 +2879,13 @@ impl Orchestrator {
                 plan_node_runs.updated_at = timestamp();
                 store.write_plan_node_runs(&plan_node_runs)?;
             }
+            let phase_route_ordinal = prestarted_worker
+                .as_ref()
+                .map(|worker| worker.phase_route_ordinal)
+                .unwrap_or(100 + iteration);
             let phase_route_receipt = phase_route_receipt_for_worker(
                 &phase_decision,
-                100 + iteration,
+                phase_route_ordinal,
                 &goal_id,
                 &plan_graph,
                 &worker_task_id,
@@ -1975,8 +2893,11 @@ impl Orchestrator {
                 &worker_task_record,
                 &store,
             )?;
-            let phase_route_receipt_path =
-                store.write_phase_route_receipt(&goal_id, 100 + iteration, &phase_route_receipt)?;
+            let phase_route_receipt_path = store.write_phase_route_receipt(
+                &goal_id,
+                phase_route_ordinal,
+                &phase_route_receipt,
+            )?;
             if worker_route_hint != Some("review") {
                 last_executor_execution_id = Some(
                     worker_session_id
@@ -2095,9 +3016,20 @@ impl Orchestrator {
                     "outcome_path": iteration_worker_result.outcome_path.to_string_lossy(),
                 }),
             )?;
+            let worker_failed = iteration_worker_result.status == WorkerStatus::Failed;
             worker_result = Some(iteration_worker_result);
             final_worker_outcome = Some(iteration_worker_outcome.clone());
             worker_output_history.push(iteration_worker_outcome.summary.clone());
+            if options.continuation {
+                store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
+                    guard.in_flight = false;
+                    if worker_failed {
+                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+                    } else {
+                        guard.consecutive_failures = 0;
+                    }
+                })?;
+            }
             if let Some(finished_at) = worker_task_record.finished_at.as_deref()
                 && let Some(notification) = CompletionNotifier::build_notification(
                     &worker_task_record,
@@ -2336,6 +3268,34 @@ impl Orchestrator {
                 context_risk_signals,
                 ..budget_snapshot_for_review
             };
+            context_pressure_seen |= !budget_snapshot.context_risk_signals.is_empty();
+            if options.continuation {
+                let token_limit_detected =
+                    budget_snapshot.context_risk_signals.iter().any(|signal| {
+                        let signal = signal.to_ascii_lowercase();
+                        signal.contains("token limit") || signal.contains("context limit")
+                    });
+                store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
+                    guard.context_pressure |= !budget_snapshot.context_risk_signals.is_empty();
+                    guard.token_limit_detected |= token_limit_detected;
+                    guard.stagnation_count = if no_progress_signals.is_empty() {
+                        0
+                    } else {
+                        guard.stagnation_count.saturating_add(1)
+                    };
+                    guard.last_progress_marker = store.continuation_progress_marker(&goal_id).ok();
+                })?;
+            }
+            if worker_failed {
+                store.record_prompt_settle_decision(
+                    &goal_id,
+                    &worker_task_id,
+                    &session_id,
+                    iteration,
+                    "runtime.worker",
+                    PromptSettleEvent::Error,
+                )?;
+            }
             let budget_summary = budget_summary(
                 &budget_controller,
                 &budget_snapshot,
@@ -2586,6 +3546,8 @@ impl Orchestrator {
         let final_worker_outcome =
             final_worker_outcome.context("Gear loop did not produce worker outcome evidence")?;
         let final_task_id = goal.current_task_id.clone();
+        persist_plan_criterion_evidence(&store, &workspace, &plan_graph, &mut plan_node_runs)?;
+        let criteria_complete = plan_node_runs.all_criteria_passed(&plan_graph);
         let final_wave_receipt = build_final_verification_wave(
             &goal_id,
             &epoch_id,
@@ -2596,6 +3558,7 @@ impl Orchestrator {
             &verification_results,
             last_verification_path.as_deref(),
             &scope_check,
+            criteria_complete,
         )?;
         if final_evaluation.status == GoalStatus::Complete && !final_wave_receipt.passed {
             final_evaluation = GoalEvaluation {
@@ -2613,6 +3576,23 @@ impl Orchestrator {
                 ),
                 route_hint_override: None,
             };
+        }
+        if context_pressure_seen && final_evaluation.status == GoalStatus::NeedsUser {
+            store.record_prompt_settle_decision(
+                &goal_id,
+                final_task_id.as_deref().unwrap_or("continuation"),
+                &session_id,
+                max_iterations,
+                "runtime.continuation.final",
+                PromptSettleEvent::ContextPressure,
+            )?;
+        }
+        if options.continuation {
+            let completed = final_evaluation.status == GoalStatus::Complete;
+            store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
+                guard.in_flight = false;
+                guard.all_todos_completed = completed;
+            })?;
         }
         goal.status = final_evaluation.status;
         goal.current_task_id = None;
@@ -2692,8 +3672,13 @@ impl Orchestrator {
         if options.continuation {
             let continuation_status = if store.continuation_is_stopped_for_session(&session_id)? {
                 ContinuationStatus::Stopped
-            } else {
+            } else if goal.status == GoalStatus::Complete {
                 ContinuationStatus::Completed
+            } else {
+                // Keep unfinished work recoverable. The persisted progress
+                // marker and bounded resume counter decide whether a later
+                // invocation may continue or must surface a stuck decision.
+                ContinuationStatus::Running
             };
             store.write_continuation_state(&session_id, &goal_id, continuation_status.clone())?;
             append_event(
@@ -3069,7 +4054,23 @@ fn run_objective_controller(
                         == Some(outcome.final_verification_wave_hash.as_str())
                     && node.final_report_path.as_deref() == Some(outcome_report_path.as_str())
             });
-        if !already_committed {
+        let blocker_decision = if !already_committed && outcome.status == GoalStatus::Blocked {
+            let blocker_budget = options.budget.clone().unwrap_or_default();
+            promote_final_review_blocker_child(
+                &store,
+                &objective_id,
+                &root_session_id,
+                &mut graph,
+                &objective_lease,
+                &policy,
+                &blocker_budget,
+                &outcome,
+            )?
+        } else {
+            FinalReviewBlockerDecision::NotPromoted
+        };
+        let blocker_promoted = blocker_decision == FinalReviewBlockerDecision::Promoted;
+        if !already_committed && blocker_decision == FinalReviewBlockerDecision::NotPromoted {
             graph.update_active_node(
                 &outcome.goal_id,
                 outcome.status.clone(),
@@ -3102,6 +4103,25 @@ fn run_objective_controller(
         #[cfg(test)]
         test_seams::objective_graph_commit(&objective_id, &graph);
         goal_outcomes.push(outcome.clone());
+
+        if blocker_decision == FinalReviewBlockerDecision::NeedsUser {
+            let reason =
+                "the same normalized external final-review blocker repeated beyond the retry cap";
+            graph.set_terminal(ObjectiveStatus::NeedsUser, reason.to_string())?;
+            store.write_objective_graph(&graph)?;
+            append_objective_terminal_event(
+                &store,
+                &objective_id,
+                &ObjectiveStatus::NeedsUser,
+                reason,
+                &outcome.goal_id,
+            )?;
+            break;
+        }
+
+        if blocker_promoted {
+            continue;
+        }
 
         if outcome.status != GoalStatus::Complete {
             let consecutive_failures = graph.consecutive_failures.saturating_add(1);
@@ -3530,6 +4550,59 @@ fn reconcile_objective_frontier(
         }
         let outcome = run_outcome_from_objective_receipt(store, receipt.clone())?;
         let outcome_report_path = outcome.final_report_path.to_string_lossy().to_string();
+        let blocker_decision = if outcome.status == GoalStatus::Blocked
+            && graph.active_goal_id.as_deref() == Some(node.goal_id.as_str())
+        {
+            objective_lease
+                .map(|lease| {
+                    promote_final_review_blocker_child(
+                        store,
+                        objective_id,
+                        root_session_id,
+                        graph,
+                        lease,
+                        policy,
+                        budget,
+                        &outcome,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(FinalReviewBlockerDecision::NotPromoted)
+        } else {
+            FinalReviewBlockerDecision::NotPromoted
+        };
+        if matches!(
+            blocker_decision,
+            FinalReviewBlockerDecision::Promoted | FinalReviewBlockerDecision::NeedsUser
+        ) {
+            let outcome_event_key = format!("goal-outcome:{}:{}", node.goal_id, node.epoch_id);
+            store.append_objective_event(
+                objective_id,
+                &outcome_event_key,
+                ObjectiveEventKind::GoalOutcomeRecorded,
+                json!({
+                    "goal_id": node.goal_id,
+                    "epoch_id": node.epoch_id,
+                    "receipt_hash": receipt.receipt_hash,
+                    "status": outcome.status.as_str(),
+                    "final_report_path": outcome.final_report_path.to_string_lossy(),
+                    "final_verification_wave_hash": outcome.final_verification_wave_hash,
+                }),
+            )?;
+            if blocker_decision == FinalReviewBlockerDecision::NeedsUser {
+                let reason = "the same normalized external final-review blocker repeated beyond the retry cap";
+                graph.set_terminal(ObjectiveStatus::NeedsUser, reason.to_string())?;
+                store.write_objective_graph(graph)?;
+                append_objective_terminal_event(
+                    store,
+                    objective_id,
+                    &ObjectiveStatus::NeedsUser,
+                    reason,
+                    &node.goal_id,
+                )?;
+            }
+            continue;
+        }
         if graph.active_goal_id.as_deref() == Some(node.goal_id.as_str()) {
             graph.update_active_node(
                 &node.goal_id,
@@ -3833,7 +4906,7 @@ fn reconcile_objective_frontier(
         reserved_unknown_calls,
         budget.max_premium_worker_calls,
     )?;
-    store.append_objective_event(
+    if let Err(error) = store.append_objective_event(
         objective_id,
         &format!("child-dispatch-reserved:{child_epoch_id}"),
         ObjectiveEventKind::ChildDispatchReserved,
@@ -3846,7 +4919,10 @@ fn reconcile_objective_frontier(
             "reserved_cost_micros": reserved_cost_micros,
             "reserved_unknown_calls": reserved_unknown_calls,
         }),
-    )?;
+    ) {
+        store.release_objective_epoch(objective_lease, &reservation_id)?;
+        return Err(error);
+    }
     graph.attach_child(child_node)?;
     store.write_objective_graph(graph)?;
     store.append_objective_event(
@@ -3881,6 +4957,339 @@ fn objective_child_request(next_objective: &str, acceptance_signals: &[String]) 
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalReviewBlockerDecision {
+    NotPromoted,
+    Promoted,
+    NeedsUser,
+}
+
+const MAX_EXTERNAL_BLOCKER_OCCURRENCES: usize = 2;
+
+fn normalize_blocker_text(value: &str) -> String {
+    let mut tokens = Vec::new();
+    for raw_token in value.split_whitespace() {
+        let lowercase = raw_token.to_ascii_lowercase();
+        if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
+            tokens.push("<url>".to_string());
+            continue;
+        }
+        let cleaned = raw_token
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    character.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>();
+        for token in cleaned.split_whitespace() {
+            tokens.push(
+                if token.len() >= 24 && token.chars().all(|character| character.is_ascii_hexdigit())
+                {
+                    "<token>".to_string()
+                } else {
+                    token.to_string()
+                },
+            );
+        }
+    }
+    tokens.join(" ")
+}
+
+fn blocker_is_external(summary: &str) -> bool {
+    let normalized = normalize_blocker_text(summary);
+    [
+        "authorization",
+        "authentication",
+        "permission",
+        "credential",
+        "api key",
+        "access token",
+        "oauth",
+        "sign in",
+        "login",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn promote_final_review_blocker_child(
+    store: &StateStore,
+    objective_id: &str,
+    root_session_id: &str,
+    graph: &mut ObjectiveGraph,
+    objective_lease: &crate::state::ObjectiveLeaseGuard,
+    policy: &ObjectivePolicy,
+    budget: &Budget,
+    outcome: &RunOutcome,
+) -> Result<FinalReviewBlockerDecision> {
+    if outcome.status != GoalStatus::Blocked {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let final_wave: FinalVerificationWaveReceipt = serde_json::from_str(
+        &std_fs::read_to_string(&outcome.final_verification_wave_path).with_context(|| {
+            format!(
+                "failed to read final verification wave {}",
+                outcome.final_verification_wave_path.display()
+            )
+        })?,
+    )
+    .context("failed to parse final verification wave for blocker promotion")?;
+    if final_wave.receipt_hash != outcome.final_verification_wave_hash || final_wave.passed {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let failed_dimensions = final_wave
+        .dimensions
+        .iter()
+        .filter(|dimension| !dimension.passed)
+        .collect::<Vec<_>>();
+    if failed_dimensions.is_empty()
+        || failed_dimensions
+            .iter()
+            .any(|dimension| dimension.evidence_paths.is_empty())
+    {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let reviewer_ids = failed_dimensions
+        .iter()
+        .flat_map(|dimension| dimension.reviewer_execution_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    if reviewer_ids.len() < 2 || reviewer_ids.iter().all(|id| id.starts_with("runtime-")) {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let parent_goal_id = outcome.goal_id.as_str();
+    if !graph
+        .nodes
+        .iter()
+        .any(|node| node.goal_id == parent_goal_id)
+    {
+        bail!("final blocker outcome references an unknown goal");
+    }
+    if graph.active_goal_id.as_deref() != Some(parent_goal_id)
+        || graph.nodes.len() >= policy.max_epochs
+        || objective_node_depth(graph, parent_goal_id) >= budget.max_child_depth
+    {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let normalized_blocker = failed_dimensions
+        .iter()
+        .map(|dimension| {
+            format!(
+                "{:?}:{}",
+                dimension.dimension,
+                normalize_blocker_text(&dimension.summary)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let blocker_signature = hash_text(&normalized_blocker);
+    let external_blocker = failed_dimensions
+        .iter()
+        .any(|dimension| blocker_is_external(&dimension.summary));
+    if external_blocker {
+        let occurrences = store
+            .read_objective_events(objective_id)?
+            .iter()
+            .filter(|event| {
+                event.kind == ObjectiveEventKind::FinalReviewBlockerPromoted
+                    && event
+                        .payload
+                        .get("blocker_signature")
+                        .and_then(Value::as_str)
+                        == Some(blocker_signature.as_str())
+            })
+            .count();
+        if occurrences >= MAX_EXTERNAL_BLOCKER_OCCURRENCES {
+            return Ok(FinalReviewBlockerDecision::NeedsUser);
+        }
+    }
+    let acceptance_signals = failed_dimensions
+        .iter()
+        .map(|dimension| {
+            format!(
+                "Resolve final review blocker for {:?}: {}",
+                dimension.dimension, dimension.summary
+            )
+        })
+        .collect::<Vec<_>>();
+    let child_request = objective_child_request(
+        &format!(
+            "Resolve the verified final-review blockers for goal {} before resuming the parent objective.",
+            outcome.goal_id
+        ),
+        &acceptance_signals,
+    );
+    let child_hash = hash_text(&normalize_objective(&child_request));
+    if graph.nodes.iter().any(|node| {
+        node.parent_goal_id.as_deref() == Some(parent_goal_id)
+            && node.parent_epoch_id.as_deref() == Some(outcome.epoch_id.as_str())
+            && node.parent_strategist_receipt_hash.as_deref()
+                == Some(outcome.final_verification_wave_hash.as_str())
+            && node.objective_hash == child_hash
+    }) {
+        return Ok(FinalReviewBlockerDecision::Promoted);
+    }
+    let (calls, tokens, cost, unknown_calls) = objective_budget_totals(store, graph)?;
+    if calls >= policy.max_calls
+        || tokens >= policy.max_tokens
+        || (policy.max_cost_micros != u64::MAX && cost >= policy.max_cost_micros)
+        || unknown_calls >= policy.max_unknown_usage_calls
+    {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let child_index = graph.nodes.len();
+    let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
+    let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
+    let child_session_id = format!("{root_session_id}.epoch{child_index}");
+    let reserved_calls = budget
+        .max_calls_per_epoch
+        .min(policy.max_calls.saturating_sub(calls));
+    let reserved_tokens = budget
+        .max_tokens_per_epoch
+        .min(policy.max_tokens.saturating_sub(tokens));
+    let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
+        u64::MAX
+    } else {
+        policy.max_cost_micros.saturating_sub(cost)
+    };
+    let reserved_unknown_calls = budget
+        .max_usage_unknown_calls
+        .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+    if reserved_calls == 0 || reserved_tokens == 0 || reserved_unknown_calls == 0 {
+        return Ok(FinalReviewBlockerDecision::NotPromoted);
+    }
+    let reservation_id = format!("epoch:{child_epoch_id}");
+    store.reserve_objective_epoch(
+        objective_lease,
+        &reservation_id,
+        &child_goal_id,
+        &child_epoch_id,
+        policy,
+        reserved_calls,
+        reserved_tokens,
+        reserved_cost_micros,
+        reserved_unknown_calls,
+        budget.max_premium_worker_calls,
+    )?;
+    if let Err(error) = store.append_objective_event(
+        objective_id,
+        &format!("child-dispatch-reserved:{child_epoch_id}"),
+        ObjectiveEventKind::ChildDispatchReserved,
+        json!({
+            "reservation_id": reservation_id,
+            "goal_id": child_goal_id,
+            "epoch_id": child_epoch_id,
+            "trigger": "final_review_blocker",
+            "blocker_signature": blocker_signature,
+        }),
+    ) {
+        store.release_objective_epoch(objective_lease, &reservation_id)?;
+        return Err(error);
+    }
+    if let Err(error) = graph.update_active_node(
+        parent_goal_id,
+        GoalStatus::Verifying,
+        Some(outcome.final_verification_wave_hash.clone()),
+        Some(outcome.final_report_path.to_string_lossy().to_string()),
+        None,
+        Some("verified final-review blocker awaiting child epoch".to_string()),
+    ) {
+        store.release_objective_epoch(objective_lease, &reservation_id)?;
+        return Err(error);
+    }
+    let child = match objective_goal_node(
+        &child_goal_id,
+        &child_epoch_id,
+        &child_session_id,
+        &child_request,
+        acceptance_signals,
+        Some(parent_goal_id.to_string()),
+        Some(outcome.epoch_id.clone()),
+        Some(outcome.final_verification_wave_hash.clone()),
+        GoalStatus::Planning,
+        None,
+        child_hash,
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            store.release_objective_epoch(objective_lease, &reservation_id)?;
+            return Err(error);
+        }
+    };
+    let attached = match graph.append_final_review_blocker_child(
+        parent_goal_id,
+        &outcome.epoch_id,
+        &outcome.final_verification_wave_hash,
+        child,
+    ) {
+        Ok(attached) => attached,
+        Err(error) => {
+            store.release_objective_epoch(objective_lease, &reservation_id)?;
+            return Err(error);
+        }
+    };
+    if !attached {
+        store.release_objective_epoch(objective_lease, &reservation_id)?;
+        return Ok(FinalReviewBlockerDecision::Promoted);
+    }
+    store.write_objective_graph(graph)?;
+    store.append_objective_event(
+        objective_id,
+        &format!("final-review-blocker:{blocker_signature}"),
+        ObjectiveEventKind::FinalReviewBlockerPromoted,
+        json!({
+            "parent_goal_id": parent_goal_id,
+            "parent_epoch_id": outcome.epoch_id,
+            "child_goal_id": child_goal_id,
+            "child_epoch_id": child_epoch_id,
+            "review_receipt_hash": outcome.final_verification_wave_hash,
+            "blocker_signature": blocker_signature,
+            "reviewer_execution_ids": reviewer_ids,
+        }),
+    )?;
+    store.append_objective_event(
+        objective_id,
+        &format!("goal-attached:{child_goal_id}"),
+        ObjectiveEventKind::GoalAttached,
+        json!({
+            "goal_id": child_goal_id,
+            "epoch_id": child_epoch_id,
+            "session_id": child_session_id,
+            "parent_goal_id": parent_goal_id,
+            "parent_epoch_id": outcome.epoch_id,
+            "parent_strategist_receipt_hash": outcome.final_verification_wave_hash,
+        }),
+    )?;
+    store.append_objective_event(
+        objective_id,
+        &format!("frontier-advanced:{child_goal_id}"),
+        ObjectiveEventKind::FrontierAdvanced,
+        json!({ "active_goal_id": child_goal_id }),
+    )?;
+    Ok(FinalReviewBlockerDecision::Promoted)
+}
+
+fn objective_node_depth(graph: &ObjectiveGraph, goal_id: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut current = goal_id.to_string();
+    let mut seen = HashSet::new();
+    while seen.insert(current.clone()) {
+        let Some(parent) = graph
+            .nodes
+            .iter()
+            .find(|node| node.goal_id == current)
+            .and_then(|node| node.parent_goal_id.clone())
+        else {
+            break;
+        };
+        depth = depth.saturating_add(1);
+        current = parent;
+    }
+    depth
 }
 
 fn sha256_file(path: &std::path::Path) -> Result<String> {
@@ -4612,6 +6021,8 @@ fn build_approved_plan_graph_inner(
     {
         return build_plan_graph(goal, scope, verification_commands);
     }
+    let mut intent_fold_artifact_path: Option<String> = None;
+    let mut intent_fold_observation_path: Option<String> = None;
     let intent_fold_receipt =
         if let Some(intent_fold_hook) = phase_runtime.intent_fold_hook.as_ref() {
             check_run_cancelled(cancellation_token)?;
@@ -4639,6 +6050,14 @@ fn build_approved_plan_graph_inner(
                 "intent-fold",
             )?;
             let submission = submission_result?;
+            intent_fold_observation_path = submission.repository_evidence_path.clone();
+            if phase_runtime.broker_factory.is_some() {
+                require_verified_repository_observation_for_goal(
+                    submission.repository_evidence_path.as_deref(),
+                    &goal.id,
+                    "planner",
+                )?;
+            }
             let parsed = IntentFoldVerdict::parse(&submission.raw_output)?;
             if parsed != submission.verdict {
                 bail!("IntentFold raw output does not match its typed verdict");
@@ -4653,11 +6072,12 @@ fn build_approved_plan_graph_inner(
                 timestamp(),
             )?;
             let receipt_json = serde_json::to_string_pretty(&receipt)?;
-            store.write_artifact(
+            let intent_fold_artifact = store.write_artifact(
                 &goal.id,
                 "intent-fold-receipt.json",
                 &format!("{receipt_json}\n"),
             )?;
+            intent_fold_artifact_path = Some(intent_fold_artifact.to_string_lossy().to_string());
             if receipt.verdict.decision == IntentFoldDecision::NeedsUser {
                 goal.status = GoalStatus::NeedsUser;
                 goal.summary = receipt.verdict.summary.clone();
@@ -4672,79 +6092,92 @@ fn build_approved_plan_graph_inner(
         } else {
             None
         };
-    let (mut plan, mut planner_raw_output, mut planner_identity, mut planner_artifact_path) =
-        if let Some(planner_hook) = phase_runtime.planner_hook.as_ref() {
-            let planner_decision = phase_runtime.routes.resolve(
-                &PhaseProfile::Planner,
-                &phase_runtime.inventory,
-                phase_runtime.current_model.as_ref(),
-            )?;
-            check_phase_terminal_state(&planner_decision)
-                .context("planner phase terminal state check failed")?;
-            let budget_reservation =
-                reserve_planning_phase_budget(goal, store, budget_context, "planner")?;
-            let submission_result = planner_hook(PlannerInput {
-                goal_id: goal.id.clone(),
-                request: goal.request.clone(),
-                scope: scope.clone(),
-                verification_commands: verification_commands.to_vec(),
-                route_decision: planner_decision.clone(),
-                intent_fold: intent_fold_receipt.clone(),
-            })
-            .context("planner hook failed before plan construction");
-            settle_planning_phase_budget(
-                goal,
-                store,
-                budget_context,
-                budget_reservation.as_deref(),
+    let (
+        mut plan,
+        mut planner_raw_output,
+        mut planner_identity,
+        mut planner_artifact_path,
+        mut planner_observation_path,
+    ) = if let Some(planner_hook) = phase_runtime.planner_hook.as_ref() {
+        let planner_decision = phase_runtime.routes.resolve(
+            &PhaseProfile::Planner,
+            &phase_runtime.inventory,
+            phase_runtime.current_model.as_ref(),
+        )?;
+        check_phase_terminal_state(&planner_decision)
+            .context("planner phase terminal state check failed")?;
+        let budget_reservation =
+            reserve_planning_phase_budget(goal, store, budget_context, "planner")?;
+        let submission_result = planner_hook(PlannerInput {
+            goal_id: goal.id.clone(),
+            request: goal.request.clone(),
+            scope: scope.clone(),
+            verification_commands: verification_commands.to_vec(),
+            route_decision: planner_decision.clone(),
+            intent_fold: intent_fold_receipt.clone(),
+        })
+        .context("planner hook failed before plan construction");
+        settle_planning_phase_budget(
+            goal,
+            store,
+            budget_context,
+            budget_reservation.as_deref(),
+            "planner",
+        )?;
+        let submission = submission_result?;
+        if phase_runtime.broker_factory.is_some() {
+            require_verified_repository_observation_for_goal(
+                submission.repository_evidence_path.as_deref(),
+                &goal.id,
                 "planner",
             )?;
-            let submission = submission_result?;
-            let parsed = parse_planner_draft(&submission.raw_output)
-                .context("planner hook raw output is not a PlanGraphDraft")?;
-            if parsed != submission.draft {
-                bail!("planner hook raw output does not match its typed draft");
-            }
-            validate_phase_execution_identity(&planner_decision, &submission.planner)?;
-            if let Some(intent_fold) = intent_fold_receipt.as_ref()
-                && !submission.planner.is_independent_from(&intent_fold.analyst)
-            {
-                bail!("planner must use a fresh session after IntentFold");
-            }
-            let provider_id = submission
-                .planner
-                .provider_id
-                .clone()
-                .context("planner hook is missing provider identity")?;
-            let model_id = submission
-                .planner
-                .model_id
-                .clone()
-                .context("planner hook is missing model identity")?;
-            let plan = PlanGraph::seal(
-                &goal.id,
-                1,
-                PlanSource::PlannerModel,
-                Some(PlannerReceipt {
-                    provider_id,
-                    model_id,
-                    session_id: submission.planner.actual_session_id.clone(),
-                }),
-                submission.draft,
-            )?;
-            goal.coordinator_brief = Some(submission.raw_output.clone());
-            (
-                plan,
-                submission.raw_output,
-                submission.planner,
-                submission.artifact_path,
-            )
-        } else {
-            let plan = build_plan_graph(goal, scope, verification_commands)?;
-            let planner_raw_output = planner_raw_output(goal, &plan)?;
-            let planner_identity = planner_identity_for_plan(&plan, phase_runtime.planner.clone())?;
-            (plan, planner_raw_output, planner_identity, None)
-        };
+        }
+        let parsed = parse_planner_draft(&submission.raw_output)
+            .context("planner hook raw output is not a PlanGraphDraft")?;
+        if parsed != submission.draft {
+            bail!("planner hook raw output does not match its typed draft");
+        }
+        validate_phase_execution_identity(&planner_decision, &submission.planner)?;
+        if let Some(intent_fold) = intent_fold_receipt.as_ref()
+            && !submission.planner.is_independent_from(&intent_fold.analyst)
+        {
+            bail!("planner must use a fresh session after IntentFold");
+        }
+        let provider_id = submission
+            .planner
+            .provider_id
+            .clone()
+            .context("planner hook is missing provider identity")?;
+        let model_id = submission
+            .planner
+            .model_id
+            .clone()
+            .context("planner hook is missing model identity")?;
+        let plan = PlanGraph::seal(
+            &goal.id,
+            1,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id,
+                model_id,
+                session_id: submission.planner.actual_session_id.clone(),
+            }),
+            submission.draft,
+        )?;
+        goal.coordinator_brief = Some(submission.raw_output.clone());
+        (
+            plan,
+            submission.raw_output,
+            submission.planner,
+            submission.artifact_path,
+            submission.repository_evidence_path,
+        )
+    } else {
+        let plan = build_plan_graph(goal, scope, verification_commands)?;
+        let planner_raw_output = planner_raw_output(goal, &plan)?;
+        let planner_identity = planner_identity_for_plan(&plan, phase_runtime.planner.clone())?;
+        (plan, planner_raw_output, planner_identity, None, None)
+    };
     if !phase_runtime.require_plan_approval {
         return Ok(plan);
     }
@@ -4906,6 +6339,8 @@ fn build_approved_plan_graph_inner(
             reserve_planning_phase_budget(goal, store, budget_context, &critic_budget_key)?;
         let submission_result = run_phase_via_broker(
             broker,
+            store,
+            phase_runtime.direct_model_usage_provider.as_ref(),
             broker_factory,
             &critic_decision,
             &goal.id,
@@ -4934,6 +6369,14 @@ fn build_approved_plan_graph_inner(
         let submission = submission_result?;
         check_run_cancelled(cancellation_token)?;
         validate_phase_execution_identity(&critic_decision, &submission.reviewer)?;
+        if broker_factory.is_some() {
+            require_verified_repository_observation(
+                store,
+                &plan,
+                "plan_critic",
+                submission.repository_evidence_path.as_deref(),
+            )?;
+        }
         if seen_phase_identities
             .iter()
             .any(|seen| !submission.reviewer.is_independent_from(seen))
@@ -4985,7 +6428,15 @@ fn build_approved_plan_graph_inner(
 
         match critic_receipt.verdict.decision {
             PlanCriticDecision::Approve => {
-                if plan.draft.tasks.len() > 1 {
+                // OMO's Momus/Oracle gate is role-based, not task-count-based:
+                // production ACP runtimes must obtain a fresh Oracle receipt
+                // even for a one-node plan. Legacy test runtimes without an
+                // Oracle route retain the historical multi-node fallback so
+                // their deterministic fixtures stay compatible.
+                if plan.draft.tasks.len() > 1
+                    || phase_runtime.oracle_hook.is_some()
+                    || phase_runtime.broker_factory.is_some()
+                {
                     let oracle_decision = phase_runtime.routes.resolve(
                         &PhaseProfile::PlanCritic,
                         &phase_runtime.inventory,
@@ -5015,9 +6466,17 @@ fn build_approved_plan_graph_inner(
                         budget_context,
                         &oracle_budget_key,
                     )?;
-                    let oracle_hook = phase_runtime.oracle_hook.as_ref().unwrap_or(critic_hook);
+                    let oracle_hook = match phase_runtime.oracle_hook.as_ref() {
+                        Some(oracle_hook) => oracle_hook,
+                        None if phase_runtime.broker_factory.is_some() => {
+                            bail!("production plan approval requires an independent Oracle hook");
+                        }
+                        None => critic_hook,
+                    };
                     let oracle_submission_result = run_phase_via_broker(
                         phase_runtime.broker.as_deref(),
+                        store,
+                        phase_runtime.direct_model_usage_provider.as_ref(),
                         phase_runtime.broker_factory.as_deref(),
                         &oracle_decision,
                         &goal.id,
@@ -5048,6 +6507,14 @@ fn build_approved_plan_graph_inner(
                         &oracle_decision,
                         &oracle_submission.reviewer,
                     )?;
+                    if phase_runtime.broker_factory.is_some() {
+                        require_verified_repository_observation(
+                            store,
+                            &plan,
+                            "plan_critic",
+                            oracle_submission.repository_evidence_path.as_deref(),
+                        )?;
+                    }
                     if seen_phase_identities
                         .iter()
                         .any(|seen| !oracle_submission.reviewer.is_independent_from(seen))
@@ -5117,6 +6584,27 @@ fn build_approved_plan_graph_inner(
                         oracle_ordinal,
                         &oracle_route_receipt,
                     )?;
+                    let review_epoch_id = budget_context
+                        .map(|context| context.1)
+                        .unwrap_or("planning");
+                    let review_epoch_bundle_path = write_review_epoch_bundle(
+                        store,
+                        &goal.id,
+                        review_epoch_id,
+                        &plan,
+                        intent_fold_receipt.as_ref(),
+                        intent_fold_artifact_path.as_deref(),
+                        intent_fold_observation_path.clone(),
+                        &planner_receipt,
+                        &planner_receipt_path,
+                        planner_observation_path.clone(),
+                        &critic_receipt,
+                        &critic_receipt_path,
+                        submission.repository_evidence_path.clone(),
+                        &oracle_receipt,
+                        &oracle_receipt_path,
+                        oracle_submission.repository_evidence_path.clone(),
+                    )?;
                     append_event(
                         store,
                         event_sink,
@@ -5137,6 +6625,7 @@ fn build_approved_plan_graph_inner(
                                 "receipt_path": oracle_receipt_path.to_string_lossy(),
                                 "route_decision_path": oracle_decision_path.to_string_lossy(),
                                 "route_receipt_path": oracle_route_receipt_path.to_string_lossy(),
+                                "review_epoch_bundle_path": review_epoch_bundle_path.to_string_lossy(),
                             }),
                         ),
                     )?;
@@ -5272,6 +6761,8 @@ fn build_approved_plan_graph_inner(
                 )?;
                 let revision_result = run_phase_via_broker(
                     broker,
+                    store,
+                    phase_runtime.direct_model_usage_provider.as_ref(),
                     broker_factory,
                     &planner_decision,
                     &goal.id,
@@ -5341,6 +6832,7 @@ fn build_approved_plan_graph_inner(
                 planner_raw_output = revision.raw_output;
                 planner_identity = revision.planner;
                 planner_artifact_path = revision.artifact_path;
+                planner_observation_path = None;
                 seen_phase_identities.push(planner_identity.clone());
                 revisions_performed += 1;
             }
@@ -5461,25 +6953,36 @@ fn phase_route_receipt_for_identity(
             _ => bail!("unsupported trusted planning phase backend/model binding"),
         };
     let worker_binding = match decision.candidate.backend {
-        PhaseBackend::Worker(worker_kind) => {
+        PhaseBackend::Worker(_worker_kind) => {
             let task_id = worker_task_id.context("worker phase receipt is missing its task id")?;
-            let artifact_path = worker_artifact_path
-                .context("worker phase receipt is missing its terminal artifact")?;
-            let artifact_bytes = std::fs::read(artifact_path).with_context(|| {
-                format!("failed to read worker phase artifact at {artifact_path}")
+            let task_record_path = worker_artifact_path
+                .context("worker phase receipt is missing its task-record evidence")?;
+            let task_record_bytes = std::fs::read(task_record_path).with_context(|| {
+                format!("failed to read worker phase task record at {task_record_path}")
             })?;
-            let worker_model = match &decision.candidate.model {
-                PhaseModelBinding::BackendDeclared(model) => Some(model.clone()),
-                PhaseModelBinding::None => None,
-                _ => None,
-            };
+            let task_record: TaskRecord =
+                serde_json::from_slice(&task_record_bytes).with_context(|| {
+                    format!("failed to parse worker task record at {task_record_path}")
+                })?;
+            if task_record.task_id != task_id {
+                bail!("worker phase task-record evidence belongs to another task");
+            }
+            let last_attempt = task_record
+                .attempts
+                .last()
+                .context("worker phase task record has no attempts")?;
+            let actual_worker_kind = WorkerKind::parse(&last_attempt.worker_kind)
+                .context("worker phase task record has an unknown worker kind")?;
+            let actual_category = WorkerCategory::parse(&last_attempt.worker_category)
+                .context("worker phase task record has an unknown worker category")?;
             Some((
                 task_id.to_string(),
-                worker_kind,
-                decision.category,
-                worker_model,
-                artifact_path.to_string(),
-                format!("{:x}", Sha256::digest(artifact_bytes)),
+                actual_worker_kind,
+                actual_category,
+                last_attempt.worker_model.clone(),
+                last_attempt.route_reason.clone(),
+                task_record_path.to_string(),
+                format!("{:x}", Sha256::digest(task_record_bytes)),
             ))
         }
         _ => None,
@@ -5494,27 +6997,27 @@ fn phase_route_receipt_for_identity(
         plan_hash: Some(plan.plan_hash.clone()),
         task_id: worker_binding
             .as_ref()
-            .map(|(task_id, _, _, _, _, _)| task_id.clone()),
+            .map(|(task_id, _, _, _, _, _, _)| task_id.clone()),
         worker_session_id: identity.actual_session_id.clone(),
         applied_model,
         actual_worker_kind: worker_binding
             .as_ref()
-            .map(|(_, worker_kind, _, _, _, _)| *worker_kind),
+            .map(|(_, worker_kind, _, _, _, _, _)| *worker_kind),
         actual_category: worker_binding
             .as_ref()
-            .map(|(_, _, category, _, _, _)| *category),
+            .map(|(_, _, category, _, _, _, _)| *category),
         actual_worker_model: worker_binding
             .as_ref()
-            .and_then(|(_, _, _, model, _, _)| model.clone()),
+            .and_then(|(_, _, _, model, _, _, _)| model.clone()),
         actual_route_reason: worker_binding
             .as_ref()
-            .map(|_| "phase worker session".to_string()),
+            .map(|(_, _, _, _, route_reason, _, _)| route_reason.clone()),
         task_record_path: worker_binding
             .as_ref()
-            .map(|(_, _, _, _, path, _)| path.clone()),
+            .map(|(_, _, _, _, _, path, _)| path.clone()),
         task_record_sha256: worker_binding
             .as_ref()
-            .map(|(_, _, _, _, _, hash)| hash.clone()),
+            .map(|(_, _, _, _, _, _, hash)| hash.clone()),
         binding_status,
         receipt_hash: String::new(),
     }
@@ -5527,6 +7030,174 @@ fn worker_task_id_from_artifact_path(path: Option<&str>) -> Option<String> {
         .file_name()?
         .to_str()
         .map(ToString::to_string)
+}
+
+fn require_verified_repository_observation(
+    _store: &StateStore,
+    plan: &PlanGraph,
+    role: &str,
+    path: Option<&str>,
+) -> Result<()> {
+    let path = path.context(format!(
+        "{role} review did not produce a repository observation receipt"
+    ))?;
+    let contents = std_fs::read_to_string(path)
+        .with_context(|| format!("failed to read repository observation receipt {path}"))?;
+    let receipt: crate::state::RepositoryObservationReceipt = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse repository observation receipt {path}"))?;
+    receipt.validate()?;
+    if receipt.goal_id != plan.goal_id
+        || receipt.plan_id != plan.plan_id
+        || receipt.plan_revision != plan.revision
+        || receipt.plan_hash != plan.plan_hash
+    {
+        bail!("{role} repository observation receipt is bound to a different plan revision");
+    }
+    if receipt.role != role && !receipt.role.starts_with(&format!("{role}-")) {
+        bail!("repository observation receipt role is not {role}");
+    }
+    if receipt.status != RepositoryObservationStatus::Verified {
+        bail!("{role} repository observation is unverified");
+    }
+    Ok(())
+}
+
+fn require_verified_repository_observation_for_goal(
+    path: Option<&str>,
+    goal_id: &str,
+    role: &str,
+) -> Result<()> {
+    let path = path.context(format!(
+        "{role} phase did not produce a repository observation receipt"
+    ))?;
+    let contents = std_fs::read_to_string(path)
+        .with_context(|| format!("failed to read repository observation receipt {path}"))?;
+    let receipt: crate::state::RepositoryObservationReceipt = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse repository observation receipt {path}"))?;
+    receipt.validate()?;
+    if receipt.goal_id != goal_id {
+        bail!("{role} repository observation receipt is bound to a different goal");
+    }
+    if receipt.role != role && !receipt.role.starts_with(&format!("{role}-")) {
+        bail!("repository observation receipt role is not {role}");
+    }
+    if receipt.status != RepositoryObservationStatus::Verified {
+        bail!("{role} repository observation is unverified");
+    }
+    Ok(())
+}
+
+fn review_epoch_role_evidence(
+    store: &StateStore,
+    goal_id: &str,
+    role: &str,
+    identity: &PhaseExecutionIdentity,
+    receipt_hash: String,
+    receipt_path: &std::path::Path,
+    observation_path: Option<String>,
+) -> Result<ReviewEpochRoleEvidence> {
+    let usage = store
+        .read_model_call_ledger(goal_id)?
+        .into_iter()
+        .rev()
+        .find(|entry| {
+            identity
+                .actual_session_id
+                .as_deref()
+                .is_some_and(|session_id| entry.session_id == session_id)
+        });
+    let usage_known = usage.as_ref().is_some_and(|entry| {
+        entry.requested_tokens.is_some()
+            || entry.actual_tokens.is_some()
+            || entry.cost_micros.is_some()
+            || entry.duration_ms.is_some()
+            || entry.cache_hit.is_some()
+    });
+    Ok(ReviewEpochRoleEvidence {
+        role: role.to_string(),
+        execution_id: identity.execution_id.clone(),
+        phase_session_id: identity.phase_session_id.clone(),
+        actual_session_id: identity.actual_session_id.clone(),
+        receipt_hash,
+        receipt_path: receipt_path.to_string_lossy().to_string(),
+        observation_path,
+        requested_tokens: usage.as_ref().and_then(|entry| entry.requested_tokens),
+        actual_tokens: usage.as_ref().and_then(|entry| entry.actual_tokens),
+        cost_micros: usage.as_ref().and_then(|entry| entry.cost_micros),
+        duration_ms: usage.as_ref().and_then(|entry| entry.duration_ms),
+        cache_hit: usage.as_ref().and_then(|entry| entry.cache_hit),
+        unknown_reason: (!usage_known).then(|| {
+            usage
+                .as_ref()
+                .and_then(|entry| entry.unavailable_reason.clone())
+                .unwrap_or_else(|| "review role usage was not reported by the provider".to_string())
+        }),
+    })
+}
+
+fn write_review_epoch_bundle(
+    store: &StateStore,
+    goal_id: &str,
+    epoch_id: &str,
+    plan: &PlanGraph,
+    intent_fold: Option<&crate::plan_review::IntentFoldReceipt>,
+    intent_fold_artifact_path: Option<&str>,
+    intent_fold_observation_path: Option<String>,
+    planner_receipt: &PlannerExecutionReceipt,
+    planner_receipt_path: &std::path::Path,
+    planner_observation_path: Option<String>,
+    critic_receipt: &PlanCriticReceipt,
+    critic_receipt_path: &std::path::Path,
+    critic_observation_path: Option<String>,
+    oracle_receipt: &PlanCriticReceipt,
+    oracle_receipt_path: &std::path::Path,
+    oracle_observation_path: Option<String>,
+) -> Result<std::path::PathBuf> {
+    let mut roles = vec![
+        review_epoch_role_evidence(
+            store,
+            goal_id,
+            "planner",
+            &planner_receipt.identity,
+            planner_receipt.receipt_hash.clone(),
+            planner_receipt_path,
+            planner_observation_path,
+        )?,
+        review_epoch_role_evidence(
+            store,
+            goal_id,
+            "momus",
+            &critic_receipt.reviewer,
+            critic_receipt.receipt_hash.clone(),
+            critic_receipt_path,
+            critic_observation_path,
+        )?,
+        review_epoch_role_evidence(
+            store,
+            goal_id,
+            "oracle",
+            &oracle_receipt.reviewer,
+            oracle_receipt.receipt_hash.clone(),
+            oracle_receipt_path,
+            oracle_observation_path,
+        )?,
+    ];
+    if let Some(intent_fold) = intent_fold {
+        let artifact_path = intent_fold_artifact_path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("intent-fold-receipt.json"));
+        roles.push(review_epoch_role_evidence(
+            store,
+            goal_id,
+            "metis",
+            &intent_fold.analyst,
+            intent_fold.receipt_hash.clone(),
+            &artifact_path,
+            intent_fold_observation_path,
+        )?);
+    }
+    let bundle = ReviewEpochBundle::seal(goal_id, epoch_id, plan, roles, intent_fold.is_some())?;
+    store.write_review_epoch_bundle(&bundle)
 }
 
 fn phase_worker_evidence_path(
@@ -5581,6 +7252,129 @@ fn worker_phase_for_route_hint(preferred: &PhaseProfile, route_hint: Option<&str
             PhaseProfile::ReviewerTask | PhaseProfile::ReviewerFinal => PhaseProfile::ReviewerFinal,
             _ => PhaseProfile::ExecutorQuick,
         },
+    }
+}
+
+fn persist_live_plan_node_session_binding(
+    store: &StateStore,
+    goal_id: &str,
+    epoch_id: &str,
+    plan: &PlanGraph,
+    plan_task_id: &str,
+    attempt: usize,
+    managed_worker_task_id: &str,
+    selected_route: &SelectedWorkerRoute<'_>,
+    route_receipt_hash: &str,
+) -> Result<bool> {
+    let task_record_path = store
+        .worker_dir(managed_worker_task_id)
+        .join("task-record.json");
+    if !task_record_path.is_file() {
+        return Ok(false);
+    }
+    let record: TaskRecord = serde_json::from_str(&std_fs::read_to_string(&task_record_path)?)
+        .with_context(|| {
+            format!(
+                "failed to parse live task record at {}",
+                task_record_path.display()
+            )
+        })?;
+    let Some(session_id) = record.session_id else {
+        return Ok(false);
+    };
+    let provider_id = selected_route
+        .worker_model
+        .and_then(|model| model.split_once('/'))
+        .map(|(provider, _)| provider.to_string());
+    let binding = crate::state::PlanNodeSessionBinding {
+        schema_version: crate::state::PLAN_NODE_SESSION_BINDING_SCHEMA_VERSION,
+        binding_id: format!("{goal_id}:{epoch_id}:{plan_task_id}:{attempt}"),
+        goal_id: goal_id.to_string(),
+        epoch_id: epoch_id.to_string(),
+        plan_id: plan.plan_id.clone(),
+        plan_revision: plan.revision,
+        plan_hash: plan.plan_hash.clone(),
+        task_id: plan_task_id.to_string(),
+        attempt,
+        worker_task_id: managed_worker_task_id.to_string(),
+        worker_kind: selected_route.worker_kind.as_str().to_string(),
+        provider_id,
+        model_id: selected_route.worker_model.map(str::to_string),
+        session_id,
+        capability_fingerprint: "unknown-at-start".to_string(),
+        route_receipt_hash: Some(route_receipt_hash.to_string()),
+        status: crate::state::PlanNodeSessionBindingStatus::Active,
+        supersedes_binding_id: (attempt > 1).then(|| {
+            format!(
+                "{goal_id}:{epoch_id}:{plan_task_id}:{}",
+                attempt.saturating_sub(1)
+            )
+        }),
+        created_at: timestamp(),
+        updated_at: timestamp(),
+    };
+    store.write_plan_node_session_binding(&binding)?;
+    Ok(true)
+}
+
+fn try_resume_plan_session(
+    task_manager: &SharedTaskManager,
+    store: &StateStore,
+    goal_id: &str,
+    epoch_id: &str,
+    plan: &PlanGraph,
+    plan_task_id: &str,
+    attempt: usize,
+    selected_route: &SelectedWorkerRoute<'_>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    let previous_attempt = attempt.saturating_sub(1);
+    if previous_attempt == 0 {
+        return Ok(None);
+    }
+    let Some(binding) =
+        store.read_plan_node_session_binding(goal_id, epoch_id, plan_task_id, previous_attempt)?
+    else {
+        return Ok(None);
+    };
+    if binding.status != crate::state::PlanNodeSessionBindingStatus::Active
+        || binding.plan_id != plan.plan_id
+        || binding.plan_revision != plan.revision
+        || binding.plan_hash != plan.plan_hash
+        || binding.worker_kind != selected_route.worker_kind.as_str()
+        || binding.model_id != selected_route.worker_model.map(str::to_string)
+    {
+        return Ok(None);
+    }
+    let previous_record = match task_manager
+        .lock()
+        .map_err(|_| anyhow::anyhow!("task manager mutex poisoned while selecting session resume"))?
+        .list()
+        .into_iter()
+        .find(|record| record.task_id == binding.worker_task_id)
+    {
+        Some(record) => record,
+        None => return Ok(None),
+    };
+    if previous_record.session_id.as_deref() != Some(binding.session_id.as_str())
+        || previous_record.worker_kind != binding.worker_kind
+        || previous_record.worker_model != binding.model_id
+    {
+        return Ok(None);
+    }
+    let outcome = task_manager
+        .lock()
+        .map_err(|_| {
+            anyhow::anyhow!("task manager mutex poisoned while sending session follow-up")
+        })?
+        .send_follow_up_task(&binding.worker_task_id, prompt.to_string())?;
+    if matches!(
+        outcome,
+        SendOutcome::Sent(_) | SendOutcome::Queued(_) | SendOutcome::Revive(_)
+    ) {
+        Ok(Some(binding.worker_task_id))
+    } else {
+        Ok(None)
     }
 }
 
@@ -6096,6 +7890,113 @@ fn final_verification_wave_markdown(receipt: &FinalVerificationWaveReceipt) -> S
     markdown
 }
 
+fn persist_plan_criterion_evidence(
+    store: &StateStore,
+    workspace: &Path,
+    plan: &PlanGraph,
+    ledger: &mut PlanNodeRunLedger,
+) -> Result<()> {
+    let ledger_goal_id = ledger.goal_id.clone();
+    for task in &plan.draft.tasks {
+        let node = ledger
+            .nodes
+            .iter_mut()
+            .find(|node| node.task_id == task.task_id)
+            .with_context(|| format!("missing PlanNodeRun for criterion task {}", task.task_id))?;
+        if node.attempt == 0 {
+            continue;
+        }
+        let node_attempt = node.attempt;
+        let mut candidates = node.green_evidence_paths.clone();
+        if let Some(review_path) = node.review_evidence_path.clone() {
+            candidates.insert(0, review_path);
+        }
+        for criterion in &task.completion_predicates {
+            let normalized = criterion.to_ascii_lowercase();
+            let candidate = candidates.iter().find(|path| {
+                let path_text = path.to_ascii_lowercase();
+                if normalized.contains("review") {
+                    path_text.contains("review")
+                } else if normalized.contains("test")
+                    || normalized.contains("verification")
+                    || normalized.contains("qa")
+                {
+                    path_text.contains("green")
+                        || path_text.contains("verification")
+                        || path_text.contains("test")
+                } else {
+                    true
+                }
+            });
+            let verified_artifact = candidate.cloned().and_then(|candidate| {
+                let path = PathBuf::from(&candidate);
+                let absolute = if path.is_absolute() {
+                    path
+                } else {
+                    workspace.join(path)
+                };
+                let canonical_workspace = workspace.canonicalize().ok()?;
+                let canonical_artifact = absolute.canonicalize().ok()?;
+                let relative = canonical_artifact
+                    .strip_prefix(&canonical_workspace)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative.is_empty() || relative == ".." || relative.starts_with("../") {
+                    return None;
+                }
+                Some((relative, canonical_artifact))
+            });
+            if let Some((relative, canonical_artifact)) = verified_artifact {
+                node.record_criterion_evidence(
+                    criterion,
+                    CriterionEvidenceStatus::Pass,
+                    node_attempt,
+                    &relative,
+                    &sha256_file(&canonical_artifact)?,
+                )?;
+            } else {
+                let status = if matches!(
+                    node.status,
+                    PlanNodeRunStatus::Failed | PlanNodeRunStatus::Cancelled
+                ) {
+                    CriterionEvidenceStatus::Fail
+                } else {
+                    CriterionEvidenceStatus::Blocked
+                };
+                let marker_id = hash_text(&format!("{}:{node_attempt}:{criterion}", task.task_id));
+                let marker_path = store.write_artifact(
+                    &ledger_goal_id,
+                    &format!("criterion-{marker_id}.json"),
+                    &json!({
+                        "task_id": task.task_id,
+                        "criterion": criterion,
+                        "status": status.clone(),
+                        "reason": "no verified artifact matched this completion predicate",
+                    })
+                    .to_string(),
+                )?;
+                let canonical_workspace = workspace.canonicalize()?;
+                let canonical_marker = marker_path.canonicalize()?;
+                let relative = canonical_marker
+                    .strip_prefix(&canonical_workspace)
+                    .context("criterion marker escaped workspace")?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                node.record_criterion_evidence(
+                    criterion,
+                    status,
+                    node_attempt,
+                    &relative,
+                    &sha256_file(&canonical_marker)?,
+                )?;
+            }
+        }
+    }
+    store.write_plan_node_runs(ledger)?;
+    Ok(())
+}
+
 fn build_final_verification_wave(
     goal_id: &str,
     epoch_id: &str,
@@ -6106,6 +8007,7 @@ fn build_final_verification_wave(
     verification_results: &[ShellCommandResult],
     verification_path: Option<&std::path::Path>,
     scope_check: &crate::tools::ScopeCheck,
+    criteria_complete: bool,
 ) -> Result<FinalVerificationWaveReceipt> {
     let all_nodes_completed = node_runs
         .nodes
@@ -6152,7 +8054,8 @@ fn build_final_verification_wave(
     let dimensions = vec![
         FinalVerificationResult {
             dimension: FinalVerificationDimension::PlanCompliance,
-            passed: all_nodes_completed
+            passed: criteria_complete
+                && all_nodes_completed
                 && node_evidence.len() >= node_runs.nodes.len()
                 && (node_runs.nodes.len() == 1 || node_reviewer_ids.len() >= node_runs.nodes.len()),
             summary: "Every PlanGraph node has terminal execution, GREEN, and review evidence."
@@ -6510,6 +8413,24 @@ fn check_run_cancelled(cancellation_token: Option<&CancellationToken>) -> Result
         bail!("Gear run cancelled");
     }
     Ok(())
+}
+
+fn prompt_settle_event_for_guard_reason(reason: &str) -> PromptSettleEvent {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("cancel") {
+        PromptSettleEvent::UserStopped
+    } else if reason.contains("context") || reason.contains("token") || reason.contains("compact") {
+        PromptSettleEvent::ContextPressure
+    } else if reason.contains("background")
+        || reason.contains("question")
+        || reason.contains("continuation")
+        || reason.contains("flight")
+        || reason.contains("recover")
+    {
+        PromptSettleEvent::Busy
+    } else {
+        PromptSettleEvent::Error
+    }
 }
 
 fn update_verification_task(
@@ -9177,6 +11098,7 @@ mod tests {
             verdict,
             raw_output,
             artifact_path: None,
+            repository_evidence_path: None,
         })
     }
 
@@ -9203,6 +11125,7 @@ mod tests {
             max_plan_revisions: 2,
             broker: None,
             broker_factory: None,
+            direct_model_usage_provider: None,
         }
     }
 
@@ -9233,6 +11156,7 @@ mod tests {
                 draft,
                 planner: phase_identity("crash_matrix_planner"),
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         }));
         phase_runtime.strategist_next_goal_hook = Some({
@@ -9289,6 +11213,7 @@ mod tests {
                 draft,
                 planner: phase_identity("repro_planner"),
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         }));
         phase_runtime.strategist_next_goal_hook =
@@ -9487,6 +11412,7 @@ mod tests {
                     actual_session_id: Some("opencode_planner_session".to_string()),
                 },
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         });
         let strategist_hook: StrategistNextGoalHook = Arc::new(|input| {
@@ -9537,6 +11463,7 @@ mod tests {
             max_plan_revisions: 2,
             broker: None,
             broker_factory: None,
+            direct_model_usage_provider: None,
         };
         let epoch_id = "epoch-planner-test";
         let lease = store.acquire_goal_run_lease(
@@ -9646,6 +11573,7 @@ mod tests {
                     draft,
                     planner: phase_identity(&format!("planner_{call}")),
                     artifact_path: None,
+                    repository_evidence_path: None,
                 })
             })
         });
@@ -9787,6 +11715,7 @@ mod tests {
                 draft,
                 planner: phase_identity("limited_planner"),
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         }));
         phase_runtime.strategist_next_goal_hook =
@@ -10043,6 +11972,7 @@ mod tests {
                     actual_session_id: Some("intent_fold_session".to_string()),
                 },
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         });
         let phase_runtime = PhaseRuntime {
@@ -10064,6 +11994,7 @@ mod tests {
             max_plan_revisions: 2,
             broker: None,
             broker_factory: None,
+            direct_model_usage_provider: None,
         };
 
         let error = build_approved_plan_graph(
@@ -10136,6 +12067,66 @@ mod tests {
         )?;
         assert!(store.read_plan_graph(&goal.id).is_err());
         assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn single_task_plan_runs_independent_oracle_when_configured() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Require an independent review for one task",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        assert_eq!(draft.tasks.len(), 1);
+        let mut goal = planning_goal(&draft)?;
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let oracle_calls = Arc::new(AtomicUsize::new(0));
+        let oracle_hook: PlanCriticHook = {
+            let oracle_calls = oracle_calls.clone();
+            Arc::new(move |input| {
+                oracle_calls.fetch_add(1, Ordering::SeqCst);
+                plan_critic_submission(&input, 2, PlanCriticDecision::Approve)
+            })
+        };
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.oracle_hook = Some(oracle_hook);
+        store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
+        let plan = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-single-task-dual-review",
+            &None,
+            None,
+            &phase_runtime,
+        )?;
+        let approval = store
+            .read_plan_approval_state(&goal.id)?
+            .context("approval state missing")?;
+        assert_eq!(approval.status, PlanApprovalStatus::Approved);
+        assert!(approval.critic_receipt_hash.is_some());
+        assert!(approval.secondary_critic_receipt_hash.is_some());
+        assert_eq!(oracle_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(plan.draft.tasks.len(), 1);
+        let bundle = store
+            .read_review_epoch_bundle(&goal.id, plan.revision)?
+            .context("review epoch bundle missing")?;
+        assert!(bundle.complete);
+        assert_eq!(
+            bundle
+                .roles
+                .iter()
+                .map(|role| role.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["momus", "oracle", "planner"]
+        );
         Ok(())
     }
 
@@ -10559,6 +12550,26 @@ mod tests {
         assert!(budget_ledger.reservations.iter().all(|reservation| {
             reservation.status == crate::state::BudgetReservationStatus::Settled
         }));
+        let task_route_receipt = state_store
+            .read_task_route_decision_receipt(&outcome.goal_id, &outcome.epoch_id, "task_003", 1)?
+            .context("worker task route decision receipt should be persisted")?;
+        assert_eq!(task_route_receipt.task_id, "task_003");
+        let expected_reservation = format!("{}.worker.1", outcome.epoch_id);
+        assert_eq!(
+            task_route_receipt.budget_reservation_id.as_deref(),
+            Some(expected_reservation.as_str())
+        );
+        if let Some(session_binding) = state_store.read_plan_node_session_binding(
+            &outcome.goal_id,
+            &outcome.epoch_id,
+            "task_003",
+            1,
+        )? {
+            assert_eq!(
+                session_binding.route_receipt_hash.as_deref(),
+                Some(task_route_receipt.receipt_hash.as_str())
+            );
+        }
         assert!(outcome.final_report_path.exists());
         assert!(outcome.events_path.exists());
         assert!(outcome.artifacts_root.join("spec.md").exists());
@@ -10730,6 +12741,154 @@ mod tests {
                 .iter()
                 .any(|event| event.contains("Goal completed after 2 Gear iteration(s)"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_plan_wave_dispatches_disjoint_workers_before_barrier_reduction() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let scope = Scope::new(
+            vec!["a.txt".to_string(), "b.txt".to_string()],
+            vec![".git".to_string()],
+            2,
+        );
+        let mut draft = deterministic_fallback_draft(
+            "Run two independent workers",
+            &scope,
+            &["true".to_string()],
+        );
+        draft.tasks[0].task_id = "task_a".to_string();
+        draft.tasks[0].scope.allowed_files = vec!["a.txt".to_string()];
+        draft.tasks[0].scope.write_scope = vec!["a.txt".to_string()];
+        draft.tasks[0].scope.max_files_changed = 1;
+        draft.tasks[0].parallel_wave = 0;
+        let mut second = draft.tasks[0].clone();
+        second.task_id = "task_b".to_string();
+        second.scope.allowed_files = vec!["b.txt".to_string()];
+        second.scope.write_scope = vec!["b.txt".to_string()];
+        draft.tasks.push(second);
+
+        let critic_count = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook = {
+            let critic_count = critic_count.clone();
+            Arc::new(move |input| {
+                let suffix = critic_count.fetch_add(1, Ordering::SeqCst) + 1;
+                plan_critic_submission(&input, suffix, PlanCriticDecision::Approve)
+            })
+        };
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        for profile in &mut phase_runtime.routes.profiles {
+            if matches!(
+                profile.phase,
+                PhaseProfile::ExecutorQuick
+                    | PhaseProfile::ExecutorDeep
+                    | PhaseProfile::ReviewerFinal
+            ) {
+                profile.candidates = vec![crate::phase_routing::PhaseRouteCandidate {
+                    backend: PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                    model: PhaseModelBinding::BackendDeclared("opencode/test-model".to_string()),
+                    command: None,
+                }];
+                profile.source = crate::phase_routing::PhaseRouteSource::BuiltIn;
+            }
+        }
+        let planner_draft = draft.clone();
+        phase_runtime.planner_hook = Some(Arc::new(move |_input: PlannerInput| {
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&planner_draft)?,
+                draft: planner_draft.clone(),
+                planner: phase_identity("parallel_planner"),
+                artifact_path: None,
+                repository_evidence_path: None,
+            })
+        }));
+
+        let mut worker = objective_worker_for_test();
+        worker.worker_kind = WorkerKind::OpencodeSession;
+        worker.worker_model = Some("opencode/test-model".to_string());
+        let worker_command = worker
+            .worker_command
+            .take()
+            .context("test worker command should be configured")?;
+        worker.worker_command = Some(worker_command.replacen("sh -c '", "sh -c 'sleep 0.3; ", 1));
+        worker.max_parallel_workers = 2;
+        worker.max_parallel_per_key = 2;
+        let outcome = Orchestrator::run_with_phase_runtime(
+            RunOptions {
+                request: "Run two independent workers".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["true".to_string()],
+                worker,
+                allowed_paths: vec!["a.txt".to_string(), "b.txt".to_string()],
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 2,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 12,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
+                budget: None,
+                coordinator_model: Some(CoordinatorModel {
+                    provider_id: "test-provider".to_string(),
+                    model_id: "test-model".to_string(),
+                    name: "Test Model".to_string(),
+                }),
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("parallel-wave-session".to_string()),
+                continuation: false,
+            },
+            phase_runtime,
+        )?;
+        assert_eq!(outcome.status, GoalStatus::Complete);
+
+        let store = StateStore::new(temp_dir.path());
+        let wave_path = fs::read_dir(store.plan_wave_runs_dir())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|contents| serde_json::from_str::<PlanWaveRunLedger>(&contents).ok())
+                    .is_some_and(|wave| wave.nodes.len() == 2)
+            })
+            .context("two-node wave ledger was not persisted")?;
+        let wave: PlanWaveRunLedger = serde_json::from_str(&fs::read_to_string(wave_path)?)?;
+        let starts = wave
+            .nodes
+            .iter()
+            .map(|node| {
+                DateTime::parse_from_rfc3339(
+                    node.worker_started_at
+                        .as_deref()
+                        .context("wave node is missing worker start")?,
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let terminals = wave
+            .nodes
+            .iter()
+            .map(|node| {
+                DateTime::parse_from_rfc3339(
+                    node.terminal_at
+                        .as_deref()
+                        .context("wave node is missing terminal timestamp")?,
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let overlap_start = starts.iter().max().context("missing wave start")?;
+        let overlap_end = terminals.iter().min().context("missing wave terminal")?;
+        assert!(
+            overlap_start < overlap_end,
+            "wave workers did not overlap: starts={starts:?} terminals={terminals:?}"
+        );
+        assert_eq!(wave.status, crate::state::PlanWaveStatus::Completed);
         Ok(())
     }
 
@@ -13402,6 +15561,9 @@ mod tests {
             updated_at: "now".to_string(),
             parent_session_id: Some("parent".to_string()),
             root_session_id: Some("parent".to_string()),
+            resume_count: 0,
+            last_progress_marker: None,
+            stuck_reason: None,
         };
         let json = serde_json::to_value(&state)?;
         // GBX-003-005: parent_session_id must exist in serialized state.
@@ -13692,6 +15854,25 @@ mod tests {
             model_id: "test-model".to_string(),
         };
 
+        let direct_usage_provider: DirectModelUsageProvider = Arc::new(|request| {
+            let ModelAvailability::Available(model) = &request.requested_model else {
+                return Ok(None);
+            };
+            Ok(Some(DirectModelUsageReport {
+                usage: BrokerUsage {
+                    requested_tokens: Some(34),
+                    actual_tokens: Some(13),
+                    model: format!("{}/{}", model.provider_id, model.model_id),
+                    duration_ms: Some(240),
+                    cost_micros: Some(19),
+                    cache_hit: Some(false),
+                    unavailable_reason: None,
+                },
+                actual_model: Some(model.clone()),
+                cost_unit: DirectModelCostUnit::Micros,
+            }))
+        });
+
         let phase_runtime = PhaseRuntime {
             routes: PhaseRouteTable::legacy_defaults(),
             inventory: LiveModelInventory {
@@ -13709,6 +15890,7 @@ mod tests {
             max_plan_revisions: 2,
             broker: Some(broker.clone()),
             broker_factory: None,
+            direct_model_usage_provider: Some(direct_usage_provider),
         };
 
         store.write_phase_route_table(&goal.id, &phase_runtime.routes)?;
@@ -13748,6 +15930,39 @@ mod tests {
                 || broker_state.lifecycle.name()
                     != crate::worker_broker::LifecycleStateName::Discovered,
             "broker must have made progress through resolve/start"
+        );
+        let direct_receipt_path = std::fs::read_dir(
+            temp_dir
+                .path()
+                .join(".gearbox-agent")
+                .join("direct-execution-receipts"),
+        )?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .context("direct-model broker receipt missing")?;
+        let direct_receipt: BrokerLifecycleReceipt =
+            serde_json::from_slice(&std::fs::read(direct_receipt_path)?)?;
+        direct_receipt.validate()?;
+        assert_eq!(
+            direct_receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.actual_tokens),
+            Some(13)
+        );
+        assert_eq!(
+            direct_receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.unavailable_reason.as_deref()),
+            None
+        );
+        assert!(
+            !store.read_model_call_ledger(&goal.id)?.is_empty(),
+            "direct usage callback must append the workspace ModelCallLedger"
         );
 
         store.write_plan_graph(&plan)?;
@@ -13789,6 +16004,99 @@ mod tests {
             "no worker should have been dispatched for a tampered/gated plan"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn direct_execution_receipt_consumes_native_usage_sidecar() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let backend = Arc::new(ts::FakeNativeWorkerBackend::new());
+        let registry = Arc::new(crate::workers::WorkerRegistry::with_native_backend(backend));
+        let broker = WorkerBroker::new(registry, temp_dir.path().join(".gearbox-agent"));
+        let model = ModelSelectorId {
+            agent_id: "zed".to_string(),
+            provider_id: "test-provider".to_string(),
+            model_id: "test-model".to_string(),
+        };
+        let request = BrokerPhaseRequest {
+            schema_version: crate::worker_broker::BROKER_SCHEMA_VERSION,
+            phase_decision_hash: "a".repeat(64),
+            goal_id: "goal-direct-usage".to_string(),
+            plan_id: "plan-direct-usage".to_string(),
+            plan_revision: 1,
+            task_id: "task-direct-usage".to_string(),
+            requested_agent: "direct".to_string(),
+            requested_model: ModelAvailability::Available(model.clone()),
+            allowed_fallback_models: Vec::new(),
+        };
+        broker.resolve(request.clone())?;
+        broker.record_direct_model_usage(
+            &request.phase_decision_hash,
+            BrokerUsage {
+                requested_tokens: Some(34),
+                actual_tokens: Some(13),
+                model: "test-provider/test-model".to_string(),
+                duration_ms: Some(240),
+                cost_micros: Some(19),
+                cache_hit: Some(false),
+                unavailable_reason: None,
+            },
+            Some(model.clone()),
+        )?;
+
+        write_direct_execution_receipt(&broker, &request, BrokerOutcome::Completed, &store)?;
+        let receipt_path = fs::read_dir(broker.artifacts_root().join("direct-execution-receipts"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .context("direct execution receipt missing")?;
+        let receipt: BrokerLifecycleReceipt = serde_json::from_slice(&fs::read(receipt_path)?)?;
+        receipt.validate()?;
+        assert_eq!(receipt.actual_model, Some(model));
+        assert_eq!(
+            receipt.usage.as_ref().and_then(|usage| usage.actual_tokens),
+            Some(13)
+        );
+        assert_eq!(
+            receipt.usage.as_ref().and_then(|usage| usage.cost_micros),
+            Some(19)
+        );
+        assert_eq!(
+            receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.unavailable_reason.as_deref()),
+            None
+        );
+        let ledger = store.read_model_call_ledger("goal-direct-usage")?;
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].actual_tokens, Some(13));
+        assert_eq!(ledger[0].cost_micros, Some(19));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_model_usage_cost_units_normalize_to_micros() -> Result<()> {
+        let report = DirectModelUsageReport {
+            usage: BrokerUsage {
+                requested_tokens: None,
+                actual_tokens: None,
+                model: "provider/model".to_string(),
+                duration_ms: None,
+                cost_micros: Some(3),
+                cache_hit: None,
+                unavailable_reason: None,
+            },
+            actual_model: None,
+            cost_unit: DirectModelCostUnit::Major,
+        }
+        .normalized_usage()?;
+        assert_eq!(report.usage.cost_micros, Some(3_000_000));
+        assert_eq!(report.cost_unit, DirectModelCostUnit::Micros);
         Ok(())
     }
 
@@ -13844,6 +16152,7 @@ mod tests {
             max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
             broker: None,
             broker_factory: Some(broker_factory),
+            direct_model_usage_provider: None,
         };
         assert!(
             gui_runtime.broker_factory.is_some(),
@@ -13877,6 +16186,7 @@ mod tests {
                 draft,
                 planner: phase_identity("repro_planner"),
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         }));
         phase_runtime.strategist_next_goal_hook =
@@ -14241,6 +16551,7 @@ mod tests {
                 draft,
                 planner: phase_identity("repro_planner"),
                 artifact_path: None,
+                repository_evidence_path: None,
             })
         }));
         phase_runtime.strategist_next_goal_hook =
@@ -14412,6 +16723,7 @@ mod tests {
             max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
             broker: None,
             broker_factory: Some(broker_factory),
+            direct_model_usage_provider: None,
         };
         assert!(
             production_runtime.broker_factory.is_some(),
@@ -14422,5 +16734,22 @@ mod tests {
             "PhaseRuntime::legacy() is NOT production"
         );
         Ok(())
+    }
+
+    #[test]
+    fn external_blocker_normalization_collapses_url_case_and_punctuation() {
+        let first = normalize_blocker_text(
+            "Authorization failed at https://example.test/login?token=abc; request access.",
+        );
+        let second = normalize_blocker_text(
+            "AUTHORIZATION failed at https://other.test/login?token=def, request access!",
+        );
+        assert_eq!(first, second);
+        assert!(blocker_is_external(&first));
+        assert_eq!(
+            hash_text(&first),
+            hash_text(&second),
+            "normalized blocker signatures must be stable across provider wording noise"
+        );
     }
 }

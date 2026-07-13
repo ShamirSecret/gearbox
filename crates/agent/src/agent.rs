@@ -24,7 +24,7 @@ pub use gearbox_agent::task_manager::{
 pub use gearbox_agent::worker_broker::{
     BrokerCapability, BrokerLifecycleReceipt, BrokerOutcome, BrokerPermissionEvidence,
     BrokerPermissionType, BrokerPhaseRequest, BrokerSessionIdentity, ModelAvailability,
-    PhaseBrokerFactory, UnavailableReason, WorkerBroker,
+    BrokerUsage, PhaseBrokerFactory, UnavailableReason, WorkerBroker,
 };
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
@@ -87,9 +87,10 @@ use gearbox_agent::task_manager::{
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{
     NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig, WorkerKind,
-    WorkerOutcome, WorkerPacket, WorkerRegistry, WorkerResult, WorkerRoute, WorkerSessionHandle,
-    WorkerStartRequest, WorkerStatus, category_resolution_for_route, sanitize_model_fields,
-    worker_outcome_from_result, worker_prompt, write_result_and_outcome,
+    WorkerEvent, WorkerEventHub, WorkerOutcome, WorkerPacket, WorkerRegistry, WorkerResult,
+    WorkerRoute, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
+    category_resolution_for_route, sanitize_model_fields, worker_outcome_from_result,
+    worker_prompt, write_result_and_outcome,
 };
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
@@ -113,6 +114,7 @@ use std::fs as std_fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::Instant;
 use util::ResultExt;
 use util::path_list::PathList;
 use util::rel_path::RelPath;
@@ -2796,15 +2798,14 @@ impl NativeAgentConnection {
             cx,
         );
 
-        let native_backend: Arc<dyn NativeWorkerBackend> =
-            Arc::new(GearZedWorkerBackend::new(native_worker_tx));
+        let native_backend: Arc<dyn NativeWorkerBackend> = Arc::new(
+            GearZedWorkerBackend::new(native_worker_tx).with_acp_backend(acp_broker_tx.clone()),
+        );
         let broker_registry = Arc::new(WorkerRegistry::with_native_backend(native_backend.clone()));
         let broker = Arc::new(WorkerBroker::new(
             broker_registry.clone(),
             workspace.join(".gearbox-agent").join("artifacts"),
         ));
-        let _acp_broker_backend: Arc<dyn NativeWorkerBackend> =
-            Arc::new(GearAcpBrokerBackend::new(acp_broker_tx));
         let broker_factory = Arc::new(PhaseBrokerFactory::new(
             broker_registry,
             workspace.join(".gearbox-agent"),
@@ -2998,6 +2999,7 @@ impl NativeAgentConnection {
                 planner: planner_identity,
                 intent_fold_hook,
                 planner_hook,
+                oracle_hook: Some(plan_critic_hook.clone()),
                 plan_critic_hook: Some(plan_critic_hook),
                 plan_revision_hook: Some(plan_revision_hook),
                 strategist_next_goal_hook,
@@ -3005,6 +3007,7 @@ impl NativeAgentConnection {
                 max_plan_revisions: gear_max_plan_revisions_from_env(),
                 broker: Some(run_broker),
                 broker_factory: Some(run_broker_factory),
+                direct_model_usage_provider: None,
             };
             let continuation_session_id = cancellation_session_id.to_string();
             let objective_policy = objective_policy_from_env()?;
@@ -3515,12 +3518,12 @@ struct GearOpenCodePhaseRunner {
 
 impl GearOpenCodePhaseRunner {
     fn to_inner(&self) -> gearbox_agent::open_code_phase_runtime::OpenCodePhaseRunner {
-        gearbox_agent::open_code_phase_runtime::OpenCodePhaseRunner {
-            broker_factory: self.broker_factory.clone(),
-            workspace: self.workspace.clone(),
-            worker_config: self.worker_config.clone(),
-            cancellation_token: self.cancellation_token.clone(),
-        }
+        gearbox_agent::open_code_phase_runtime::OpenCodePhaseRunner::new(
+            self.broker_factory.clone(),
+            self.workspace.clone(),
+            self.worker_config.clone(),
+            self.cancellation_token.clone(),
+        )
     }
 
     fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
@@ -3702,6 +3705,7 @@ Return exactly seven checks, one per dimension. Approve only when every check pa
         verdict,
         raw_output,
         artifact_path: None,
+        repository_evidence_path: None,
     })
 }
 
@@ -4308,10 +4312,30 @@ fn gear_worker_routes_from_env(
     default_worker_command: Option<&str>,
     default_worker_model: Option<&str>,
 ) -> Vec<WorkerRoute> {
-    let Some(sequence) = trimmed_env_value("GEARBOX_GEAR_WORKER_SEQUENCE") else {
-        return Vec::new();
+    if let Some(sequence) = trimmed_env_value("GEARBOX_GEAR_WORKER_SEQUENCE") {
+        return gear_worker_routes_from_sequence(
+            &sequence,
+            default_worker_kind,
+            default_worker_command,
+            default_worker_model,
+        );
+    }
+
+    if gear_opencode_free_fallbacks_enabled() {
+        return gear_opencode_free_fallback_routes(gear_worker_command_for_kind(
+            WorkerKind::Opencode,
+        ));
     };
 
+    Vec::new()
+}
+
+fn gear_worker_routes_from_sequence(
+    sequence: &str,
+    default_worker_kind: WorkerKind,
+    default_worker_command: Option<&str>,
+    default_worker_model: Option<&str>,
+) -> Vec<WorkerRoute> {
     sequence
         .split(',')
         .filter_map(|worker| {
@@ -4351,6 +4375,43 @@ fn gear_worker_routes_from_env(
             })
         })
         .collect()
+}
+
+fn gear_opencode_free_fallbacks_enabled() -> bool {
+    matches!(
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS").as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+fn gear_opencode_free_fallback_routes(command: Option<String>) -> Vec<WorkerRoute> {
+    let command = command.unwrap_or_else(|| {
+        "if [ \"$GEARBOX_WORKER_RESUME\" = \"true\" ]; then opencode run --pure --format json --session \"$GEARBOX_WORKER_SESSION_ID\" --model \"$GEARBOX_WORKER_MODEL\" < \"$GEARBOX_WORKER_PROMPT\"; else opencode run --pure --format json --model \"$GEARBOX_WORKER_MODEL\" < \"$GEARBOX_WORKER_PROMPT\"; fi"
+            .to_string()
+    });
+    ["opencode/hy3-free", "opencode/mimo-v2.5-free", "opencode/deepseek-v4-flash-free"]
+        .into_iter()
+        .map(|worker_model| WorkerRoute {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command.clone()),
+            worker_model: Some(worker_model.to_string()),
+        })
+        .collect()
+}
+
+fn gear_opencode_free_fallback_uses_command_backend(
+    worker_kind: WorkerKind,
+    worker_model: Option<&str>,
+) -> bool {
+    worker_kind == WorkerKind::OpencodeSession
+        && matches!(
+            worker_model.map(str::trim),
+            Some(
+                "opencode/hy3-free"
+                    | "opencode/mimo-v2.5-free"
+                    | "opencode/deepseek-v4-flash-free"
+            )
+        )
 }
 
 fn gear_unavailable_worker_models_from_env() -> Vec<String> {
@@ -5640,6 +5701,7 @@ pub struct NativeThreadEnvironment {
 
 struct GearZedWorkerBackend {
     request_tx: async_channel::Sender<GearZedWorkerDispatch>,
+    acp_request_tx: Option<async_channel::Sender<GearAcpBrokerDispatch>>,
 }
 
 #[derive(Default)]
@@ -5698,7 +5760,18 @@ impl GearZedInteractionKind {
 
 impl GearZedWorkerBackend {
     fn new(request_tx: async_channel::Sender<GearZedWorkerDispatch>) -> Self {
-        Self { request_tx }
+        Self {
+            request_tx,
+            acp_request_tx: None,
+        }
+    }
+
+    fn with_acp_backend(
+        mut self,
+        request_tx: async_channel::Sender<GearAcpBrokerDispatch>,
+    ) -> Self {
+        self.acp_request_tx = Some(request_tx);
+        self
     }
 }
 
@@ -5833,6 +5906,50 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
             cancellation_token,
         }))
     }
+
+    fn start_acp_worker(
+        &self,
+        worker_kind: WorkerKind,
+        request: WorkerStartRequest<'_>,
+    ) -> Result<Option<Arc<dyn WorkerSessionHandle>>> {
+        let Some(request_tx) = self.acp_request_tx.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(
+            worker_kind,
+            WorkerKind::Opencode
+                | WorkerKind::OpencodeSession
+                | WorkerKind::Codex
+                | WorkerKind::Claude
+        ) {
+            return Ok(None);
+        }
+        let route = request
+            .config
+            .selected_route_for_hint(request.route_attempt, request.route_hint);
+        if gear_opencode_free_fallback_uses_command_backend(worker_kind, route.worker_model) {
+            return Ok(None);
+        }
+        let backend = GearAcpBrokerBackend::new(request_tx.clone());
+        backend.start_zed_agent(request).map(Some)
+    }
+
+    fn native_broker_capabilities(&self, worker_kind: WorkerKind) -> Option<Vec<BrokerCapability>> {
+        self.acp_request_tx.as_ref().and_then(|_| {
+            matches!(
+                worker_kind,
+                WorkerKind::Opencode
+                    | WorkerKind::OpencodeSession
+                    | WorkerKind::Codex
+                    | WorkerKind::Claude
+            )
+            .then(|| {
+                gearbox_agent::worker_broker::native_acp_broker_capabilities_for_kind(
+                    WorkerKind::OpencodeSession,
+                )
+            })
+        })
+    }
 }
 
 impl WorkerSessionHandle for GearZedWorkerSessionHandle {
@@ -5874,7 +5991,7 @@ impl WorkerSessionHandle for GearZedWorkerSessionHandle {
     }
 
     fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
-        Ok(worker_outcome_from_result(&self.wait_for_result()?))
+        worker_outcome_from_result(&self.wait_for_result()?)
     }
 
     fn wait_for_result(&self) -> Result<WorkerResult> {
@@ -6239,12 +6356,6 @@ async fn run_native_zed_worker(
         .lock()
         .expect("running native zed sessions poisoned")
         .remove(&job.task_id);
-    if let Ok(close_task) =
-        agent.update(cx, |agent, cx| agent.close_session(&worker_session_id, cx))
-    {
-        close_task.await?;
-    }
-
     run_result
 }
 
@@ -6297,6 +6408,12 @@ enum GearAcpBrokerDispatch {
     Cancel { task_id: String },
     /// Set end-turn-at-boundary on a session.
     SetEndTurnAtBoundary { task_id: String, enabled: bool },
+    /// Release a session only when its Gear worker handle is explicitly disposed.
+    Dispose {
+        task_id: String,
+        session_id: acp::SessionId,
+        state: Arc<(Mutex<GearAcpBrokerState>, Condvar)>,
+    },
 }
 
 /// Job passed through the channel to start an ACP broker worker session.
@@ -6317,10 +6434,12 @@ struct GearAcpBrokerState {
     session_id: Option<acp::SessionId>,
     result: Option<std::result::Result<WorkerResult, String>>,
     last_output: Option<String>,
+    usage: Option<BrokerUsage>,
     pending_interactions: VecDeque<GearAcpBrokerInteraction>,
     interaction_count: usize,
     /// Permission events recorded during the interaction.
     permission_events: Vec<BrokerPermissionEvidence>,
+    event_hub: WorkerEventHub,
 }
 
 #[derive(Clone)]
@@ -6533,8 +6652,43 @@ impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
         Ok(())
     }
 
+    fn dispose(&self) -> Result<()> {
+        let session_id = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| anyhow!("acp broker state poisoned"))?
+            .session_id
+            .clone();
+        if let Some(session_id) = session_id {
+            self.request_tx
+                .send_blocking(GearAcpBrokerDispatch::Dispose {
+                    task_id: self.task_id.clone(),
+                    session_id,
+                    state: self.state.clone(),
+                })
+                .context("failed to dispose ACP broker worker session")?;
+        }
+        Ok(())
+    }
+
+    fn supports_event_subscriptions(&self) -> bool {
+        true
+    }
+
+    fn subscribe(&self, listener: gearbox_agent::workers::WorkerEventListener) -> Result<gearbox_agent::workers::WorkerSubscription> {
+        let event_hub = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| anyhow!("acp broker state poisoned"))?
+            .event_hub
+            .clone();
+        event_hub.subscribe(listener)
+    }
+
     fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
-        Ok(worker_outcome_from_result(&self.wait_for_result()?))
+        worker_outcome_from_result(&self.wait_for_result()?)
     }
 
     fn wait_for_result(&self) -> Result<WorkerResult> {
@@ -6554,6 +6708,10 @@ impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
             .lock()
             .ok()
             .and_then(|state| state.last_output.clone())
+    }
+
+    fn usage(&self) -> Option<BrokerUsage> {
+        self.state.0.lock().ok().and_then(|state| state.usage.clone())
     }
 }
 
@@ -6619,6 +6777,32 @@ fn spawn_gear_acp_broker_dispatcher(
                         .update(cx, |thread, cx| thread.cancel(cx))
                         .await;
                 }
+                GearAcpBrokerDispatch::Dispose {
+                    task_id,
+                    session_id,
+                    state,
+                } => {
+                    running_acp_sessions
+                        .lock()
+                        .expect("running acp sessions poisoned")
+                        .remove(&task_id);
+                    match agent.update(cx, |agent, cx| agent.close_session(&session_id, cx)) {
+                        Ok(close_task) => {
+                            if let Err(error) = close_task.await {
+                                eprintln!(
+                                    "failed to dispose Gear ACP worker session {session_id}: {error:#}"
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "failed to schedule disposal for Gear ACP worker session {session_id}: {error:#}"
+                        ),
+                    }
+                    let (lock, wake) = &*state;
+                    let mut state = lock.lock().expect("acp broker state poisoned");
+                    state.session_id = None;
+                    wake.notify_all();
+                }
                 GearAcpBrokerDispatch::SetEndTurnAtBoundary { task_id, enabled } => {
                     let Some(worker_session_id) = running_acp_sessions
                         .lock()
@@ -6648,6 +6832,71 @@ fn spawn_gear_acp_broker_dispatcher(
         }
     })
     .detach();
+}
+
+fn emit_gear_acp_worker_event(job: &GearAcpBrokerJob, event: WorkerEvent) -> Result<()> {
+    let event_json =
+        serde_json::to_string(&event).context("failed to serialize ACP worker event")?;
+    let line = format!("{event_json}\n");
+    job.store
+        .append_worker_file(&job.task_id, "transcript.jsonl", &line)?;
+    if matches!(
+        event,
+        WorkerEvent::TurnStarted { .. }
+            | WorkerEvent::TurnFinished { .. }
+            | WorkerEvent::ToolCallStarted { .. }
+            | WorkerEvent::ToolCallFinished { .. }
+            | WorkerEvent::Error { .. }
+    ) {
+        job.store
+            .append_worker_file(&job.task_id, "tool-events.jsonl", &line)?;
+    }
+    let event_hub = job
+        .state
+        .0
+        .lock()
+        .map_err(|_| anyhow!("acp broker state poisoned"))?
+        .event_hub
+        .clone();
+    event_hub.emit(event);
+    Ok(())
+}
+
+fn broker_usage_from_thread(
+    thread: &Thread,
+    model: Option<&str>,
+    duration_ms: u64,
+) -> Option<BrokerUsage> {
+    let usage = thread.latest_token_usage()?;
+    Some(BrokerUsage {
+        requested_tokens: Some(usage.input_tokens),
+        actual_tokens: Some(usage.output_tokens),
+        model: model.unwrap_or("unknown").to_string(),
+        duration_ms: Some(duration_ms),
+        cost_micros: None,
+        cache_hit: None,
+        unavailable_reason: None,
+    })
+}
+
+fn merge_broker_usage(previous: Option<BrokerUsage>, current: BrokerUsage) -> BrokerUsage {
+    let add = |left: Option<u64>, right: Option<u64>| match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        _ => None,
+    };
+    if let Some(previous) = previous {
+        BrokerUsage {
+            requested_tokens: add(previous.requested_tokens, current.requested_tokens),
+            actual_tokens: add(previous.actual_tokens, current.actual_tokens),
+            model: current.model,
+            duration_ms: add(previous.duration_ms, current.duration_ms),
+            cost_micros: add(previous.cost_micros, current.cost_micros),
+            cache_hit: current.cache_hit.or(previous.cache_hit),
+            unavailable_reason: current.unavailable_reason.or(previous.unavailable_reason),
+        }
+    } else {
+        current
+    }
 }
 
 /// Run an ACP broker worker session on the foreground thread.
@@ -6756,11 +7005,33 @@ async fn run_gear_acp_broker_worker(
                 anyhow::bail!("acp broker worker cancelled before prompt started");
             }
 
-            let response = acp_thread
+            let turn_started_at = Instant::now();
+            emit_gear_acp_worker_event(
+                &job,
+                WorkerEvent::TurnStarted {
+                    kind: "acp".to_string(),
+                    prompt_path: next_prompt_path.clone(),
+                },
+            )?;
+
+            let response = match acp_thread
                 .update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![next_prompt.clone().into()], cx)
                 })
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    emit_gear_acp_worker_event(
+                        &job,
+                        WorkerEvent::Error {
+                            kind: "acp".to_string(),
+                            message: format!("{error:#}"),
+                        },
+                    )?;
+                    return Err(error);
+                }
+            };
 
             {
                 let (lock, _) = &*job.state;
@@ -6795,6 +7066,44 @@ async fn run_gear_acp_broker_worker(
                     })
                     .unwrap_or_default()
             });
+            if !assistant_text.trim().is_empty() {
+                emit_gear_acp_worker_event(
+                    &job,
+                    WorkerEvent::AssistantTextDelta {
+                        kind: "acp".to_string(),
+                        delta: assistant_text.clone(),
+                    },
+                )?;
+            }
+            if let Some(usage) = subagent_thread.read_with(cx, |thread, _cx| {
+                broker_usage_from_thread(
+                    thread,
+                    applied_worker_model.as_deref(),
+                    turn_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                )
+            }) {
+                let usage = {
+                    let (lock, _) = &*job.state;
+                    let mut state = lock.lock().expect("acp broker state poisoned");
+                    let usage = merge_broker_usage(state.usage.take(), usage);
+                    state.usage = Some(usage.clone());
+                    usage
+                };
+                job.store.write_worker_file(
+                    &job.task_id,
+                    "usage.json",
+                    &format!("{}\n", serde_json::to_string_pretty(&usage)?),
+                )?;
+            }
+            emit_gear_acp_worker_event(
+                &job,
+                WorkerEvent::TurnFinished {
+                    kind: "acp".to_string(),
+                    result_path: job.store.worker_dir(&job.task_id).join("result.json"),
+                    outcome_path: job.store.worker_dir(&job.task_id).join("outcome.json"),
+                    summary: "ACP worker turn completed".to_string(),
+                },
+            )?;
             let next_interaction = {
                 let (lock, _) = &*job.state;
                 let mut state = lock.lock().expect("acp broker state poisoned");
@@ -6829,8 +7138,8 @@ async fn run_gear_acp_broker_worker(
                     build_native_zed_worker_result(
                         &job.store,
                         &job.task_id,
-                        job.packet_path,
-                        next_prompt_path,
+                        job.packet_path.clone(),
+                        next_prompt_path.clone(),
                         assistant_text,
                         WorkerStatus::Succeeded,
                         None,
@@ -6840,8 +7149,8 @@ async fn run_gear_acp_broker_worker(
                     build_native_zed_worker_result(
                         &job.store,
                         &job.task_id,
-                        job.packet_path,
-                        next_prompt_path,
+                        job.packet_path.clone(),
+                        next_prompt_path.clone(),
                         assistant_text,
                         WorkerStatus::Failed,
                         Some("cancelled".to_string()),
@@ -6864,8 +7173,8 @@ async fn run_gear_acp_broker_worker(
                     build_native_zed_worker_result(
                         &job.store,
                         &job.task_id,
-                        job.packet_path,
-                        next_prompt_path,
+                        job.packet_path.clone(),
+                        next_prompt_path.clone(),
                         assistant_text,
                         WorkerStatus::Failed,
                         Some(failure),
@@ -6874,8 +7183,8 @@ async fn run_gear_acp_broker_worker(
                 None => build_native_zed_worker_result(
                     &job.store,
                     &job.task_id,
-                    job.packet_path,
-                    next_prompt_path,
+                    job.packet_path.clone(),
+                    next_prompt_path.clone(),
                     String::new(),
                     WorkerStatus::Failed,
                     Some("acp broker worker returned no response".to_string()),
@@ -7898,6 +8207,92 @@ mod internal_tests {
         assert_eq!(config.worker_kind, WorkerKind::Opencode);
         assert_eq!(config.worker_command, None);
         assert!(!config.require_worker);
+    }
+
+    #[test]
+    fn gear_opencode_free_fallback_routes_preserve_the_verified_order() {
+        let routes = gear_opencode_free_fallback_routes(None);
+
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.worker_model.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("opencode/hy3-free"),
+                Some("opencode/mimo-v2.5-free"),
+                Some("opencode/deepseek-v4-flash-free"),
+            ]
+        );
+        assert!(routes.iter().all(|route| {
+            route.worker_kind == WorkerKind::OpencodeSession
+                && route
+                    .worker_command
+                    .as_deref()
+                    .is_some_and(|command| {
+                        command.contains("--model \"$GEARBOX_WORKER_MODEL\"")
+                            && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
+                            && command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
+                            && command.contains("GEARBOX_WORKER_RESUME")
+                            && !command.contains("$(cat")
+                    })
+                && gear_opencode_free_fallback_uses_command_backend(
+                    route.worker_kind,
+                    route.worker_model.as_deref(),
+                )
+        }));
+        assert!(!gear_opencode_free_fallback_uses_command_backend(
+            WorkerKind::OpencodeSession,
+            Some("opencode/custom-free"),
+        ));
+    }
+
+    #[test]
+    fn gear_worker_routes_from_env_enables_free_fallbacks_only_when_requested() {
+        let original_free_fallbacks =
+            std::env::var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS").ok();
+        let original_sequence = std::env::var("GEARBOX_GEAR_WORKER_SEQUENCE").ok();
+        unsafe {
+            std::env::set_var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS", "1");
+            std::env::remove_var("GEARBOX_GEAR_WORKER_SEQUENCE");
+        }
+
+        let routes = gear_worker_routes_from_env(WorkerKind::Opencode, None, None);
+
+        unsafe {
+            if let Some(value) = original_free_fallbacks {
+                std::env::set_var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS", value);
+            } else {
+                std::env::remove_var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS");
+            }
+            if let Some(value) = original_sequence {
+                std::env::set_var("GEARBOX_GEAR_WORKER_SEQUENCE", value);
+            } else {
+                std::env::remove_var("GEARBOX_GEAR_WORKER_SEQUENCE");
+            }
+        }
+
+        assert_eq!(routes.len(), 3);
+        assert!(routes.iter().all(|route| route.worker_command.is_some()));
+    }
+
+    #[test]
+    fn gear_worker_routes_from_sequence_keeps_explicit_routes_over_free_defaults() {
+        let routes = gear_worker_routes_from_sequence(
+            "codex:gpt-5,opencode:opencode/custom-free",
+            WorkerKind::Opencode,
+            Some("opencode run"),
+            None,
+        );
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].worker_kind, WorkerKind::Codex);
+        assert_eq!(routes[0].worker_model.as_deref(), Some("gpt-5"));
+        assert_eq!(routes[1].worker_kind, WorkerKind::Opencode);
+        assert_eq!(
+            routes[1].worker_model.as_deref(),
+            Some("opencode/custom-free")
+        );
     }
 
     #[test]
@@ -11809,6 +12204,76 @@ mod internal_tests {
         assert_eq!(strip_slash_command_prefix("hello world"), "hello world",);
     }
 
+    #[test]
+    fn merge_broker_usage_preserves_unknown_totals() {
+        let previous = BrokerUsage {
+            requested_tokens: None,
+            actual_tokens: Some(5),
+            model: "previous-model".to_string(),
+            duration_ms: Some(3),
+            cost_micros: None,
+            cache_hit: Some(false),
+            unavailable_reason: Some("previous unavailable reason".to_string()),
+        };
+        let current = BrokerUsage {
+            requested_tokens: Some(8),
+            actual_tokens: None,
+            model: "current-model".to_string(),
+            duration_ms: Some(7),
+            cost_micros: Some(11),
+            cache_hit: Some(true),
+            unavailable_reason: None,
+        };
+
+        let merged = merge_broker_usage(Some(previous), current);
+
+        assert_eq!(merged.requested_tokens, None);
+        assert_eq!(merged.actual_tokens, None);
+        assert_eq!(merged.duration_ms, Some(10));
+        assert_eq!(merged.cost_micros, None);
+        assert_eq!(merged.model, "current-model");
+        assert_eq!(merged.cache_hit, Some(true));
+        assert_eq!(
+            merged.unavailable_reason.as_deref(),
+            Some("previous unavailable reason")
+        );
+    }
+
+    #[test]
+    fn merge_broker_usage_sums_known_totals() {
+        let previous = BrokerUsage {
+            requested_tokens: Some(3),
+            actual_tokens: Some(5),
+            model: "previous-model".to_string(),
+            duration_ms: Some(7),
+            cost_micros: Some(11),
+            cache_hit: Some(true),
+            unavailable_reason: None,
+        };
+        let current = BrokerUsage {
+            requested_tokens: Some(13),
+            actual_tokens: Some(17),
+            model: "current-model".to_string(),
+            duration_ms: Some(19),
+            cost_micros: Some(23),
+            cache_hit: None,
+            unavailable_reason: Some("current unavailable reason".to_string()),
+        };
+
+        let merged = merge_broker_usage(Some(previous), current);
+
+        assert_eq!(merged.requested_tokens, Some(16));
+        assert_eq!(merged.actual_tokens, Some(22));
+        assert_eq!(merged.duration_ms, Some(26));
+        assert_eq!(merged.cost_micros, Some(34));
+        assert_eq!(merged.model, "current-model");
+        assert_eq!(merged.cache_hit, Some(true));
+        assert_eq!(
+            merged.unavailable_reason.as_deref(),
+            Some("current unavailable reason")
+        );
+    }
+
     #[gpui::test]
     async fn gearbox_acp_worker_broker_lifecycle(cx: &mut TestAppContext) {
         use gearbox_agent::state::{
@@ -11912,6 +12377,18 @@ mod internal_tests {
                 route_hint: None,
             })
             .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _event_subscription = handle
+            .subscribe({
+                let events = events.clone();
+                Arc::new(move |event| {
+                    events
+                        .lock()
+                        .expect("acp broker event capture mutex poisoned")
+                        .push(event);
+                })
+            })
+            .unwrap();
 
         // Phase 3: wait for the first prompt — the dispatcher should have
         // created a subagent session via the ACP thread.
@@ -11945,6 +12422,19 @@ mod internal_tests {
             Some(first_session_id.as_str()),
             "steer should reuse the same session"
         );
+        let observed_events = events
+            .lock()
+            .expect("acp broker event capture mutex poisoned");
+        assert!(observed_events.iter().any(|event| matches!(
+            event,
+            WorkerEvent::AssistantTextDelta { kind, delta }
+                if kind == "acp" && delta.contains("broker follow-up response")
+        )));
+        assert!(observed_events.iter().any(|event| matches!(
+            event,
+            WorkerEvent::TurnFinished { kind, .. } if kind == "acp"
+        )));
+        drop(observed_events);
 
         // Phase 6: cancel — verify the session still existed before cancel
         let _ = handle.session_id();
@@ -11976,7 +12466,16 @@ mod internal_tests {
             worker_result.as_ref().map(|r| &r.status)
         );
 
-        // Phase 7: model discovery produces valid ModelAvailability entries
+        // Phase 7: disposal is distinct from cancellation and clears the
+        // handle's provider-session identity once the dispatcher has run.
+        handle.dispose().unwrap();
+        cx.run_until_parked();
+        assert!(
+            handle.session_id().is_none(),
+            "disposed ACP handles must not expose a stale session identity"
+        );
+
+        // Phase 8: model discovery produces valid ModelAvailability entries
         for (agent_name, availability) in &discovered {
             assert!(
                 !agent_name.is_empty(),

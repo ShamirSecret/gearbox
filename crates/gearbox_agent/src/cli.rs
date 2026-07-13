@@ -18,7 +18,7 @@ use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
 use crate::workers::{WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
 
-const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'opencode --pure run --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" "$(cat "$GEARBOX_WORKER_PROMPT")" > "$GEARBOX_WORKER_LAST_MESSAGE"'"#;
+const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'if [ "$GEARBOX_WORKER_RESUME" = "true" ]; then opencode run --pure --format json --session "$GEARBOX_WORKER_SESSION_ID" --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; else opencode run --pure --format json --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; fi'"#;
 
 #[derive(Debug, Parser)]
 #[command(name = "gear")]
@@ -99,6 +99,9 @@ struct RunCommand {
 
     #[arg(long = "worker-sequence")]
     worker_sequence: Option<String>,
+
+    #[arg(long)]
+    opencode_free_fallbacks: bool,
 
     #[arg(long = "unavailable-worker-model")]
     unavailable_worker_models: Vec<String>,
@@ -268,13 +271,19 @@ fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
         })
         .or_else(|| worker_kind.default_command(worker_model.as_deref()))
         .filter(|command| !command.trim().is_empty());
-    let worker_routes = worker_routes_from_sequence(
-        command.worker_sequence.as_deref(),
-        worker_kind,
-        &worker_command,
-        &worker_model,
-        command,
-    )?;
+    let worker_routes = if command.worker_sequence.is_some() {
+        worker_routes_from_sequence(
+            command.worker_sequence.as_deref(),
+            worker_kind,
+            &worker_command,
+            &worker_model,
+            command,
+        )?
+    } else if command.opencode_free_fallbacks {
+        opencode_free_fallback_routes()
+    } else {
+        Vec::new()
+    };
     let require_worker = command.require_worker
         || worker_command.is_some()
         || worker_routes
@@ -300,6 +309,21 @@ fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
         require_worker,
         default_worker_for_small_tasks: WorkerKind::ZedAgent,
     })
+}
+
+fn opencode_free_fallback_routes() -> Vec<WorkerRoute> {
+    [
+        "opencode/hy3-free",
+        "opencode/mimo-v2.5-free",
+        "opencode/deepseek-v4-flash-free",
+    ]
+    .into_iter()
+    .map(|worker_model| WorkerRoute {
+        worker_kind: WorkerKind::OpencodeSession,
+        worker_command: Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string()),
+        worker_model: Some(worker_model.to_string()),
+    })
+    .collect()
 }
 
 fn worker_routes_from_sequence(
@@ -396,6 +420,7 @@ mod tests {
             worker_command: None,
             worker_model: None,
             worker_sequence: None,
+            opencode_free_fallbacks: false,
             unavailable_worker_models: Vec::new(),
             premium_worker_budget: 1,
             max_parallel_workers: 1,
@@ -446,6 +471,47 @@ mod tests {
         assert_eq!(config.max_parallel_per_key, 1);
         assert_eq!(config.premium_worker_budget, 1);
         assert!(config.require_worker);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_worker_config_enables_verified_opencode_free_fallbacks_without_overriding_sequence(
+    ) -> Result<()> {
+        let mut command = run_command();
+        command.opencode_free_fallbacks = true;
+
+        let config = worker_config_from_command(&command)?;
+
+        assert_eq!(
+            config
+                .worker_routes
+                .iter()
+                .map(|route| route.worker_model.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("opencode/hy3-free"),
+                Some("opencode/mimo-v2.5-free"),
+                Some("opencode/deepseek-v4-flash-free"),
+            ]
+        );
+        assert!(config.worker_routes.iter().all(|route| {
+            route.worker_kind == WorkerKind::OpencodeSession
+                && route
+                    .worker_command
+                    .as_deref()
+                    .is_some_and(|command| {
+                        command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
+                            && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
+                    })
+        }));
+
+        command.worker_sequence = Some("opencode:opencode/custom-free".to_string());
+        let explicit_config = worker_config_from_command(&command)?;
+        assert_eq!(explicit_config.worker_routes.len(), 1);
+        assert_eq!(
+            explicit_config.worker_routes[0].worker_model.as_deref(),
+            Some("opencode/custom-free")
+        );
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -11,12 +11,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{CoordinatorModel, StateStore, Task, TaskKind, timestamp};
+use crate::state::{
+    CoordinatorModel, PromptDispatchDecision, PromptDispatchGate, PromptDispatchGateStatus,
+    PromptSettleEvent, StateStore, Task, TaskKind, timestamp,
+};
 use crate::tools::CancellationToken;
 use crate::worker_broker::WorkerBroker;
 use crate::workers::{
-    WorkerConfig, WorkerKind, WorkerOutcome, WorkerRegistry, WorkerResult, WorkerSessionHandle,
-    WorkerStartRequest, WorkerStatus, WorkerSubscription, route_identity_key,
+    WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome, WorkerRegistry, WorkerResult,
+    WorkerSessionHandle, WorkerStartRequest, WorkerStatus, WorkerSubscription,
+    provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
     worker_model_is_unavailable,
 };
 
@@ -231,6 +235,7 @@ pub enum TaskFailureKind {
     WorkerCancelled,
     WorkerUnavailable,
     ModelUnavailable,
+    ProviderTemporarilyUnavailable,
     PremiumBudgetExceeded,
     NoFallbackRoute,
     RepeatedFailureLimit,
@@ -488,6 +493,13 @@ struct QueuedTask {
     route_hint: Option<String>,
 }
 
+#[derive(Clone)]
+struct GoalEpochContext {
+    session_id: String,
+    goal_id: String,
+    epoch_id: String,
+}
+
 #[derive(Clone, Debug)]
 struct ConcurrencyManager {
     max_parallel_workers: usize,
@@ -528,7 +540,9 @@ impl Default for TaskRuntimePolicy {
 impl TaskRuntimePolicy {
     fn from_worker_config(config: &WorkerConfig) -> Self {
         Self {
-            stale_task_timeout: Duration::from_secs(config.stale_task_timeout_secs.max(1) as u64),
+            stale_task_timeout: Duration::from_secs(
+                config.stale_task_timeout_secs.max(1) as u64 + 1,
+            ),
         }
     }
 }
@@ -768,12 +782,27 @@ struct CurrentManagedTask {
     task_id: String,
     status: ManagedTaskStatus,
     handle: Option<Arc<dyn WorkerSessionHandle>>,
+    dispatch_context: Option<PromptDispatchControlContext>,
+}
+
+#[derive(Clone)]
+struct PromptDispatchControlContext {
+    store: StateStore,
+    goal_id: String,
+    session_id: String,
+    run_epoch: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueuedMessageKind {
     FollowUp,
     Steer,
+}
+
+enum PromptDispatchGateResult {
+    Acquired(StateStore, PromptDispatchGate),
+    Duplicate,
+    Unavailable,
 }
 
 #[derive(Clone, Debug)]
@@ -990,6 +1019,51 @@ impl TaskManagerControl {
         }))
     }
 
+    fn acquire_prompt_dispatch_gate(
+        &self,
+        task_id: &str,
+        message_kind: &str,
+        prompt: &str,
+    ) -> Result<PromptDispatchGateResult> {
+        let Some(current_task) = self.current_task_snapshot()? else {
+            return Ok(PromptDispatchGateResult::Unavailable);
+        };
+        if current_task.task_id != task_id {
+            return Ok(PromptDispatchGateResult::Unavailable);
+        }
+        let Some(context) = current_task.dispatch_context else {
+            return Ok(PromptDispatchGateResult::Unavailable);
+        };
+        match context.store.reserve_prompt_dispatch(
+            &context.goal_id,
+            task_id,
+            &context.session_id,
+            context.run_epoch as usize,
+            message_kind,
+            "gui_control",
+            prompt,
+        )? {
+            PromptDispatchDecision::Acquired(gate) => {
+                Ok(PromptDispatchGateResult::Acquired(context.store, gate))
+            }
+            PromptDispatchDecision::Duplicate(_) => Ok(PromptDispatchGateResult::Duplicate),
+        }
+    }
+
+    fn settle_prompt_dispatch_gate(
+        gate_context: &Option<(StateStore, PromptDispatchGate)>,
+        status: PromptDispatchGateStatus,
+        reason: Option<String>,
+    ) -> Result<()> {
+        if let Some((store, gate)) = gate_context.as_ref() {
+            store
+                .settle_prompt_dispatch_gate(gate, status, None, reason)
+                .map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn cancel_task(&self, task_id: &str) -> Result<ActionOutcome> {
         let Some(current_task) = self.current_task_snapshot()? else {
             return Ok(ActionOutcome::Noop(OutcomeContext {
@@ -1060,6 +1134,16 @@ impl TaskManagerControl {
         }))
     }
     pub fn send_follow_up_task(&self, task_id: &str, prompt: String) -> Result<SendOutcome> {
+        let gate_context = match self.acquire_prompt_dispatch_gate(task_id, "follow_up", &prompt)? {
+            PromptDispatchGateResult::Acquired(store, gate) => Some((store, gate)),
+            PromptDispatchGateResult::Duplicate => {
+                return Ok(SendOutcome::Noop(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    ..OutcomeContext::default()
+                }));
+            }
+            PromptDispatchGateResult::Unavailable => None,
+        };
         let current_task_guard = self
             .current_task
             .lock()
@@ -1081,6 +1165,11 @@ impl TaskManagerControl {
         match current_task.status {
             ManagedTaskStatus::Pending => {
                 self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt, None)?;
+                Self::settle_prompt_dispatch_gate(
+                    &gate_context,
+                    PromptDispatchGateStatus::Held,
+                    None,
+                )?;
                 Ok(SendOutcome::Queued(OutcomeContext {
                     task_id: Some(current_task_id),
                     ..OutcomeContext::default()
@@ -1093,7 +1182,19 @@ impl TaskManagerControl {
                     .context("running task missing handle")?
                     .clone();
                 drop(current_task_guard);
-                handle.send_follow_up(prompt)?;
+                if let Err(error) = handle.send_follow_up(prompt) {
+                    let _ = Self::settle_prompt_dispatch_gate(
+                        &gate_context,
+                        PromptDispatchGateStatus::Failed,
+                        Some(format!("GUI follow-up dispatch failed: {error:#}")),
+                    );
+                    return Err(error);
+                }
+                Self::settle_prompt_dispatch_gate(
+                    &gate_context,
+                    PromptDispatchGateStatus::Accepted,
+                    None,
+                )?;
                 Ok(SendOutcome::Sent(OutcomeContext {
                     task_id: Some(current_task_id),
                     ..OutcomeContext::default()
@@ -1107,6 +1208,16 @@ impl TaskManagerControl {
     }
 
     pub fn steer_task(&self, task_id: &str, prompt: String) -> Result<SteerOutcome> {
+        let gate_context = match self.acquire_prompt_dispatch_gate(task_id, "steer", &prompt)? {
+            PromptDispatchGateResult::Acquired(store, gate) => Some((store, gate)),
+            PromptDispatchGateResult::Duplicate => {
+                return Ok(SteerOutcome::Noop(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    ..OutcomeContext::default()
+                }));
+            }
+            PromptDispatchGateResult::Unavailable => None,
+        };
         let current_task_guard = self
             .current_task
             .lock()
@@ -1128,6 +1239,11 @@ impl TaskManagerControl {
         match current_task.status {
             ManagedTaskStatus::Pending => {
                 self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt, None)?;
+                Self::settle_prompt_dispatch_gate(
+                    &gate_context,
+                    PromptDispatchGateStatus::Held,
+                    None,
+                )?;
                 Ok(SteerOutcome::Queued(OutcomeContext {
                     task_id: Some(current_task_id),
                     ..OutcomeContext::default()
@@ -1140,7 +1256,19 @@ impl TaskManagerControl {
                     .context("running task missing handle")?
                     .clone();
                 drop(current_task_guard);
-                handle.steer(prompt)?;
+                if let Err(error) = handle.steer(prompt) {
+                    let _ = Self::settle_prompt_dispatch_gate(
+                        &gate_context,
+                        PromptDispatchGateStatus::Failed,
+                        Some(format!("GUI steer dispatch failed: {error:#}")),
+                    );
+                    return Err(error);
+                }
+                Self::settle_prompt_dispatch_gate(
+                    &gate_context,
+                    PromptDispatchGateStatus::Accepted,
+                    None,
+                )?;
                 Ok(SteerOutcome::Steered(OutcomeContext {
                     task_id: Some(current_task_id),
                     ..OutcomeContext::default()
@@ -1167,7 +1295,34 @@ impl TaskManagerControl {
                 task_id,
                 status,
                 handle,
+                dispatch_context: None,
             });
+        Ok(())
+    }
+
+    fn set_dispatch_context(
+        &self,
+        task_id: &str,
+        store: StateStore,
+        goal_id: String,
+        session_id: String,
+        run_epoch: u64,
+    ) -> Result<()> {
+        let mut current_task = self
+            .current_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
+        let Some(current_task) = current_task.as_mut() else {
+            return Ok(());
+        };
+        if current_task.task_id == task_id {
+            current_task.dispatch_context = Some(PromptDispatchControlContext {
+                store,
+                goal_id,
+                session_id,
+                run_epoch,
+            });
+        }
         Ok(())
     }
 
@@ -1202,6 +1357,9 @@ pub struct TaskManager {
     runtime_policy: TaskRuntimePolicy,
     control: TaskManagerControl,
     session_scope: Option<String>,
+    goal_unavailable_worker_models: HashMap<String, HashMap<String, Instant>>,
+    goal_provider_sessions: HashMap<String, String>,
+    goal_epoch_context: Option<GoalEpochContext>,
     artifacts_root: Option<PathBuf>,
     finished_task_tx: Sender<FinishedTaskMessage>,
     finished_task_rx: Receiver<FinishedTaskMessage>,
@@ -1209,6 +1367,8 @@ pub struct TaskManager {
 }
 
 pub type SharedTaskManager = Arc<Mutex<TaskManager>>;
+
+const GOAL_WORKER_MODEL_COOLDOWN: Duration = Duration::from_secs(60);
 
 pub struct TaskManagerTickLoop {
     stop: Arc<AtomicBool>,
@@ -1300,6 +1460,9 @@ impl Default for TaskManager {
             runtime_policy: TaskRuntimePolicy::default(),
             control: TaskManagerControl::default(),
             session_scope: None,
+            goal_unavailable_worker_models: HashMap::new(),
+            goal_provider_sessions: HashMap::new(),
+            goal_epoch_context: None,
             artifacts_root: None,
             finished_task_tx,
             finished_task_rx,
@@ -1359,7 +1522,44 @@ impl TaskManager {
     }
 
     pub fn set_session_scope(&mut self, session_id: impl Into<String>) {
-        self.session_scope = Some(session_id.into());
+        let session_id = session_id.into();
+        if self.session_scope.as_deref() != Some(session_id.as_str()) {
+            self.goal_unavailable_worker_models.clear();
+            self.goal_provider_sessions.clear();
+        }
+        self.session_scope = Some(session_id);
+    }
+
+    pub fn set_goal_epoch_context(
+        &mut self,
+        session_id: impl Into<String>,
+        goal_id: impl Into<String>,
+        epoch_id: impl Into<String>,
+    ) -> Result<()> {
+        let context = GoalEpochContext {
+            session_id: session_id.into(),
+            goal_id: goal_id.into(),
+            epoch_id: epoch_id.into(),
+        };
+        for (field, value) in [
+            ("session_id", context.session_id.as_str()),
+            ("goal_id", context.goal_id.as_str()),
+            ("epoch_id", context.epoch_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("goal epoch context {field} cannot be empty");
+            }
+        }
+        if self
+            .goal_epoch_context
+            .as_ref()
+            .is_some_and(|current| current.goal_id != context.goal_id)
+        {
+            self.goal_unavailable_worker_models.clear();
+            self.goal_provider_sessions.clear();
+        }
+        self.goal_epoch_context = Some(context);
+        Ok(())
     }
 
     pub fn set_worker_registry(&mut self, registry: WorkerRegistry) {
@@ -1598,6 +1798,13 @@ impl TaskManager {
         );
         self.control
             .set_current(task_id.clone(), ManagedTaskStatus::Pending, None)?;
+        self.control.set_dispatch_context(
+            &task_id,
+            queued_task.store.clone(),
+            queued_task.task.goal_id.clone(),
+            format!("task:{task_id}"),
+            0,
+        )?;
 
         self.queued_tasks.push_back(queued_task);
         self.process_queue()?;
@@ -2083,10 +2290,7 @@ impl TaskManager {
                         },
                     ),
                     WorkerStatus::Failed => {
-                        let cancelled = outcome.known_failures.iter().any(|failure| {
-                            let failure = failure.to_ascii_lowercase();
-                            failure.contains("cancelled") || failure.contains("canceled")
-                        });
+                        let cancelled = worker_outcome_is_cancelled(&outcome);
                         if cancelled {
                             transition_task_record(
                                 &mut record,
@@ -2116,6 +2320,30 @@ impl TaskManager {
                     record.result_path = Some(result.result_path.clone());
                     record.outcome_path = Some(result.outcome_path.clone());
                 }
+                self.remember_unavailable_model_for_goal(
+                    &running_task.queued_task.task.goal_id,
+                    &record,
+                );
+                self.remember_provider_session_for_goal(
+                    &running_task.queued_task.task.goal_id,
+                    &running_task.store,
+                    &record.task_id,
+                )?;
+                let settle_event = match result.status {
+                    WorkerStatus::Succeeded | WorkerStatus::Skipped => {
+                        PromptSettleEvent::BackgroundCompleted
+                    }
+                    WorkerStatus::Failed => PromptSettleEvent::Error,
+                };
+                record_worker_settle_event(
+                    &running_task.store,
+                    &running_task.queued_task.task.goal_id,
+                    &record.task_id,
+                    record.session_id.as_deref(),
+                    record.run_epoch,
+                    "task_manager.worker_completion",
+                    settle_event,
+                )?;
                 write_task_record(&running_task.store, &record)?;
                 append_task_lifecycle_event(&running_task.store, &record, Some(&transition))?;
 
@@ -2139,6 +2367,15 @@ impl TaskManager {
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
                             let run_epoch = record.run_epoch;
+                            record_worker_settle_event(
+                                &running_task.store,
+                                &running_task.queued_task.task.goal_id,
+                                &record.task_id,
+                                record.session_id.as_deref(),
+                                run_epoch,
+                                "task_manager.fallback",
+                                PromptSettleEvent::FallbackRetry,
+                            )?;
                             self.control
                                 .update_current_status(task_id, record.status.clone())?;
                             self.release_running_task_once(task_id, run_epoch, &running_task)?;
@@ -2211,6 +2448,16 @@ impl TaskManager {
                             error: Some(error_text),
                         },
                     )
+                } else if error_text.contains("Gear worker command timed out") {
+                    transition_task_record(
+                        &mut record,
+                        TaskTransition::Fail {
+                            finished_at: timestamp(),
+                            summary: "Worker provider timed out.".to_string(),
+                            failure_kind: TaskFailureKind::ProviderTemporarilyUnavailable,
+                            error: Some(error_text),
+                        },
+                    )
                 } else if error_text.contains("timed out waiting for outcome") {
                     transition_task_record(
                         &mut record,
@@ -2245,6 +2492,15 @@ impl TaskManager {
                         },
                     )
                 };
+                record_worker_settle_event(
+                    &running_task.store,
+                    &running_task.queued_task.task.goal_id,
+                    &record.task_id,
+                    record.session_id.as_deref(),
+                    record.run_epoch,
+                    "task_manager.worker_error",
+                    PromptSettleEvent::Error,
+                )?;
                 write_task_record(&running_task.store, &record)?;
                 append_task_lifecycle_event(&running_task.store, &record, Some(&transition))?;
                 if record.status == ManagedTaskStatus::Failed {
@@ -2267,6 +2523,15 @@ impl TaskManager {
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
                             let run_epoch = record.run_epoch;
+                            record_worker_settle_event(
+                                &running_task.store,
+                                &running_task.queued_task.task.goal_id,
+                                &record.task_id,
+                                record.session_id.as_deref(),
+                                run_epoch,
+                                "task_manager.fallback",
+                                PromptSettleEvent::FallbackRetry,
+                            )?;
                             self.control
                                 .update_current_status(task_id, record.status.clone())?;
                             self.release_running_task_once(task_id, run_epoch, &running_task)?;
@@ -2634,8 +2899,19 @@ impl TaskManager {
         let started_at = timestamp();
         let handle = resident_task.handle.clone();
         let session_id = handle.session_id();
+        let control_session_id = session_id
+            .clone()
+            .unwrap_or_else(|| format!("task:{task_id}"));
+        let goal_epoch_context = self.goal_epoch_context.clone();
         let revive_result = (|| -> Result<RunningTask> {
-            let subscription = subscribe_to_worker_events(&handle)?;
+            let subscription = subscribe_to_worker_events(
+                &handle,
+                &resident_task.queued_task.store,
+                task_id,
+                &resident_task.queued_task.task.goal_id,
+                previous_record.run_epoch.saturating_add(1),
+                goal_epoch_context,
+            )?;
             let record = self
                 .records
                 .get_mut(task_id)
@@ -2682,6 +2958,13 @@ impl TaskManager {
                 task_id.to_string(),
                 ManagedTaskStatus::Running,
                 Some(handle.clone()),
+            )?;
+            self.control.set_dispatch_context(
+                task_id,
+                resident_task.queued_task.store.clone(),
+                resident_task.queued_task.task.goal_id.clone(),
+                control_session_id,
+                record_snapshot.run_epoch,
             )?;
             let running_task = RunningTask {
                 store: resident_task.queued_task.store.clone(),
@@ -2740,27 +3023,117 @@ impl TaskManager {
         self.send_follow_up_task_inner(task_id, prompt, None)
     }
 
+    fn acquire_prompt_dispatch_gate(
+        &self,
+        task_id: &str,
+        record: &TaskRecord,
+        message_kind: &str,
+        source: &str,
+        prompt: &str,
+    ) -> Result<PromptDispatchGateResult> {
+        let queued_task = self
+            .running_tasks
+            .get(task_id)
+            .map(|running_task| running_task.queued_task.clone())
+            .or_else(|| {
+                self.resident_tasks
+                    .get(task_id)
+                    .map(|resident_task| resident_task.queued_task.clone())
+            })
+            .or_else(|| {
+                self.queued_tasks
+                    .iter()
+                    .find(|queued_task| queued_task.task.id == task_id)
+                    .cloned()
+            });
+        let Some(queued_task) = queued_task else {
+            return Ok(PromptDispatchGateResult::Unavailable);
+        };
+        let session_id = record
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("task:{task_id}"));
+        let semantic_key = format!(
+            "{message_kind}:{source}:{}",
+            prompt
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        );
+        let decision = queued_task.store.reserve_prompt_dispatch_with_options(
+            &queued_task.task.goal_id,
+            task_id,
+            &session_id,
+            record.run_epoch as usize,
+            message_kind,
+            source,
+            prompt,
+            Some(&semantic_key),
+        )?;
+        match decision {
+            PromptDispatchDecision::Acquired(gate) => {
+                Ok(PromptDispatchGateResult::Acquired(queued_task.store, gate))
+            }
+            PromptDispatchDecision::Duplicate(_) => Ok(PromptDispatchGateResult::Duplicate),
+        }
+    }
+
     fn send_follow_up_task_inner(
         &mut self,
         task_id: &str,
         prompt: String,
         caller_session_id: Option<String>,
     ) -> Result<SendOutcome> {
-        let Some(record) = self.records.get(task_id) else {
+        let Some(record) = self.records.get(task_id).cloned() else {
             return Ok(SendOutcome::Noop(OutcomeContext {
                 task_id: Some(task_id.to_string()),
                 ..OutcomeContext::default()
             }));
         };
         let run_epoch = record.run_epoch;
+        let gate_context = match self.acquire_prompt_dispatch_gate(
+            task_id,
+            &record,
+            "follow_up",
+            "task_manager",
+            &prompt,
+        )? {
+            PromptDispatchGateResult::Acquired(store, gate) => Some((store, gate)),
+            PromptDispatchGateResult::Duplicate => {
+                return Ok(SendOutcome::Noop(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(run_epoch as usize),
+                    queue_position: None,
+                }));
+            }
+            PromptDispatchGateResult::Unavailable => None,
+        };
+        let settle_gate = |status: PromptDispatchGateStatus, reason: Option<String>| {
+            if let Some((store, gate)) = gate_context.as_ref() {
+                store
+                    .settle_prompt_dispatch_gate(gate, status, None, reason)
+                    .map(|_| ())
+            } else {
+                Ok(())
+            }
+        };
 
         if record.status == ManagedTaskStatus::Pending {
-            self.control.queue_pending_message(
+            let queued = self.control.queue_pending_message(
                 task_id,
                 QueuedMessageKind::FollowUp,
                 prompt,
                 caller_session_id,
-            )?;
+            );
+            if let Err(error) = queued {
+                let _ = settle_gate(
+                    PromptDispatchGateStatus::Failed,
+                    Some(format!("failed to queue follow-up: {error:#}")),
+                );
+                return Err(error);
+            }
+            settle_gate(PromptDispatchGateStatus::Held, None)?;
             return Ok(SendOutcome::Queued(OutcomeContext {
                 task_id: Some(task_id.to_string()),
                 run_epoch: Some(run_epoch as usize),
@@ -2769,7 +3142,14 @@ impl TaskManager {
         }
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
-            running_task.handle.send_follow_up(prompt)?;
+            if let Err(error) = running_task.handle.send_follow_up(prompt) {
+                let _ = settle_gate(
+                    PromptDispatchGateStatus::Failed,
+                    Some(format!("follow-up dispatch failed: {error:#}")),
+                );
+                return Err(error);
+            }
+            settle_gate(PromptDispatchGateStatus::Accepted, None)?;
             return Ok(SendOutcome::Sent(OutcomeContext {
                 task_id: Some(task_id.to_string()),
                 run_epoch: Some(run_epoch as usize),
@@ -2777,8 +3157,10 @@ impl TaskManager {
             }));
         }
 
-        if messageability_for_record(record) == Messageability::Revive {
-            if self.revive_task(task_id, prompt.clone(), QueuedMessageKind::FollowUp)? {
+        if messageability_for_record(&record) == Messageability::Revive {
+            let revived = self.revive_task(task_id, prompt.clone(), QueuedMessageKind::FollowUp)?;
+            if revived {
+                settle_gate(PromptDispatchGateStatus::Accepted, None)?;
                 return Ok(SendOutcome::Revive(OutcomeContext {
                     task_id: Some(task_id.to_string()),
                     run_epoch: Some(run_epoch as usize),
@@ -2792,6 +3174,7 @@ impl TaskManager {
                     kind: QueuedMessageKind::FollowUp,
                     caller_session_id,
                 });
+                settle_gate(PromptDispatchGateStatus::Held, None)?;
                 return Ok(SendOutcome::Queued(OutcomeContext {
                     task_id: Some(task_id.to_string()),
                     run_epoch: Some(run_epoch as usize),
@@ -2804,6 +3187,11 @@ impl TaskManager {
                 queue_position: None,
             }));
         }
+
+        settle_gate(
+            PromptDispatchGateStatus::Released,
+            Some("task is not continuable".to_string()),
+        )?;
 
         Ok(SendOutcome::NotContinuable(OutcomeContext {
             task_id: Some(task_id.to_string()),
@@ -2867,21 +3255,55 @@ impl TaskManager {
         prompt: String,
         caller_session_id: Option<String>,
     ) -> Result<SteerOutcome> {
-        let Some(record) = self.records.get(task_id) else {
+        let Some(record) = self.records.get(task_id).cloned() else {
             return Ok(SteerOutcome::Noop(OutcomeContext {
                 task_id: Some(task_id.to_string()),
                 ..OutcomeContext::default()
             }));
         };
         let run_epoch = record.run_epoch;
+        let gate_context = match self.acquire_prompt_dispatch_gate(
+            task_id,
+            &record,
+            "steer",
+            "task_manager",
+            &prompt,
+        )? {
+            PromptDispatchGateResult::Acquired(store, gate) => Some((store, gate)),
+            PromptDispatchGateResult::Duplicate => {
+                return Ok(SteerOutcome::Noop(OutcomeContext {
+                    task_id: Some(task_id.to_string()),
+                    run_epoch: Some(run_epoch as usize),
+                    queue_position: None,
+                }));
+            }
+            PromptDispatchGateResult::Unavailable => None,
+        };
+        let settle_gate = |status: PromptDispatchGateStatus, reason: Option<String>| {
+            if let Some((store, gate)) = gate_context.as_ref() {
+                store
+                    .settle_prompt_dispatch_gate(gate, status, None, reason)
+                    .map(|_| ())
+            } else {
+                Ok(())
+            }
+        };
 
         if record.status == ManagedTaskStatus::Pending {
-            self.control.queue_pending_message(
+            let queued = self.control.queue_pending_message(
                 task_id,
                 QueuedMessageKind::Steer,
                 prompt,
                 caller_session_id,
-            )?;
+            );
+            if let Err(error) = queued {
+                let _ = settle_gate(
+                    PromptDispatchGateStatus::Failed,
+                    Some(format!("failed to queue steer: {error:#}")),
+                );
+                return Err(error);
+            }
+            settle_gate(PromptDispatchGateStatus::Held, None)?;
             return Ok(SteerOutcome::Queued(OutcomeContext {
                 task_id: Some(task_id.to_string()),
                 run_epoch: Some(run_epoch as usize),
@@ -2890,7 +3312,14 @@ impl TaskManager {
         }
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
-            running_task.handle.steer(prompt)?;
+            if let Err(error) = running_task.handle.steer(prompt) {
+                let _ = settle_gate(
+                    PromptDispatchGateStatus::Failed,
+                    Some(format!("steer dispatch failed: {error:#}")),
+                );
+                return Err(error);
+            }
+            settle_gate(PromptDispatchGateStatus::Accepted, None)?;
             return Ok(SteerOutcome::Steered(OutcomeContext {
                 task_id: Some(task_id.to_string()),
                 run_epoch: Some(run_epoch as usize),
@@ -2898,8 +3327,10 @@ impl TaskManager {
             }));
         }
 
-        if messageability_for_record(record) == Messageability::Revive {
-            if self.revive_task(task_id, prompt.clone(), QueuedMessageKind::Steer)? {
+        if messageability_for_record(&record) == Messageability::Revive {
+            let revived = self.revive_task(task_id, prompt.clone(), QueuedMessageKind::Steer)?;
+            if revived {
+                settle_gate(PromptDispatchGateStatus::Accepted, None)?;
                 return Ok(SteerOutcome::Revive(OutcomeContext {
                     task_id: Some(task_id.to_string()),
                     run_epoch: Some(run_epoch as usize),
@@ -2913,6 +3344,7 @@ impl TaskManager {
                     kind: QueuedMessageKind::Steer,
                     caller_session_id,
                 });
+                settle_gate(PromptDispatchGateStatus::Held, None)?;
                 return Ok(SteerOutcome::Queued(OutcomeContext {
                     task_id: Some(task_id.to_string()),
                     run_epoch: Some(run_epoch as usize),
@@ -2925,6 +3357,11 @@ impl TaskManager {
                 queue_position: None,
             }));
         }
+
+        settle_gate(
+            PromptDispatchGateStatus::Released,
+            Some("task is not continuable".to_string()),
+        )?;
 
         Ok(SteerOutcome::NotContinuable(OutcomeContext {
             task_id: Some(task_id.to_string()),
@@ -3153,7 +3590,101 @@ impl TaskManager {
         Ok(())
     }
 
+    fn remember_unavailable_model_for_goal(&mut self, goal_id: &str, record: &TaskRecord) {
+        let Some(previous_attempt) = record.attempts.last() else {
+            return;
+        };
+        if !matches!(
+            previous_attempt.failure_kind,
+            Some(
+                TaskFailureKind::ModelUnavailable | TaskFailureKind::ProviderTemporarilyUnavailable
+            )
+        ) {
+            return;
+        }
+        let Some(worker_model) = previous_attempt
+            .worker_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|worker_model| !worker_model.is_empty())
+        else {
+            return;
+        };
+        self.goal_unavailable_worker_models
+            .entry(goal_id.to_string())
+            .or_default()
+            .insert(worker_model.to_string(), Instant::now());
+    }
+
+    fn apply_goal_unavailable_models(&mut self, queued_task: &mut QueuedTask) {
+        let unavailable_models = self
+            .goal_unavailable_worker_models
+            .get_mut(&queued_task.task.goal_id)
+            .map(|models| {
+                models.retain(|_, failed_at| failed_at.elapsed() < GOAL_WORKER_MODEL_COOLDOWN);
+                models.keys().cloned().collect::<Vec<_>>()
+            });
+        let Some(unavailable_models) = unavailable_models else {
+            return;
+        };
+        if unavailable_models.is_empty() {
+            self.goal_unavailable_worker_models
+                .remove(&queued_task.task.goal_id);
+            return;
+        }
+        for unavailable_model in unavailable_models {
+            if !queued_task
+                .config
+                .unavailable_worker_models
+                .iter()
+                .any(|configured_model| configured_model.eq_ignore_ascii_case(&unavailable_model))
+            {
+                queued_task
+                    .config
+                    .unavailable_worker_models
+                    .push(unavailable_model);
+            }
+        }
+    }
+
+    fn remember_provider_session_for_goal(
+        &mut self,
+        goal_id: &str,
+        store: &StateStore,
+        task_id: &str,
+    ) -> Result<()> {
+        let Some(provider_session_id) = provider_session_id_for_task(store, task_id)? else {
+            return Ok(());
+        };
+        self.goal_provider_sessions
+            .insert(goal_id.to_string(), provider_session_id);
+        Ok(())
+    }
+
+    fn seed_goal_provider_session(&self, queued_task: &QueuedTask) -> Result<()> {
+        let selected_route = queued_task
+            .config
+            .selected_route_for_hint(queued_task.route_attempt, queued_task.route_hint.as_deref());
+        if selected_route.worker_kind != WorkerKind::OpencodeSession {
+            return Ok(());
+        }
+        let Some(provider_session_id) = self.goal_provider_sessions.get(&queued_task.task.goal_id)
+        else {
+            return Ok(());
+        };
+        seed_provider_session_for_task(
+            &queued_task.store,
+            &queued_task.workspace,
+            &queued_task.task,
+            selected_route.worker_kind,
+            selected_route.worker_model.map(ToString::to_string),
+            provider_session_id,
+        )
+    }
+
     fn start_queued_task(&mut self, mut queued_task: QueuedTask) -> Result<()> {
+        self.apply_goal_unavailable_models(&mut queued_task);
+        self.seed_goal_provider_session(&queued_task)?;
         let task_id = queued_task.task.id.clone();
         loop {
             if let Some(model_unavailable_error) =
@@ -3295,11 +3826,38 @@ impl TaskManager {
                     "concurrency slot unexpectedly unavailable while starting task: {task_id}"
                 ));
             }
-            let subscription = subscribe_to_worker_events(&handle)?;
+            let run_epoch = self
+                .records
+                .get(&task_id)
+                .map(|record| record.run_epoch)
+                .unwrap_or_default();
+            let subscription = subscribe_to_worker_events(
+                &handle,
+                &queued_task.store,
+                &task_id,
+                &queued_task.task.goal_id,
+                run_epoch,
+                self.goal_epoch_context.clone(),
+            )?;
             self.control.set_current(
                 task_id.clone(),
                 ManagedTaskStatus::Running,
                 Some(Arc::clone(&handle)),
+            )?;
+            let control_session_id = self
+                .records
+                .get(&task_id)
+                .and_then(|record| record.session_id.clone())
+                .unwrap_or_else(|| format!("task:{task_id}"));
+            self.control.set_dispatch_context(
+                &task_id,
+                queued_task.store.clone(),
+                queued_task.task.goal_id.clone(),
+                control_session_id,
+                self.records
+                    .get(&task_id)
+                    .map(|record| record.run_epoch)
+                    .unwrap_or_default(),
             )?;
             let running_task = RunningTask {
                 store: queued_task.store.clone(),
@@ -4187,6 +4745,25 @@ fn queued_task_from_request(request: WorkerStartRequest<'_>) -> QueuedTask {
     }
 }
 
+fn record_worker_settle_event(
+    store: &StateStore,
+    goal_id: &str,
+    task_id: &str,
+    session_id: Option<&str>,
+    run_epoch: u64,
+    source: &str,
+    event: PromptSettleEvent,
+) -> Result<()> {
+    let session_id = session_id
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("task:{task_id}"));
+    let run_epoch = usize::try_from(run_epoch).unwrap_or(usize::MAX);
+    store
+        .record_prompt_settle_decision(goal_id, task_id, &session_id, run_epoch, source, event)
+        .map(|_| ())
+}
+
 fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> FallbackDecision {
     if let Some(failure_kind) = record
         .attempts
@@ -4201,14 +4778,15 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         let max_attempts = queued_task.config.worker_routes.len().max(2);
         if same_failure_count >= max_attempts {
             return FallbackDecision::Unavailable {
-                reason: format!(
-                    "same failure kind `{failure_kind:?}` reached retry limit {max_attempts}"
-                ),
+                reason: fallback_exhaustion_reason(record, &failure_kind, max_attempts),
                 failure_kind: TaskFailureKind::RepeatedFailureLimit,
             };
         }
     }
 
+    if let Some(previous_attempt) = record.attempts.last() {
+        mark_failed_model_unavailable_for_retry(previous_attempt, &mut queued_task.config);
+    }
     maybe_append_failure_upgrade_route(record, queued_task);
 
     let Some(previous_attempt) = record.attempts.last() else {
@@ -4279,8 +4857,14 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
     let route_reason = selected_route.route_reason;
     let route_hint = queued_task.route_hint.clone();
     let started_at = timestamp();
+    let previous_model_label = fallback_model_label(
+        WorkerKind::parse(&previous_attempt.worker_kind).unwrap_or(WorkerKind::Custom),
+        previous_attempt.worker_model.as_deref(),
+    );
+    let next_model_label =
+        fallback_model_label(selected_route.worker_kind, worker_model.as_deref());
     let retry_reason = format!(
-        "retrying after {:?} with `{}` via {}",
+        "模型回退：{previous_model_label} -> {next_model_label}；retrying after {:?} with `{}` via {}",
         previous_attempt
             .failure_kind
             .clone()
@@ -4330,6 +4914,74 @@ fn normalized_worker_command(value: Option<&str>) -> Option<String> {
         .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+fn fallback_model_label(worker_kind: WorkerKind, worker_model: Option<&str>) -> String {
+    let worker_model = worker_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    match (worker_kind.provider_id_hint(), worker_model) {
+        (_, Some(model)) if model.contains('/') => model.to_string(),
+        (Some(provider_id), Some(model)) => format!("{provider_id}/{model}"),
+        (_, Some(model)) => format!("{}({model})", worker_kind.as_str()),
+        _ => worker_kind.as_str().to_string(),
+    }
+}
+
+fn fallback_exhaustion_reason(
+    record: &TaskRecord,
+    failure_kind: &TaskFailureKind,
+    max_attempts: usize,
+) -> String {
+    let mut attempted_models = record
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.failure_kind.as_ref() == Some(failure_kind))
+        .map(|attempt| {
+            fallback_model_label(
+                WorkerKind::parse(&attempt.worker_kind).unwrap_or(WorkerKind::Custom),
+                attempt.worker_model.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    attempted_models.dedup();
+    let attempted_models = if attempted_models.is_empty() {
+        "none".to_string()
+    } else {
+        attempted_models.join(" -> ")
+    };
+    format!(
+        "模型回退链已耗尽：已尝试 {attempted_models}；same failure kind `{failure_kind:?}` reached retry limit {max_attempts}"
+    )
+}
+
+fn mark_failed_model_unavailable_for_retry(
+    previous_attempt: &TaskAttempt,
+    config: &mut WorkerConfig,
+) {
+    if !matches!(
+        previous_attempt.failure_kind,
+        Some(TaskFailureKind::ModelUnavailable | TaskFailureKind::ProviderTemporarilyUnavailable)
+    ) {
+        return;
+    }
+    let Some(worker_model) = previous_attempt
+        .worker_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|worker_model| !worker_model.is_empty())
+    else {
+        return;
+    };
+    if !config
+        .unavailable_worker_models
+        .iter()
+        .any(|unavailable_model| unavailable_model.eq_ignore_ascii_case(worker_model))
+    {
+        config
+            .unavailable_worker_models
+            .push(worker_model.to_string());
+    }
+}
+
 fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut QueuedTask) {
     if queued_task.task.inputs.phase_route_locked {
         return;
@@ -4349,6 +5001,7 @@ fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut Que
             | TaskFailureKind::WorkerStartFailed
             | TaskFailureKind::WorkerUnavailable
             | TaskFailureKind::ModelUnavailable
+            | TaskFailureKind::ProviderTemporarilyUnavailable
     ) {
         return;
     }
@@ -4357,6 +5010,14 @@ fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut Que
         Some(WorkerKind::Opencode | WorkerKind::OpencodeSession) => WorkerKind::Codex,
         _ => return,
     };
+    if WorkerKind::parse(&previous_attempt.worker_kind) == Some(WorkerKind::OpencodeSession)
+        && queued_task.config.worker_routes.iter().any(|route| {
+            route.worker_kind == WorkerKind::OpencodeSession
+                && route.worker_model.as_deref() != previous_attempt.worker_model.as_deref()
+        })
+    {
+        return;
+    }
     if queued_task
         .config
         .worker_routes
@@ -4398,16 +5059,80 @@ fn failure_kind_from_worker_result(
             }
         }
         WorkerStatus::Failed => {
-            if outcome.known_failures.iter().any(|failure| {
-                failure.to_ascii_lowercase().contains("cancelled")
-                    || failure.to_ascii_lowercase().contains("canceled")
-            }) {
+            if worker_outcome_is_cancelled(outcome) {
                 Some(TaskFailureKind::WorkerCancelled)
+            } else if worker_outcome_has_model_unavailable_error(outcome) {
+                Some(TaskFailureKind::ModelUnavailable)
+            } else if worker_outcome_has_retryable_provider_error(outcome) {
+                Some(TaskFailureKind::ProviderTemporarilyUnavailable)
             } else {
                 Some(TaskFailureKind::WorkerFailed)
             }
         }
     }
+}
+
+fn worker_outcome_is_cancelled(outcome: &WorkerOutcome) -> bool {
+    outcome.known_failures.iter().any(|failure| {
+        let failure = failure.to_ascii_lowercase();
+        failure.contains("cancelled") || failure.contains("canceled") || failure.contains("aborted")
+    })
+}
+
+fn worker_outcome_has_model_unavailable_error(outcome: &WorkerOutcome) -> bool {
+    outcome
+        .known_failures
+        .iter()
+        .chain(std::iter::once(&outcome.summary))
+        .map(|failure| failure.to_ascii_lowercase())
+        .any(|failure| {
+            failure.contains("model_not_found")
+                || failure.contains("model unavailable")
+                || failure.contains("model not found")
+                || (failure.contains("model") && failure.contains("not supported"))
+        })
+}
+
+fn worker_outcome_has_retryable_provider_error(outcome: &WorkerOutcome) -> bool {
+    outcome
+        .known_failures
+        .iter()
+        .chain(std::iter::once(&outcome.summary))
+        .map(|failure| failure.to_ascii_lowercase())
+        .any(|failure| {
+            failure.contains("rate limit")
+                || failure.contains("rate-limit")
+                || failure.contains("too many requests")
+                || failure.contains("quota exceeded")
+                || failure.contains("usage quota")
+                || failure.contains("free usage")
+                || failure.contains("limit exhausted")
+                || failure.contains("cooling down")
+                || failure.contains("service unavailable")
+                || failure.contains("temporarily unavailable")
+                || failure.contains("overloaded")
+                || failure
+                    .split(|character: char| !character.is_ascii_digit())
+                    .any(|status_code| matches!(status_code, "429" | "503" | "529"))
+                || failure.contains("使用上限")
+                || failure.contains("频率限制")
+                || failure.contains("请求过于频繁")
+                || failure.contains("暂时不可用")
+                || failure.contains("服务不可用")
+        })
+}
+
+fn is_retryable_worker_failure(failure_kind: Option<&TaskFailureKind>) -> bool {
+    matches!(
+        failure_kind,
+        None | Some(
+            TaskFailureKind::WorkerFailed
+                | TaskFailureKind::WorkerStartFailed
+                | TaskFailureKind::WorkerUnavailable
+                | TaskFailureKind::ModelUnavailable
+                | TaskFailureKind::ProviderTemporarilyUnavailable
+        )
+    )
 }
 
 fn should_retry_worker_result(
@@ -4416,7 +5141,7 @@ fn should_retry_worker_result(
     result: &WorkerResult,
 ) -> bool {
     if result.status == WorkerStatus::Failed {
-        return true;
+        return is_retryable_worker_failure(record.failure_kind.as_ref());
     }
 
     record.failure_kind == Some(TaskFailureKind::WorkerUnavailable)
@@ -4425,12 +5150,220 @@ fn should_retry_worker_result(
 
 fn subscribe_to_worker_events(
     handle: &Arc<dyn WorkerSessionHandle>,
+    store: &StateStore,
+    task_id: &str,
+    goal_id: &str,
+    run_epoch: u64,
+    goal_epoch_context: Option<GoalEpochContext>,
 ) -> Result<Option<WorkerSubscription>> {
     if handle.supports_event_subscriptions() {
-        Ok(Some(handle.subscribe(Arc::new(|_| {}))?))
+        let store = store.clone();
+        let task_id = task_id.to_string();
+        let goal_id = goal_id.to_string();
+        let session_id = handle.session_id();
+        Ok(Some(handle.subscribe(Arc::new(move |event| {
+            if let Err(error) =
+                append_worker_event_evidence(&store, &task_id, session_id.as_deref(), &event)
+            {
+                eprintln!("failed to persist worker event evidence: {error:#}");
+            }
+            if let Some(settle_event) = worker_event_settle_event(&event)
+                && let Err(error) = record_worker_settle_event(
+                    &store,
+                    &goal_id,
+                    &task_id,
+                    session_id.as_deref(),
+                    run_epoch,
+                    "task_manager.worker_event",
+                    settle_event,
+                )
+            {
+                eprintln!("failed to persist worker event settle decision: {error:#}");
+            }
+            if let Some(context) = goal_epoch_context.as_ref()
+                && let Err(error) = project_worker_event_to_guard(&store, context, &task_id, &event)
+            {
+                eprintln!("failed to project worker event to continuation guard: {error:#}");
+            }
+        }))?))
     } else {
         Ok(None)
     }
+}
+
+fn project_worker_event_to_guard(
+    store: &StateStore,
+    context: &GoalEpochContext,
+    task_id: &str,
+    event: &WorkerEvent,
+) -> Result<()> {
+    let Some(existing_guard) = store.read_continuation_guard_for_session(&context.session_id)?
+    else {
+        return Ok(());
+    };
+    if existing_guard.goal_id != context.goal_id || existing_guard.epoch_id != context.epoch_id {
+        return Ok(());
+    }
+    let marker = match event {
+        WorkerEvent::TurnStarted { .. } => Some("turn_started"),
+        WorkerEvent::AssistantTextDelta { .. } => Some("assistant_text_delta"),
+        WorkerEvent::ToolCallStarted { .. } => Some("tool_call_started"),
+        WorkerEvent::ToolCallFinished { .. } => Some("tool_call_finished"),
+        WorkerEvent::WorkerStdout { .. } => Some("worker_stdout"),
+        WorkerEvent::WorkerStderr { .. } => Some("worker_stderr"),
+        WorkerEvent::Error { .. } => Some("error"),
+        WorkerEvent::TurnFinished { .. } => None,
+    };
+    let Some(marker) = marker else {
+        return Ok(());
+    };
+    store.update_continuation_guard(
+        &context.session_id,
+        &context.goal_id,
+        &context.epoch_id,
+        |guard| {
+            match event {
+                WorkerEvent::Error { .. } => {
+                    guard.in_flight = false;
+                    guard.background_pending = true;
+                    guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+                }
+                _ => {
+                    guard.in_flight = true;
+                    guard.background_pending = true;
+                    guard.stagnation_count = 0;
+                }
+            }
+            guard.last_progress_marker = Some(format!("worker_event:{task_id}:{marker}"));
+        },
+    )?;
+    Ok(())
+}
+
+fn worker_event_settle_event(event: &WorkerEvent) -> Option<PromptSettleEvent> {
+    match event {
+        WorkerEvent::TurnStarted { .. } => Some(PromptSettleEvent::Busy),
+        WorkerEvent::Error { .. } => Some(PromptSettleEvent::Error),
+        WorkerEvent::AssistantTextDelta { .. }
+        | WorkerEvent::ToolCallStarted { .. }
+        | WorkerEvent::ToolCallFinished { .. }
+        | WorkerEvent::WorkerStdout { .. }
+        | WorkerEvent::WorkerStderr { .. }
+        | WorkerEvent::TurnFinished { .. } => None,
+    }
+}
+
+fn append_worker_event_evidence(
+    store: &StateStore,
+    task_id: &str,
+    session_id: Option<&str>,
+    event: &WorkerEvent,
+) -> Result<()> {
+    let (event_type, kind, details) = match event {
+        WorkerEvent::TurnStarted { kind, prompt_path } => (
+            "turn_started",
+            kind,
+            serde_json::json!({ "prompt_file": evidence_file_name(prompt_path) }),
+        ),
+        WorkerEvent::AssistantTextDelta { kind, delta } => (
+            "assistant_text_delta",
+            kind,
+            serde_json::json!({ "delta_length": delta.chars().count() }),
+        ),
+        WorkerEvent::ToolCallStarted {
+            kind,
+            tool_name,
+            arguments,
+        } => (
+            "tool_call_started",
+            kind,
+            serde_json::json!({
+                "tool_name": tool_name,
+                "arguments_length": arguments.chars().count(),
+            }),
+        ),
+        WorkerEvent::ToolCallFinished {
+            kind,
+            tool_name,
+            result,
+        } => (
+            "tool_call_finished",
+            kind,
+            serde_json::json!({
+                "tool_name": tool_name,
+                "result_length": result.chars().count(),
+            }),
+        ),
+        WorkerEvent::WorkerStdout { kind, output } => (
+            "worker_stdout",
+            kind,
+            serde_json::json!({ "output_length": output.chars().count() }),
+        ),
+        WorkerEvent::WorkerStderr { kind, output } => (
+            "worker_stderr",
+            kind,
+            serde_json::json!({ "output_length": output.chars().count() }),
+        ),
+        WorkerEvent::TurnFinished {
+            kind,
+            result_path,
+            outcome_path,
+            summary,
+        } => (
+            "turn_finished",
+            kind,
+            serde_json::json!({
+                "result_file": evidence_file_name(result_path),
+                "outcome_file": evidence_file_name(outcome_path),
+                "summary_length": summary.chars().count(),
+            }),
+        ),
+        WorkerEvent::Error { kind, message } => (
+            "error",
+            kind,
+            serde_json::json!({ "message": truncate_event_error(message) }),
+        ),
+    };
+    let event_record = serde_json::json!({
+        "recorded_at": timestamp(),
+        "task_id": task_id,
+        "session_id": session_id,
+        "event_type": event_type,
+        "kind": kind,
+        "details": details,
+    });
+    let path = store.worker_dir(task_id).join("worker-events.jsonl");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(&event_record)?)
+        .with_context(|| format!("failed to append {}", path.display()))?;
+    Ok(())
+}
+
+fn evidence_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn truncate_event_error(message: &str) -> String {
+    const MAX_EVENT_ERROR_CHARS: usize = 512;
+    let mut truncated = message
+        .chars()
+        .take(MAX_EVENT_ERROR_CHARS)
+        .collect::<String>();
+    if message.chars().count() > MAX_EVENT_ERROR_CHARS {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 fn concurrency_key_for_task(queued_task: &QueuedTask) -> String {
@@ -4507,7 +5440,10 @@ mod tests {
 
     use super::*;
     use crate::state::{Scope, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus};
-    use crate::workers::{WorkerConfig, WorkerEventListener, WorkerKind, WorkerRoute};
+    use crate::workers::{
+        NativeWorkerBackend, WorkerConfig, WorkerEventHub, WorkerEventListener, WorkerKind,
+        WorkerRoute,
+    };
 
     fn test_task(id: &str) -> Task {
         Task {
@@ -4594,6 +5530,107 @@ mod tests {
                 error: None,
             }],
         }
+    }
+
+    struct StartFailingNativeBackend;
+
+    impl NativeWorkerBackend for StartFailingNativeBackend {
+        fn start_zed_agent(
+            &self,
+            _request: WorkerStartRequest<'_>,
+        ) -> Result<Arc<dyn WorkerSessionHandle>> {
+            Err(anyhow::anyhow!("injected native worker start failure"))
+        }
+    }
+
+    #[test]
+    fn cancelled_or_aborted_worker_failure_is_not_retryable() {
+        assert!(!is_retryable_worker_failure(Some(
+            &TaskFailureKind::WorkerCancelled,
+        )));
+        assert!(is_retryable_worker_failure(Some(
+            &TaskFailureKind::ModelUnavailable,
+        )));
+        assert!(is_retryable_worker_failure(Some(
+            &TaskFailureKind::ProviderTemporarilyUnavailable,
+        )));
+
+        let aborted_outcome = WorkerOutcome {
+            status: WorkerStatus::Failed,
+            session_id: None,
+            session_capability: None,
+            summary: "worker aborted".to_string(),
+            changed_files: Vec::new(),
+            commands_run: Vec::new(),
+            known_failures: vec!["request aborted by user".to_string()],
+            raw_output_path: None,
+            command: None,
+            exit_code: None,
+        };
+        let result = WorkerResult {
+            status: WorkerStatus::Failed,
+            command: None,
+            exit_code: None,
+            summary: "worker aborted".to_string(),
+            packet_path: PathBuf::from("packet.json"),
+            prompt_path: PathBuf::from("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: None,
+            result_path: PathBuf::from("result.json"),
+            outcome_path: PathBuf::from("outcome.json"),
+        };
+
+        assert_eq!(
+            failure_kind_from_worker_result(&result, &aborted_outcome),
+            Some(TaskFailureKind::WorkerCancelled)
+        );
+
+        let unavailable_model_outcome = WorkerOutcome {
+            known_failures: vec!["provider returned model_not_found".to_string()],
+            ..aborted_outcome
+        };
+        assert_eq!(
+            failure_kind_from_worker_result(&result, &unavailable_model_outcome),
+            Some(TaskFailureKind::ModelUnavailable)
+        );
+
+        let unavailable_provider_outcome = WorkerOutcome {
+            known_failures: vec!["HTTP 429 rate limit exceeded for free usage".to_string()],
+            ..unavailable_model_outcome
+        };
+        assert_eq!(
+            failure_kind_from_worker_result(&result, &unavailable_provider_outcome),
+            Some(TaskFailureKind::ProviderTemporarilyUnavailable)
+        );
+    }
+
+    #[test]
+    fn fallback_exhaustion_reason_lists_the_models_already_tried() {
+        let failure_kind = TaskFailureKind::ProviderTemporarilyUnavailable;
+        let mut record = test_task_record(
+            "task_exhausted_free_models",
+            ManagedTaskStatus::Failed,
+            TaskAttemptStatus::Failed,
+        );
+        record.attempts[0].worker_kind = "opencode_session".to_string();
+        record.attempts[0].worker_model = Some("opencode/hy3-free".to_string());
+        record.attempts[0].failure_kind = Some(failure_kind.clone());
+        let mut mimo_attempt = record.attempts[0].clone();
+        mimo_attempt.attempt = 2;
+        mimo_attempt.worker_model = Some("opencode/mimo-v2.5-free".to_string());
+        let mut deepseek_attempt = record.attempts[0].clone();
+        deepseek_attempt.attempt = 3;
+        deepseek_attempt.worker_model = Some("opencode/deepseek-v4-flash-free".to_string());
+        record.attempts.extend([mimo_attempt, deepseek_attempt]);
+
+        let reason = fallback_exhaustion_reason(&record, &failure_kind, 3);
+
+        assert!(reason.contains("模型回退链已耗尽"));
+        assert!(reason.contains(
+            "opencode/hy3-free -> opencode/mimo-v2.5-free -> opencode/deepseek-v4-flash-free"
+        ));
+        assert!(reason.contains("ProviderTemporarilyUnavailable"));
     }
 
     #[test]
@@ -4761,6 +5798,587 @@ mod tests {
         let events = fs::read_to_string(store.worker_dir(&task.id).join("task-events.jsonl"))?;
         assert!(events.contains(r#""status":"failed""#));
         assert!(events.contains(r#"Worker fallback attempt 2 queued."#));
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_continues_after_selected_worker_start_fails() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_start_failure_fallback");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::ZedAgent,
+                    worker_command: None,
+                    worker_model: None,
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("printf fallback-start-ok".to_string()),
+                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let mut manager = TaskManager::new();
+        manager.set_worker_registry(WorkerRegistry::with_native_backend(Arc::new(
+            StartFailingNativeBackend,
+        )));
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test start failure fallback",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 2);
+        assert_eq!(
+            run.record.attempts[0].failure_kind,
+            Some(TaskFailureKind::WorkerStartFailed)
+        );
+        assert_eq!(run.record.attempts[1].status, TaskAttemptStatus::Completed);
+        assert!(
+            run.record.attempts[1]
+                .retry_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("retrying after WorkerStartFailed"))
+        );
+        assert!(
+            run.record.attempts[1].retry_reason.as_deref().is_some_and(
+                |reason| reason.contains("模型回退：zed_agent -> opencode/mimo-v2.5-free")
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_switches_to_distinct_model_after_model_unavailable() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_model_unavailable_fallback");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: None,
+            worker_model: Some("openai/primary".to_string()),
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some(
+                        "sh -c 'printf \"model not found\\n\" >&2; exit 2'".to_string(),
+                    ),
+                    worker_model: Some("openai/primary".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("printf fallback-model-ok".to_string()),
+                    worker_model: Some("openai/secondary".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 2,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test model fallback",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.record.attempts.len(), 2);
+        assert_eq!(
+            run.record.attempts[0].failure_kind,
+            Some(TaskFailureKind::ModelUnavailable)
+        );
+        assert_eq!(
+            run.record.attempts[0].worker_model.as_deref(),
+            Some("openai/primary")
+        );
+        assert_eq!(
+            run.record.attempts[1].worker_model.as_deref(),
+            Some("openai/secondary")
+        );
+        assert_eq!(run.record.attempts[1].status, TaskAttemptStatus::Completed);
+        assert!(
+            run.record.attempts[1]
+                .retry_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ModelUnavailable"))
+        );
+        assert!(
+            run.record.attempts[1]
+                .retry_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason.contains("模型回退：openai/primary -> openai/secondary")
+                })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_switches_to_distinct_model_after_provider_temporary_unavailability()
+    -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_provider_temporary_unavailability_fallback");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: None,
+            worker_model: Some("opencode/hy3-free".to_string()),
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some(
+                        "sh -c 'printf \"HTTP 429 rate limit exceeded\\n\" >&2; exit 2'"
+                            .to_string(),
+                    ),
+                    worker_model: Some("opencode/hy3-free".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("printf fallback-provider-ok".to_string()),
+                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 2,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test provider fallback",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.record.attempts.len(), 2);
+        assert_eq!(
+            run.record.attempts[0].failure_kind,
+            Some(TaskFailureKind::ProviderTemporarilyUnavailable)
+        );
+        assert_eq!(
+            run.record.attempts[0].worker_model.as_deref(),
+            Some("opencode/hy3-free")
+        );
+        assert_eq!(
+            run.record.attempts[1].worker_model.as_deref(),
+            Some("opencode/mimo-v2.5-free")
+        );
+        assert_eq!(run.record.attempts[1].status, TaskAttemptStatus::Completed);
+        assert!(
+            run.record.attempts[1]
+                .retry_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ProviderTemporarilyUnavailable"))
+        );
+        assert!(
+            run.record.attempts[1]
+                .retry_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason.contains("模型回退：opencode/hy3-free -> opencode/mimo-v2.5-free")
+                })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_model_is_skipped_when_a_retry_changes_category() {
+        let mut config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some("opencode run --model opencode/hy3-free".to_string()),
+                    worker_model: Some("opencode/hy3-free".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some(
+                        "opencode run --model opencode/mimo-v2.5-free".to_string(),
+                    ),
+                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let failed_attempt = TaskAttempt {
+            attempt: 1,
+            worker_kind: "opencode_session".to_string(),
+            worker_command: None,
+            worker_model: Some("opencode/hy3-free".to_string()),
+            worker_category: "repair".to_string(),
+            route_hint: Some("repair".to_string()),
+            route_reason: "initial route".to_string(),
+            status: TaskAttemptStatus::Failed,
+            started_at: timestamp(),
+            finished_at: Some(timestamp()),
+            session_id: None,
+            result_path: None,
+            outcome_path: None,
+            summary: "model unavailable".to_string(),
+            failure_kind: Some(TaskFailureKind::ModelUnavailable),
+            retry_reason: None,
+            error: Some("model unavailable".to_string()),
+        };
+
+        mark_failed_model_unavailable_for_retry(&failed_attempt, &mut config);
+
+        assert_eq!(
+            config.unavailable_worker_models,
+            vec!["opencode/hy3-free".to_string()]
+        );
+        assert_eq!(
+            config.selected_route_for_hint(1, Some("deep")).worker_model,
+            Some("opencode/mimo-v2.5-free")
+        );
+
+        config.unavailable_worker_models.clear();
+        let mut temporarily_unavailable_attempt = failed_attempt.clone();
+        temporarily_unavailable_attempt.failure_kind =
+            Some(TaskFailureKind::ProviderTemporarilyUnavailable);
+        mark_failed_model_unavailable_for_retry(&temporarily_unavailable_attempt, &mut config);
+        assert_eq!(
+            config.selected_route_for_hint(1, Some("deep")).worker_model,
+            Some("opencode/mimo-v2.5-free")
+        );
+    }
+
+    #[test]
+    fn unavailable_model_propagates_to_later_tasks_in_the_same_goal() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let mut failed_record = test_task_record(
+            "task_failed_provider",
+            ManagedTaskStatus::Failed,
+            TaskAttemptStatus::Failed,
+        );
+        failed_record.attempts[0].worker_model = Some("opencode/hy3-free".to_string());
+        failed_record.attempts[0].failure_kind =
+            Some(TaskFailureKind::ProviderTemporarilyUnavailable);
+        let mut manager = TaskManager::new();
+        manager.set_goal_epoch_context("session_test", "goal_test", "epoch_test")?;
+        manager.remember_unavailable_model_for_goal("goal_test", &failed_record);
+
+        let next_task = test_task("task_repair_after_provider_failure");
+        let mut queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: next_task,
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: vec![
+                    WorkerRoute {
+                        worker_kind: WorkerKind::OpencodeSession,
+                        worker_command: Some("opencode run --model opencode/hy3-free".to_string()),
+                        worker_model: Some("opencode/hy3-free".to_string()),
+                    },
+                    WorkerRoute {
+                        worker_kind: WorkerKind::OpencodeSession,
+                        worker_command: Some(
+                            "opencode run --model opencode/mimo-v2.5-free".to_string(),
+                        ),
+                        worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                    },
+                ],
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: false,
+                require_worker: true,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair".to_string()),
+        };
+
+        manager.apply_goal_unavailable_models(&mut queued_task);
+
+        assert_eq!(
+            queued_task
+                .config
+                .selected_route_for_hint(1, Some("repair"))
+                .worker_model,
+            Some("opencode/mimo-v2.5-free")
+        );
+
+        let expired_at = Instant::now()
+            .checked_sub(GOAL_WORKER_MODEL_COOLDOWN + Duration::from_secs(1))
+            .expect("cooldown test timestamp should be representable");
+        manager
+            .goal_unavailable_worker_models
+            .get_mut("goal_test")
+            .expect("failed model should be tracked for the active goal")
+            .insert("opencode/hy3-free".to_string(), expired_at);
+        queued_task.config.unavailable_worker_models.clear();
+        manager.apply_goal_unavailable_models(&mut queued_task);
+        assert!(queued_task.config.unavailable_worker_models.is_empty());
+        assert_eq!(
+            queued_task
+                .config
+                .selected_route_for_hint(1, Some("repair"))
+                .worker_model,
+            Some("opencode/hy3-free")
+        );
+
+        manager.set_goal_epoch_context("session_test", "goal_new", "epoch_new")?;
+        queued_task.config.unavailable_worker_models.clear();
+        manager.apply_goal_unavailable_models(&mut queued_task);
+        assert!(queued_task.config.unavailable_worker_models.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_session_propagates_to_later_opencode_task_in_the_same_goal() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_repair_session_inheritance");
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some("opencode run".to_string()),
+                worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                worker_routes: vec![WorkerRoute {
+                    worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some("opencode run".to_string()),
+                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                }],
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: false,
+                require_worker: true,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair".to_string()),
+        };
+        let mut manager = TaskManager::new();
+        manager
+            .goal_provider_sessions
+            .insert("goal_test".to_string(), "provider-session-1".to_string());
+
+        manager.seed_goal_provider_session(&queued_task)?;
+
+        assert_eq!(
+            provider_session_id_for_task(&store, &task.id)?,
+            Some("provider-session-1".to_string())
+        );
+
+        manager.set_session_scope("new-session");
+        let next_task = test_task("task_new_session");
+        let next_queued_task = QueuedTask {
+            task: next_task.clone(),
+            ..queued_task
+        };
+        manager.seed_goal_provider_session(&next_queued_task)?;
+        assert_eq!(provider_session_id_for_task(&store, &next_task.id)?, None);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GEARBOX_LIVE_OPENCODE_SESSION_SMOKE=1 and OpenCode provider access"]
+    fn live_opencode_session_survives_a_same_goal_cross_model_task_handoff() -> Result<()> {
+        if std::env::var("GEARBOX_LIVE_OPENCODE_SESSION_SMOKE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Ok(());
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let first_task = test_task("live_opencode_session_start");
+        let second_task = test_task("live_opencode_session_continue");
+        let third_task = test_task("live_opencode_session_continue_deepseek");
+        let command = "sh -c 'if [ \"$GEARBOX_WORKER_RESUME\" = \"true\" ]; then opencode run --pure --format json --session \"$GEARBOX_WORKER_SESSION_ID\" --model \"$GEARBOX_WORKER_MODEL\" < \"$GEARBOX_WORKER_PROMPT\"; else opencode run --pure --format json --model \"$GEARBOX_WORKER_MODEL\" < \"$GEARBOX_WORKER_PROMPT\"; fi'".to_string();
+        let first_config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command.clone()),
+            worker_model: Some("opencode/hy3-free".to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(command.clone()),
+                worker_model: Some("opencode/hy3-free".to_string()),
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 45,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let second_config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command.clone()),
+            worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(command.clone()),
+                worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+            }],
+            ..first_config.clone()
+        };
+        let third_config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command.clone()),
+            worker_model: Some("opencode/deepseek-v4-flash-free".to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(command),
+                worker_model: Some("opencode/deepseek-v4-flash-free".to_string()),
+            }],
+            ..first_config.clone()
+        };
+        let mut manager = TaskManager::new();
+
+        let first_run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &first_task,
+            route_attempt: 1,
+            goal: "Reply with a concise acknowledgement and do not modify files.",
+            verification_commands: &[],
+            config: &first_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair"),
+        })?;
+        assert_eq!(first_run.result.status, WorkerStatus::Succeeded);
+        let provider_session_id = provider_session_id_for_task(&store, &first_task.id)?
+            .context("live OpenCode start did not persist a provider session id")?;
+
+        let second_run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &second_task,
+            route_attempt: 1,
+            goal: "Continue the existing session with a concise acknowledgement and do not modify files.",
+            verification_commands: &[],
+            config: &second_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair"),
+        })?;
+        assert_eq!(second_run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(
+            provider_session_id_for_task(&store, &second_task.id)?,
+            Some(provider_session_id.clone())
+        );
+
+        let third_run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &third_task,
+            route_attempt: 1,
+            goal: "Continue the existing session with a concise acknowledgement and do not modify files.",
+            verification_commands: &[],
+            config: &third_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair"),
+        })?;
+        assert_eq!(third_run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(
+            provider_session_id_for_task(&store, &third_task.id)?,
+            Some(provider_session_id)
+        );
+        if let Ok(report_path) = std::env::var("GEARBOX_LIVE_OPENCODE_SESSION_SMOKE_REPORT") {
+            std::fs::write(
+                report_path,
+                "status=passed\nmodels=opencode/hy3-free,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free\nprovider_session_continuity=asserted\n",
+            )?;
+        }
         Ok(())
     }
 
@@ -5478,6 +7096,71 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_free_model_falls_back_to_the_next_free_model() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_timed_out_free_model_fallback");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some("sleep 5".to_string()),
+                    worker_model: Some("opencode/hy3-free".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some("printf 'worker-ok\\n'".to_string()),
+                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 1,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair"),
+        })?;
+
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 2);
+        assert_eq!(
+            run.record.attempts[0].failure_kind,
+            Some(TaskFailureKind::ProviderTemporarilyUnavailable)
+        );
+        assert_eq!(
+            run.record.attempts[0].worker_model.as_deref(),
+            Some("opencode/hy3-free")
+        );
+        assert_eq!(
+            run.record.attempts[1].worker_model.as_deref(),
+            Some("opencode/mimo-v2.5-free")
+        );
+        assert!(run.record.retry_reason.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn task_manager_start_dispatches_worker_in_background_until_wait() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -5731,10 +7414,203 @@ mod tests {
     #[test]
     fn session_identity_does_not_imply_event_subscription_support() -> Result<()> {
         let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeOutputHandle);
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
 
         assert!(handle.session_id().is_some());
         assert!(!handle.supports_event_subscriptions());
-        assert!(subscribe_to_worker_events(&handle)?.is_none());
+        assert!(
+            subscribe_to_worker_events(
+                &handle,
+                &store,
+                "task_session_identity",
+                "goal_session_identity",
+                1,
+                None,
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    struct EventfulHandle {
+        event_hub: WorkerEventHub,
+    }
+
+    impl WorkerSessionHandle for EventfulHandle {
+        fn session_id(&self) -> Option<String> {
+            Some("session_eventful".to_string())
+        }
+
+        fn send_follow_up(&self, _prompt: String) -> Result<()> {
+            bail!("not supported")
+        }
+
+        fn steer(&self, _prompt: String) -> Result<()> {
+            bail!("not supported")
+        }
+
+        fn interrupt(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_event_subscriptions(&self) -> bool {
+            true
+        }
+
+        fn subscribe(&self, listener: WorkerEventListener) -> Result<WorkerSubscription> {
+            self.event_hub.subscribe(listener)
+        }
+
+        fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+            bail!("not supported")
+        }
+
+        fn wait_for_result(&self) -> Result<WorkerResult> {
+            bail!("not supported")
+        }
+
+        fn last_output(&self) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn worker_event_subscription_persists_bounded_task_evidence() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        store.update_continuation_guard(
+            "runtime_session_eventful",
+            "goal_eventful",
+            "epoch_eventful",
+            |_| {},
+        )?;
+        let event_hub = WorkerEventHub::default();
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
+            event_hub: event_hub.clone(),
+        });
+        let subscription = subscribe_to_worker_events(
+            &handle,
+            &store,
+            "task_eventful",
+            "goal_eventful",
+            3,
+            Some(GoalEpochContext {
+                session_id: "runtime_session_eventful".to_string(),
+                goal_id: "goal_eventful".to_string(),
+                epoch_id: "epoch_eventful".to_string(),
+            }),
+        )?
+        .context("eventful handle did not create a subscription")?;
+
+        event_hub.emit(WorkerEvent::TurnStarted {
+            kind: "acp".to_string(),
+            prompt_path: PathBuf::from("/private/prompt.md"),
+        });
+        event_hub.emit(WorkerEvent::AssistantTextDelta {
+            kind: "acp".to_string(),
+            delta: "secret assistant response".to_string(),
+        });
+        event_hub.emit(WorkerEvent::ToolCallStarted {
+            kind: "acp".to_string(),
+            tool_name: "edit_file".to_string(),
+            arguments: "private arguments".to_string(),
+        });
+        event_hub.emit(WorkerEvent::TurnFinished {
+            kind: "acp".to_string(),
+            result_path: PathBuf::from("/private/result.json"),
+            outcome_path: PathBuf::from("/private/outcome.json"),
+            summary: "private summary".to_string(),
+        });
+        event_hub.emit(WorkerEvent::Error {
+            kind: "acp".to_string(),
+            message: "provider rejected request".to_string(),
+        });
+
+        let evidence = fs::read_to_string(
+            store
+                .worker_dir("task_eventful")
+                .join("worker-events.jsonl"),
+        )?;
+        assert_eq!(evidence.lines().count(), 5);
+        assert!(evidence.contains("\"event_type\":\"turn_started\""));
+        assert!(evidence.contains("\"event_type\":\"turn_finished\""));
+        assert!(evidence.contains("\"event_type\":\"error\""));
+        assert!(evidence.contains("\"delta_length\":25"));
+        assert!(evidence.contains("\"prompt_file\":\"prompt.md\""));
+        assert!(!evidence.contains("secret assistant response"));
+        assert!(!evidence.contains("private arguments"));
+        let busy = store.record_prompt_settle_decision(
+            "goal_eventful",
+            "task_eventful",
+            "session_eventful",
+            3,
+            "task_manager.worker_event",
+            PromptSettleEvent::Busy,
+        )?;
+        assert!(busy.duplicate);
+        assert_eq!(busy.decision.action, crate::state::PromptSettleAction::Hold);
+        let error = store.record_prompt_settle_decision(
+            "goal_eventful",
+            "task_eventful",
+            "session_eventful",
+            3,
+            "task_manager.worker_event",
+            PromptSettleEvent::Error,
+        )?;
+        assert!(error.duplicate);
+        assert_eq!(
+            error.decision.action,
+            crate::state::PromptSettleAction::Hold
+        );
+        let guard = store
+            .read_continuation_guard_for_session("runtime_session_eventful")?
+            .context("worker events did not update the matching continuation guard")?;
+        assert_eq!(guard.epoch_id, "epoch_eventful");
+        assert!(!guard.in_flight);
+        assert!(guard.background_pending);
+        assert_eq!(guard.consecutive_failures, 1);
+        assert_eq!(
+            guard.last_progress_marker.as_deref(),
+            Some("worker_event:task_eventful:error")
+        );
+        store.update_continuation_guard(
+            "runtime_session_eventful",
+            "goal_eventful",
+            "epoch_newer",
+            |guard| guard.last_progress_marker = Some("newer_epoch".to_string()),
+        )?;
+        event_hub.emit(WorkerEvent::AssistantTextDelta {
+            kind: "acp".to_string(),
+            delta: "stale event must not overwrite a newer epoch".to_string(),
+        });
+        let newer_guard = store
+            .read_continuation_guard_for_session("runtime_session_eventful")?
+            .context("newer continuation guard disappeared")?;
+        assert_eq!(newer_guard.epoch_id, "epoch_newer");
+        assert_eq!(
+            newer_guard.last_progress_marker.as_deref(),
+            Some("newer_epoch")
+        );
+        let settle_dir = store
+            .prompt_settle_decision_path(&busy.decision.decision_id)
+            .parent()
+            .context("prompt settle decision path has no parent")?
+            .to_path_buf();
+        assert_eq!(fs::read_dir(settle_dir)?.count(), 2);
+        assert!(
+            !store
+                .worker_dir("task_eventful")
+                .join("task-record.json")
+                .exists()
+        );
+        drop(subscription);
         Ok(())
     }
 
@@ -5895,6 +7771,49 @@ mod tests {
         );
         control.clear_current("task_fake")?;
         assert_eq!(control.current_last_output()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_control_prompt_gate_deduplicates_follow_up() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let follow_ups = Arc::new(Mutex::new(Vec::new()));
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeInterruptHandle {
+            interrupted: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+            follow_ups: follow_ups.clone(),
+            steers: Arc::new(Mutex::new(Vec::new())),
+        });
+        let control = TaskManagerControl::default();
+        control.set_current(
+            "task_control_gate".to_string(),
+            ManagedTaskStatus::Running,
+            Some(handle),
+        )?;
+        control.set_dispatch_context(
+            "task_control_gate",
+            store,
+            "goal_control_gate".to_string(),
+            "session_control_gate".to_string(),
+            1,
+        )?;
+        assert!(matches!(
+            control.send_follow_up_task("task_control_gate", "same prompt".to_string())?,
+            SendOutcome::Sent(_)
+        ));
+        assert!(matches!(
+            control.send_follow_up_task("task_control_gate", "same prompt".to_string())?,
+            SendOutcome::Noop(_)
+        ));
+        assert_eq!(
+            follow_ups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("follow-up mutex poisoned"))?
+                .as_slice(),
+            ["same prompt"]
+        );
         Ok(())
     }
 
@@ -9293,6 +11212,14 @@ mod tests {
         assert_eq!(
             manager.send_follow_up_task(&task_id, "wait for slot".to_string())?,
             SendOutcome::Queued(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
+        );
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "wait for slot".to_string())?,
+            SendOutcome::Noop(OutcomeContext {
                 task_id: Some(task_id.clone()),
                 run_epoch: Some(0),
                 ..OutcomeContext::default()

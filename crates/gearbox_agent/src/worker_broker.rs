@@ -326,6 +326,88 @@ pub struct BrokerUsage {
     pub unavailable_reason: Option<String>,
 }
 
+/// Provider usage captured by a native/direct model invocation.
+///
+/// Native Zed model calls do not pass through a command-backed worker handle,
+/// so the orchestrator accepts this sealed sidecar before it writes the
+/// lifecycle receipt. The phase decision hash binds the sidecar to exactly
+/// one routed invocation and prevents a usage record from being reused for a
+/// different phase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectModelUsageReceipt {
+    pub schema_version: u32,
+    pub phase_decision_hash: String,
+    pub usage: BrokerUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<ModelSelectorId>,
+    pub recorded_at: String,
+    pub receipt_hash: String,
+}
+
+pub const DIRECT_MODEL_USAGE_SCHEMA_VERSION: u32 = 1;
+
+impl DirectModelUsageReceipt {
+    pub fn new(
+        phase_decision_hash: impl Into<String>,
+        usage: BrokerUsage,
+        actual_model: Option<ModelSelectorId>,
+    ) -> Result<Self> {
+        Self {
+            schema_version: DIRECT_MODEL_USAGE_SCHEMA_VERSION,
+            phase_decision_hash: phase_decision_hash.into(),
+            usage,
+            actual_model,
+            recorded_at: timestamp(),
+            receipt_hash: String::new(),
+        }
+        .seal()
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut unsigned = self.clone();
+        unsigned.receipt_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&unsigned)?)
+        ))
+    }
+
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != DIRECT_MODEL_USAGE_SCHEMA_VERSION {
+            bail!(
+                "unsupported direct model usage schema version {}",
+                self.schema_version
+            );
+        }
+        require_non_empty("phase_decision_hash", &self.phase_decision_hash)?;
+        validate_sha256("phase_decision_hash", &self.phase_decision_hash)?;
+        require_non_empty("usage.model", &self.usage.model)?;
+        require_non_empty("recorded_at", &self.recorded_at)?;
+        if let Some(actual_model) = self.actual_model.as_ref() {
+            actual_model.validate().context("actual_model")?;
+        }
+        Ok(())
+    }
+
+    pub fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.validate_payload()?;
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        validate_sha256("direct model usage receipt_hash", &self.receipt_hash)?;
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("direct model usage receipt integrity hash mismatch");
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle receipt
 // ---------------------------------------------------------------------------
@@ -597,6 +679,19 @@ pub fn broker_capabilities_for_kind(
     }
 
     caps
+}
+
+/// Capabilities exposed by the current native ACP adapter.
+///
+/// ACP turns can accept follow-ups while their handle is live, but the adapter
+/// does not yet provide a durable reattach operation after a terminal turn.
+/// Do not advertise [`BrokerCapability::SessionResume`] until that operation
+/// exists: callers must be able to distinguish a live follow-up from resuming
+/// a persisted provider session.
+pub fn native_acp_broker_capabilities_for_kind(kind: WorkerKind) -> Vec<BrokerCapability> {
+    let mut capabilities = broker_capabilities_for_kind(kind, false);
+    capabilities.retain(|capability| *capability != BrokerCapability::SessionResume);
+    capabilities
 }
 
 // ---------------------------------------------------------------------------
@@ -916,6 +1011,52 @@ impl WorkerBroker {
     /// Return the artifacts root path.
     pub fn artifacts_root(&self) -> &Path {
         &self.artifacts_root
+    }
+
+    /// Persist usage reported by a native/direct model invocation.
+    ///
+    /// The caller must use the phase decision hash returned by the route
+    /// resolver. A later direct lifecycle receipt will consume only the
+    /// sidecar with the same hash.
+    pub fn record_direct_model_usage(
+        &self,
+        phase_decision_hash: &str,
+        usage: BrokerUsage,
+        actual_model: Option<ModelSelectorId>,
+    ) -> Result<PathBuf> {
+        validate_sha256("phase_decision_hash", phase_decision_hash)?;
+        let receipt =
+            DirectModelUsageReceipt::new(phase_decision_hash.to_string(), usage, actual_model)?;
+        let directory = self.artifacts_root.join("direct-model-usage");
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+        let filename = format!("{}.json", phase_decision_hash);
+        let path = directory.join(filename);
+        write_json(&path, &receipt)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Read and validate the native/direct usage sidecar for a phase.
+    pub fn direct_model_usage(
+        &self,
+        phase_decision_hash: &str,
+    ) -> Result<Option<DirectModelUsageReceipt>> {
+        validate_sha256("phase_decision_hash", phase_decision_hash)?;
+        let path = self
+            .artifacts_root
+            .join("direct-model-usage")
+            .join(format!("{phase_decision_hash}.json"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let receipt: DirectModelUsageReceipt =
+            read_json_file(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        receipt.validate()?;
+        if receipt.phase_decision_hash != phase_decision_hash {
+            bail!("direct model usage phase decision binding mismatch");
+        }
+        Ok(Some(receipt))
     }
 
     pub fn session_ledger_dir(&self) -> Result<PathBuf> {
@@ -1538,7 +1679,15 @@ impl WorkerBroker {
 
         // Write final receipt.
         if let (Some(identity), Some(phase_request)) = (&identity, &phase_request) {
-            let (usage, actual_model) = declared_model_usage_evidence(phase_request);
+            let (usage, actual_model) = if let Some(usage) = handle.usage() {
+                let actual_model = match &phase_request.requested_model {
+                    ModelAvailability::Available(model) => Some(model.clone()),
+                    ModelAvailability::Unavailable(_) => None,
+                };
+                (Some(usage), actual_model)
+            } else {
+                declared_model_usage_evidence(phase_request)
+            };
             let receipt = BrokerLifecycleReceipt {
                 schema_version: BROKER_SCHEMA_VERSION,
                 interaction_ordinal: ordinal,
@@ -1732,7 +1881,18 @@ impl WorkerBroker {
             .session_identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no session identity"))?;
-        let (usage, actual_model) = declared_model_usage_evidence(phase_request);
+        let (usage, actual_model) = inner
+            .session_handle
+            .as_ref()
+            .and_then(|handle| handle.usage())
+            .map(|usage| {
+                let actual_model = match &phase_request.requested_model {
+                    ModelAvailability::Available(model) => Some(model.clone()),
+                    ModelAvailability::Unavailable(_) => None,
+                };
+                (Some(usage), actual_model)
+            })
+            .unwrap_or_else(|| declared_model_usage_evidence(phase_request));
 
         BrokerLifecycleReceipt {
             schema_version: BROKER_SCHEMA_VERSION,
@@ -2114,6 +2274,7 @@ pub struct PhaseWorkerExecution {
     pub execution_identity: PhaseExecutionIdentity,
     pub session_identity: BrokerSessionIdentity,
     pub session_dir: PathBuf,
+    pub usage: Option<BrokerUsage>,
 }
 
 impl PhaseBrokerFactory {
@@ -2282,6 +2443,7 @@ impl PhaseBrokerFactory {
             let handle = broker.start_via_broker(request)?;
             broker.wait_for_outcome()?;
             let result = handle.wait_for_result()?;
+            let usage = broker.latest_receipt()?.and_then(|receipt| receipt.usage);
             let session_identity = broker.session_identity()?;
             let session_dir = broker.session_ledger_dir()?;
             let model = match &phase_decision.requested_model {
@@ -2319,6 +2481,7 @@ impl PhaseBrokerFactory {
                 execution_identity: actual_execution_identity,
                 session_identity,
                 session_dir,
+                usage,
             })
         })();
 
@@ -2589,6 +2752,19 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn native_acp_does_not_advertise_resume_without_reattach() {
+        let capabilities = native_acp_broker_capabilities_for_kind(WorkerKind::OpencodeSession);
+
+        assert!(capabilities.contains(&BrokerCapability::FollowUp));
+        assert!(capabilities.contains(&BrokerCapability::Steer));
+        assert!(capabilities.contains(&BrokerCapability::Usage));
+        assert!(
+            !capabilities.contains(&BrokerCapability::SessionResume),
+            "native ACP cannot advertise resume before it has a durable reattach operation"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 2. missing_model_selector — backend cannot select model → typed unavailable
     // -----------------------------------------------------------------------
@@ -2700,6 +2876,41 @@ mod tests {
             "receipt with unknown usage must have usage=None"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn direct_model_usage_sidecar_round_trips_and_is_bound_to_phase() -> Result<()> {
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let broker = WorkerBroker::new(
+            Arc::new(crate::test_support::test_support::worker_registry_for_test()),
+            tmp.path().to_path_buf(),
+        );
+        let phase_hash = valid_hex64();
+        let model = test_model("provider/model");
+        let usage = BrokerUsage {
+            requested_tokens: Some(21),
+            actual_tokens: Some(8),
+            model: "provider/model".to_string(),
+            duration_ms: Some(120),
+            cost_micros: Some(7),
+            cache_hit: Some(true),
+            unavailable_reason: None,
+        };
+        let path =
+            broker.record_direct_model_usage(&phase_hash, usage.clone(), Some(model.clone()))?;
+        assert!(path.is_file());
+
+        let receipt = broker
+            .direct_model_usage(&phase_hash)?
+            .context("direct usage sidecar missing")?;
+        assert_eq!(receipt.phase_decision_hash, phase_hash);
+        assert_eq!(receipt.usage, usage);
+        assert_eq!(receipt.actual_model, Some(model));
+        receipt.validate()?;
+        assert!(broker.direct_model_usage(&"b".repeat(64))?.is_none());
         Ok(())
     }
 
@@ -3594,7 +3805,12 @@ mod tests {
             },
             outputs: TaskOutputs::default(),
         };
-        let command = "sh -c 'cat \"$GEARBOX_WORKER_PROMPT\"'".to_string();
+        let script_path = temp_dir.path().join("phase-worker.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\ncat \"$GEARBOX_WORKER_PROMPT\"\nprintf '{\"sessionID\":\"phase-provider-session\",\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"cost_micros\":9}}\\n'\n",
+        )?;
+        let command = format!("sh {}", script_path.display());
         let config = WorkerConfig {
             worker_kind: WorkerKind::OpencodeSession,
             worker_command: Some(command.clone()),
@@ -3671,6 +3887,10 @@ mod tests {
             execution.execution_identity.model_id.as_deref(),
             Some("gpt-planner")
         );
+        let usage = execution.usage.context("phase usage receipt missing")?;
+        assert_eq!(usage.requested_tokens, Some(11));
+        assert_eq!(usage.actual_tokens, Some(4));
+        assert_eq!(usage.cost_micros, Some(9));
         assert!(
             execution
                 .session_dir

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command as StdCommand, Stdio as StdStdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -97,6 +98,22 @@ pub fn run_shell_command_with_env_and_cancellation(
     env: &HashMap<String, String>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ShellCommandResult> {
+    run_shell_command_with_env_and_cancellation_and_timeout(
+        workspace,
+        command,
+        env,
+        cancellation_token,
+        None,
+    )
+}
+
+pub fn run_shell_command_with_env_and_cancellation_and_timeout(
+    workspace: &Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    cancellation_token: Option<&CancellationToken>,
+    timeout: Option<Duration>,
+) -> Result<ShellCommandResult> {
     check_cancelled(cancellation_token, command)?;
 
     let started_at = Instant::now();
@@ -107,11 +124,11 @@ pub fn run_shell_command_with_env_and_cancellation(
     let stderr = fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create {}", stderr_path.display()))?;
 
-    let mut process = shell_command(command);
+    let mut process = cancellable_shell_command(command);
     process
         .current_dir(workspace)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(StdStdio::from(stdout))
+        .stderr(StdStdio::from(stderr));
     for (key, value) in env {
         process.env(key, value);
     }
@@ -121,25 +138,24 @@ pub fn run_shell_command_with_env_and_cancellation(
         .with_context(|| format!("failed to run command `{command}`"))?;
     let status = loop {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
-            if let Err(error) = child.kill()
-                && error.kind() != std::io::ErrorKind::InvalidInput
-            {
-                return Err(error)
-                    .with_context(|| format!("failed to kill cancelled command `{command}`"));
-            }
-            if let Err(error) = smol::block_on(child.status())
-                && error.kind() != std::io::ErrorKind::InvalidInput
-            {
-                return Err(error)
-                    .with_context(|| format!("failed to wait for cancelled command `{command}`"));
-            }
+            terminate_command_process_group(&mut child)?;
             cleanup_command_output(&stdout_path);
             cleanup_command_output(&stderr_path);
             bail!("Gear run cancelled while running `{command}`");
         }
 
+        if let Some(timeout) = timeout.filter(|timeout| started_at.elapsed() >= *timeout) {
+            terminate_command_process_group(&mut child)?;
+            cleanup_command_output(&stdout_path);
+            cleanup_command_output(&stderr_path);
+            bail!(
+                "Gear worker command timed out after {} seconds",
+                timeout.as_secs()
+            );
+        }
+
         if let Some(status) = child
-            .try_status()
+            .try_wait()
             .with_context(|| format!("failed to poll command `{command}`"))?
         {
             break status;
@@ -293,16 +309,72 @@ fn parse_status_paths(status: &str) -> Vec<String> {
         .collect()
 }
 
-fn shell_command(command: &str) -> Command {
+fn cancellable_shell_command(command: &str) -> StdCommand {
     if cfg!(windows) {
-        let mut process = Command::new("cmd");
+        let mut process = StdCommand::new("cmd");
         process.args(["/C", command]);
         process
     } else {
-        let mut process = Command::new("sh");
+        let mut process = StdCommand::new("sh");
         process.args(["-lc", command]);
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt as _;
+
+            process.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         process
     }
+}
+
+fn terminate_command_process_group(child: &mut Child) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let process_group = child.id() as libc::pid_t;
+        signal_command_process_group(process_group, libc::SIGTERM)?;
+        let graceful_deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < graceful_deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        signal_command_process_group(process_group, libc::SIGKILL)?;
+        child.wait()?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = child.kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            return Err(error).context("failed to stop worker command");
+        }
+        if let Err(error) = child.wait()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            return Err(error).context("failed to wait for worker command shutdown");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn signal_command_process_group(process_group: libc::pid_t, signal: libc::c_int) -> Result<()> {
+    if unsafe { libc::killpg(process_group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).context("failed to signal worker command process group")
 }
 
 fn command_output_path(workspace: &Path, stream: &str) -> Result<PathBuf> {
@@ -387,6 +459,56 @@ mod tests {
         assert!(
             error.to_string().contains("Gear run cancelled"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn timed_out_command_returns_a_stable_error() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let error = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "sleep 5",
+            &HashMap::new(),
+            None,
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("command should time out");
+
+        assert_eq!(
+            error.to_string(),
+            "Gear worker command timed out after 0 seconds"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_command_terminates_its_process_group() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let child_pid_path = temp_dir.path().join("child.pid");
+        let command = format!(
+            "sleep 5 & printf '%s' \"$!\" > {}; wait",
+            child_pid_path.display()
+        );
+
+        run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            &command,
+            &HashMap::new(),
+            None,
+            Some(Duration::from_millis(500)),
+        )
+        .expect_err("command should time out");
+
+        let child_pid = fs::read_to_string(&child_pid_path)
+            .expect("background child pid should be recorded")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("background child pid should be numeric");
+        std::thread::sleep(Duration::from_millis(20));
+        let process_exists = unsafe { libc::kill(child_pid, 0) == 0 };
+        assert!(
+            !process_exists,
+            "background command child {child_pid} survived"
         );
     }
 }

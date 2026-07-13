@@ -36,7 +36,176 @@ pub enum ContinuationStatus {
     Completed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+pub const MAX_CONTINUATION_AUTO_RESUMES: usize = 2;
+
+pub const CONTINUATION_GUARD_SCHEMA_VERSION: u32 = 1;
+
+/// Durable equivalent of OMO's in-memory idle-continuation guard.
+///
+/// The runtime may be restarted between two provider events. Persisting the
+/// guard makes a restart explainable and prevents a stale idle event from
+/// dispatching through a context that was already cancelled, compacted, or
+/// waiting for a user/background task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuationGuardState {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    #[serde(default)]
+    pub all_todos_completed: bool,
+    #[serde(default)]
+    pub is_recovering: bool,
+    #[serde(default)]
+    pub was_cancelled: bool,
+    #[serde(default)]
+    pub token_limit_detected: bool,
+    #[serde(default)]
+    pub context_pressure: bool,
+    #[serde(default)]
+    pub compaction_pending: bool,
+    #[serde(default)]
+    pub background_pending: bool,
+    #[serde(default)]
+    pub pending_question: bool,
+    #[serde(default)]
+    pub pending_internal_continuation: bool,
+    #[serde(default)]
+    pub in_flight: bool,
+    #[serde(default)]
+    pub consecutive_failures: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    #[serde(default)]
+    pub stagnation_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_marker: Option<String>,
+    pub updated_at: String,
+    pub guard_hash: String,
+}
+
+impl ContinuationGuardState {
+    pub fn new(
+        session_id: impl Into<String>,
+        goal_id: impl Into<String>,
+        epoch_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: CONTINUATION_GUARD_SCHEMA_VERSION,
+            session_id: session_id.into(),
+            goal_id: goal_id.into(),
+            epoch_id: epoch_id.into(),
+            all_todos_completed: false,
+            is_recovering: false,
+            was_cancelled: false,
+            token_limit_detected: false,
+            context_pressure: false,
+            compaction_pending: false,
+            background_pending: false,
+            pending_question: false,
+            pending_internal_continuation: false,
+            in_flight: false,
+            consecutive_failures: 0,
+            cooldown_until: None,
+            stagnation_count: 0,
+            last_progress_marker: None,
+            updated_at: timestamp(),
+            guard_hash: String::new(),
+        }
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut unsigned = self.clone();
+        unsigned.guard_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&unsigned)?)
+        ))
+    }
+
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != CONTINUATION_GUARD_SCHEMA_VERSION {
+            bail!("unsupported continuation guard schema version");
+        }
+        for (field, value) in [
+            ("session_id", self.session_id.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("epoch_id", self.epoch_id.as_str()),
+            ("updated_at", self.updated_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("continuation guard {field} cannot be empty");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn seal(mut self) -> Result<Self> {
+        self.guard_hash.clear();
+        self.validate_payload()?;
+        self.guard_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        if self.guard_hash != self.expected_hash()? {
+            bail!("continuation guard integrity hash mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn blocking_reason(&self) -> Option<&'static str> {
+        if self.all_todos_completed {
+            return Some("all todos completed");
+        }
+        if self.is_recovering {
+            return Some("session is recovering");
+        }
+        if self.was_cancelled {
+            return Some("session was cancelled");
+        }
+        if self.token_limit_detected {
+            return Some("token limit detected");
+        }
+        if self.context_pressure {
+            return Some("context pressure detected");
+        }
+        if self.compaction_pending {
+            return Some("compaction guard is pending");
+        }
+        if self.background_pending {
+            return Some("background work is pending");
+        }
+        if self.pending_question {
+            return Some("a user question is pending");
+        }
+        if self.pending_internal_continuation {
+            return Some("an internal continuation is pending");
+        }
+        if self.in_flight {
+            return Some("a worker turn is already in flight");
+        }
+        if self.consecutive_failures >= 2 {
+            return Some("consecutive failure cooldown is active");
+        }
+        if self.stagnation_count >= 2 {
+            return Some("continuation progress is stagnant");
+        }
+        if self.cooldown_until.as_deref().is_some_and(|until| {
+            DateTime::parse_from_rfc3339(until)
+                .map(|until| Local::now() < until.with_timezone(&Local))
+                .unwrap_or(true)
+        }) {
+            return Some("continuation cooldown is active");
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinuationState {
     pub session_id: String,
     pub goal_id: String,
@@ -50,6 +219,26 @@ pub struct ContinuationState {
     /// The root orchestrator session for this work tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_session_id: Option<String>,
+    /// Number of consecutive resume attempts that observed no durable work
+    /// progress. This is the persisted equivalent of OMO's auto-resume cap.
+    #[serde(default)]
+    pub resume_count: usize,
+    /// Stable work marker captured from the PlanNodeRun ledger. Event-log
+    /// sequence numbers are intentionally excluded because a retry itself
+    /// appends events without proving progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_marker: Option<String>,
+    /// Human-readable reason written when the automatic continuation budget is
+    /// exhausted. The caller must surface this as a user decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContinuationResumeDecision {
+    pub state: ContinuationState,
+    pub progress_advanced: bool,
+    pub should_resume: bool,
 }
 
 /// Gear-owned work lineage that tracks the hierarchy of related sessions.
@@ -418,6 +607,81 @@ impl PlanNodeRunStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionEvidenceStatus {
+    Pass,
+    Fail,
+    Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCriterionEvidence {
+    pub criterion_id: String,
+    pub status: CriterionEvidenceStatus,
+    pub attempt: usize,
+    pub evidence_path: String,
+    pub evidence_sha256: String,
+    pub captured_at: String,
+    pub evidence_hash: String,
+}
+
+pub const PLAN_CRITERION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+impl PlanCriterionEvidence {
+    pub fn seal(
+        criterion_id: &str,
+        status: CriterionEvidenceStatus,
+        attempt: usize,
+        evidence_path: &str,
+        evidence_sha256: &str,
+    ) -> Result<Self> {
+        let mut evidence = Self {
+            criterion_id: criterion_id.to_string(),
+            status,
+            attempt,
+            evidence_path: evidence_path.to_string(),
+            evidence_sha256: evidence_sha256.to_string(),
+            captured_at: timestamp(),
+            evidence_hash: String::new(),
+        };
+        evidence.evidence_hash = evidence.expected_hash()?;
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.criterion_id.trim().is_empty()
+            || self.evidence_path.trim().is_empty()
+            || self.evidence_sha256.trim().is_empty()
+            || self.captured_at.trim().is_empty()
+            || self.attempt == 0
+        {
+            bail!("criterion evidence has incomplete identity or attempt binding");
+        }
+        let path = Path::new(&self.evidence_path);
+        if path.is_absolute()
+            || self.evidence_path == ".."
+            || self.evidence_path.starts_with("../")
+            || self.evidence_path.contains("/../")
+        {
+            bail!("criterion evidence path must be workspace-relative");
+        }
+        if self.evidence_hash != self.expected_hash()? {
+            bail!("criterion evidence hash mismatch");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.evidence_hash.clear();
+        let bytes =
+            serde_json::to_vec(&payload).context("failed to serialize criterion evidence")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanNodeRun {
     pub goal_id: String,
     pub epoch_id: String,
@@ -442,6 +706,8 @@ pub struct PlanNodeRun {
     pub review_evidence_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub criterion_evidence: Vec<PlanCriterionEvidence>,
     pub updated_at: String,
 }
 
@@ -457,7 +723,1210 @@ pub struct PlanNodeRunLedger {
     pub updated_at: String,
 }
 
+/// Durable state for one Atlas-style execution wave.
+///
+/// A wave is persisted before its first worker is dispatched. This makes the
+/// dispatch barrier observable after a crash instead of reconstructing it from
+/// the in-memory task queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanWaveStatus {
+    Prepared,
+    Dispatching,
+    Running,
+    Completed,
+    Failed,
+    Recovered,
+}
+
+impl PlanWaveStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanWaveNodeStatus {
+    Pending,
+    Dispatched,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl PlanWaveNodeStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanWaveNode {
+    pub task_id: String,
+    pub attempt: usize,
+    pub status: PlanWaveNodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanWaveRunLedger {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub wave_id: String,
+    pub status: PlanWaveStatus,
+    pub nodes: Vec<PlanWaveNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barrier_opened_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barrier_closed_at: Option<String>,
+    pub updated_at: String,
+}
+
+pub const PLAN_WAVE_RUN_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+impl PlanWaveRunLedger {
+    pub fn new(
+        goal_id: &str,
+        epoch_id: &str,
+        plan: &crate::plan_graph::PlanGraph,
+        wave_id: &str,
+        task_ids: impl IntoIterator<Item = String>,
+    ) -> Result<Self> {
+        plan.validate()?;
+        let mut task_ids = task_ids.into_iter().collect::<Vec<_>>();
+        task_ids.sort();
+        task_ids.dedup();
+        if task_ids.is_empty() {
+            bail!("PlanWaveRunLedger requires at least one task");
+        }
+        for task_id in &task_ids {
+            plan.task(task_id)
+                .with_context(|| format!("wave references unknown PlanGraph task `{task_id}`"))?;
+        }
+        let now = timestamp();
+        Ok(Self {
+            schema_version: PLAN_WAVE_RUN_LEDGER_SCHEMA_VERSION,
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            plan_revision: plan.revision,
+            plan_hash: plan.plan_hash.clone(),
+            wave_id: wave_id.to_string(),
+            status: PlanWaveStatus::Prepared,
+            nodes: task_ids
+                .into_iter()
+                .map(|task_id| PlanWaveNode {
+                    task_id,
+                    attempt: 0,
+                    status: PlanWaveNodeStatus::Pending,
+                    worker_task_id: None,
+                    dispatch_started_at: None,
+                    worker_started_at: None,
+                    terminal_at: None,
+                    error: None,
+                })
+                .collect(),
+            barrier_opened_at: None,
+            barrier_closed_at: None,
+            updated_at: now,
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != PLAN_WAVE_RUN_LEDGER_SCHEMA_VERSION {
+            bail!(
+                "unsupported PlanWaveRunLedger schema version {}",
+                self.schema_version
+            );
+        }
+        for (field, value) in [
+            ("goal_id", self.goal_id.as_str()),
+            ("epoch_id", self.epoch_id.as_str()),
+            ("plan_id", self.plan_id.as_str()),
+            ("plan_hash", self.plan_hash.as_str()),
+            ("wave_id", self.wave_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("PlanWaveRunLedger {field} cannot be empty");
+            }
+        }
+        if self.nodes.is_empty() {
+            bail!("PlanWaveRunLedger must contain at least one node");
+        }
+        let mut ids = HashSet::new();
+        for node in &self.nodes {
+            if node.task_id.trim().is_empty() || !ids.insert(node.task_id.as_str()) {
+                bail!("PlanWaveRunLedger contains duplicate or empty task id");
+            }
+            if node.status == PlanWaveNodeStatus::Running
+                && (node.worker_task_id.is_none() || node.worker_started_at.is_none())
+            {
+                bail!(
+                    "running wave node `{}` is missing worker identity or start timestamp",
+                    node.task_id
+                );
+            }
+            if node.status.is_terminal() && node.terminal_at.is_none() {
+                bail!(
+                    "terminal wave node `{}` is missing terminal timestamp",
+                    node.task_id
+                );
+            }
+        }
+        if self.status == PlanWaveStatus::Running && self.barrier_opened_at.is_none() {
+            bail!("running wave is missing barrier opening timestamp");
+        }
+        if self.status == PlanWaveStatus::Completed
+            && !self
+                .nodes
+                .iter()
+                .all(|node| node.status == PlanWaveNodeStatus::Completed)
+        {
+            bail!("completed wave contains a non-completed node");
+        }
+        Ok(())
+    }
+
+    pub fn node(&self, task_id: &str) -> Result<&PlanWaveNode> {
+        self.nodes
+            .iter()
+            .find(|node| node.task_id == task_id)
+            .with_context(|| format!("unknown PlanWave task `{task_id}`"))
+    }
+
+    pub fn node_mut(&mut self, task_id: &str) -> Result<&mut PlanWaveNode> {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.task_id == task_id)
+            .with_context(|| format!("unknown PlanWave task `{task_id}`"))
+    }
+
+    pub fn open_barrier(&mut self) -> Result<()> {
+        if self.status != PlanWaveStatus::Prepared && self.status != PlanWaveStatus::Recovered {
+            bail!("cannot open wave barrier from {:?}", self.status);
+        }
+        self.status = PlanWaveStatus::Dispatching;
+        let now = timestamp();
+        self.barrier_opened_at = Some(now.clone());
+        self.updated_at = now;
+        Ok(())
+    }
+
+    pub fn mark_dispatched(
+        &mut self,
+        task_id: &str,
+        attempt: usize,
+        worker_task_id: String,
+    ) -> Result<()> {
+        if !matches!(
+            self.status,
+            PlanWaveStatus::Dispatching | PlanWaveStatus::Running
+        ) {
+            bail!("cannot dispatch wave node while wave is {:?}", self.status);
+        }
+        let now = timestamp();
+        let node = self.node_mut(task_id)?;
+        if node.status != PlanWaveNodeStatus::Pending {
+            bail!("wave node `{task_id}` was already dispatched");
+        }
+        node.attempt = attempt;
+        node.worker_task_id = Some(worker_task_id);
+        node.dispatch_started_at = Some(now.clone());
+        node.status = PlanWaveNodeStatus::Dispatched;
+        self.status = PlanWaveStatus::Running;
+        self.updated_at = now;
+        Ok(())
+    }
+
+    pub fn mark_started(&mut self, task_id: &str) -> Result<()> {
+        let now = timestamp();
+        let node = self.node_mut(task_id)?;
+        if node.status != PlanWaveNodeStatus::Dispatched {
+            bail!("wave node `{task_id}` is not dispatched");
+        }
+        node.status = PlanWaveNodeStatus::Running;
+        node.worker_started_at = Some(now.clone());
+        self.updated_at = now;
+        Ok(())
+    }
+
+    pub fn mark_terminal(
+        &mut self,
+        task_id: &str,
+        status: PlanWaveNodeStatus,
+        error: Option<String>,
+    ) -> Result<()> {
+        if !status.is_terminal() {
+            bail!("wave node terminal status must be terminal");
+        }
+        let now = timestamp();
+        let node = self.node_mut(task_id)?;
+        if !matches!(
+            node.status,
+            PlanWaveNodeStatus::Dispatched | PlanWaveNodeStatus::Running
+        ) {
+            bail!("wave node `{task_id}` is not active");
+        }
+        node.status = status;
+        node.error = error;
+        node.terminal_at = Some(now.clone());
+        self.updated_at = now;
+        if self.nodes.iter().all(|node| node.status.is_terminal()) {
+            self.status = if self
+                .nodes
+                .iter()
+                .all(|node| node.status == PlanWaveNodeStatus::Completed)
+            {
+                PlanWaveStatus::Completed
+            } else {
+                PlanWaveStatus::Failed
+            };
+            self.barrier_closed_at = Some(self.updated_at.clone());
+        }
+        Ok(())
+    }
+
+    pub fn barrier_ready(&self) -> bool {
+        self.nodes.iter().all(|node| node.status.is_terminal())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanNodeSessionBindingStatus {
+    Active,
+    Suspended,
+    Terminal,
+    Superseded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanNodeSessionBinding {
+    pub schema_version: u32,
+    pub binding_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub task_id: String,
+    pub attempt: usize,
+    pub worker_task_id: String,
+    pub worker_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub session_id: String,
+    pub capability_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_receipt_hash: Option<String>,
+    pub status: PlanNodeSessionBindingStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_binding_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub const PLAN_NODE_SESSION_BINDING_SCHEMA_VERSION: u32 = 1;
+
+impl PlanNodeSessionBinding {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != PLAN_NODE_SESSION_BINDING_SCHEMA_VERSION {
+            bail!(
+                "unsupported PlanNodeSessionBinding schema version {}",
+                self.schema_version
+            );
+        }
+        for (field, value) in [
+            ("binding_id", self.binding_id.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("epoch_id", self.epoch_id.as_str()),
+            ("plan_id", self.plan_id.as_str()),
+            ("plan_hash", self.plan_hash.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("worker_task_id", self.worker_task_id.as_str()),
+            ("worker_kind", self.worker_kind.as_str()),
+            ("session_id", self.session_id.as_str()),
+            (
+                "capability_fingerprint",
+                self.capability_fingerprint.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                bail!("PlanNodeSessionBinding {field} cannot be empty");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallKind {
+    Primary,
+    SchemaRepair,
+    SemanticRepair,
+    ReviewRetry,
+    FollowUp,
+    Fallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryObservationEvent {
+    pub operation: String,
+    pub path: String,
+    pub event_id: String,
+    pub event_hash: String,
+    pub observed_at: String,
+}
+
+impl RepositoryObservationEvent {
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("operation", self.operation.as_str()),
+            ("path", self.path.as_str()),
+            ("event_id", self.event_id.as_str()),
+            ("event_hash", self.event_hash.as_str()),
+            ("observed_at", self.observed_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("repository observation event {field} cannot be empty");
+            }
+        }
+        if !matches!(self.operation.as_str(), "read" | "search" | "list") {
+            bail!(
+                "repository observation event operation `{}` is not read/search/list",
+                self.operation
+            );
+        }
+        if self.path.starts_with('/')
+            || self.path == ".."
+            || self.path.starts_with("../")
+            || self.path.contains("/../")
+        {
+            bail!("repository observation event path escapes the workspace");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCallLedgerEntry {
+    pub schema_version: u32,
+    pub call_id: String,
+    pub parent_call_id: Option<String>,
+    pub goal_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub phase: String,
+    pub task_id: String,
+    pub kind: ModelCallKind,
+    pub worker_kind: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub session_id: String,
+    pub status: String,
+    pub artifact_path: Option<String>,
+    pub transcript_path: Option<String>,
+    pub transcript_sha256: Option<String>,
+    pub observed_tool_count: usize,
+    #[serde(default)]
+    pub observed_paths: Vec<String>,
+    #[serde(default)]
+    pub observation_events: Vec<RepositoryObservationEvent>,
+    pub requested_tokens: Option<u64>,
+    pub actual_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub cache_hit: Option<bool>,
+    pub unavailable_reason: Option<String>,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+pub const MODEL_CALL_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+/// Durable explanation of the worker route selected for one PlanGraph node.
+///
+/// The tier calculation is deterministic, while the selected phase/model is
+/// policy input. Persisting both facts lets a resumed run explain a fallback
+/// without relying on an in-memory route decision or model prose.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRouteDecisionReceipt {
+    pub schema_version: u32,
+    pub receipt_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub task_id: String,
+    pub attempt: usize,
+    pub phase: crate::plan_graph::PhaseProfile,
+    pub route_hint: Option<String>,
+    pub size_tier: crate::plan_graph::TaskSizeTier,
+    pub risk_tier: crate::plan_graph::TaskRiskTier,
+    pub worker_kind: String,
+    pub worker_model: Option<String>,
+    pub worker_category: String,
+    pub route_reason: String,
+    pub selected_candidate: usize,
+    pub fallback_count: usize,
+    pub phase_decision_path: String,
+    pub budget_reservation_id: Option<String>,
+    pub policy_version: String,
+    pub created_at: String,
+    pub receipt_hash: String,
+}
+
+pub const TASK_ROUTE_DECISION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+impl TaskRouteDecisionReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal(
+        goal_id: &str,
+        epoch_id: &str,
+        plan: &crate::plan_graph::PlanGraph,
+        task: &crate::plan_graph::PlanTaskContract,
+        attempt: usize,
+        phase: crate::plan_graph::PhaseProfile,
+        route_hint: Option<String>,
+        worker_kind: String,
+        worker_model: Option<String>,
+        worker_category: String,
+        route_reason: String,
+        selected_candidate: usize,
+        fallback_count: usize,
+        phase_decision_path: String,
+        budget_reservation_id: Option<String>,
+    ) -> Result<Self> {
+        plan.validate()?;
+        if plan.task(&task.task_id).is_none() {
+            bail!("task route receipt references a task outside the PlanGraph");
+        }
+        let mut receipt = Self {
+            schema_version: TASK_ROUTE_DECISION_RECEIPT_SCHEMA_VERSION,
+            receipt_id: String::new(),
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            plan_revision: plan.revision,
+            plan_hash: plan.plan_hash.clone(),
+            task_id: task.task_id.clone(),
+            attempt,
+            phase,
+            route_hint,
+            size_tier: task.size_tier(),
+            risk_tier: task.risk_tier(),
+            worker_kind,
+            worker_model,
+            worker_category,
+            route_reason,
+            selected_candidate,
+            fallback_count,
+            phase_decision_path,
+            budget_reservation_id,
+            policy_version: "gbx-012-size-risk-v1".to_string(),
+            created_at: timestamp(),
+            receipt_hash: String::new(),
+        };
+        receipt.receipt_hash = receipt.expected_hash()?;
+        receipt.receipt_id = format!("task_route_{}", &receipt.receipt_hash[..16]);
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != TASK_ROUTE_DECISION_RECEIPT_SCHEMA_VERSION {
+            bail!("unsupported TaskRouteDecisionReceipt schema version");
+        }
+        for (field, value) in [
+            ("receipt_id", self.receipt_id.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("epoch_id", self.epoch_id.as_str()),
+            ("plan_id", self.plan_id.as_str()),
+            ("plan_hash", self.plan_hash.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("worker_kind", self.worker_kind.as_str()),
+            ("worker_category", self.worker_category.as_str()),
+            ("route_reason", self.route_reason.as_str()),
+            ("phase_decision_path", self.phase_decision_path.as_str()),
+            ("policy_version", self.policy_version.as_str()),
+            ("created_at", self.created_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("TaskRouteDecisionReceipt {field} cannot be empty");
+            }
+        }
+        if self.attempt == 0 {
+            bail!("TaskRouteDecisionReceipt attempt must be greater than zero");
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("task route decision receipt hash mismatch");
+        }
+        if self.receipt_id != format!("task_route_{}", &self.receipt_hash[..16]) {
+            bail!("task route decision receipt id mismatch");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_id.clear();
+        payload.receipt_hash.clear();
+        let bytes = serde_json::to_vec(&payload)
+            .context("failed to serialize task route decision receipt")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDispatchGateStatus {
+    Reserved,
+    Held,
+    Accepted,
+    Failed,
+    Released,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptDispatchGate {
+    pub schema_version: u32,
+    pub gate_id: String,
+    pub key_hash: String,
+    pub goal_id: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub run_epoch: usize,
+    pub message_kind: String,
+    pub source: String,
+    pub prompt_hash: String,
+    /// Optional caller-provided semantic key. When present it is used for
+    /// dedupe instead of the exact prompt hash, matching OMO's semantic gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dedupe_key: Option<String>,
+    pub status: PromptDispatchGateStatus,
+    /// Reservation expiry used to recover a process that died after reserve
+    /// but before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub gate_hash: String,
+}
+
+pub const PROMPT_DISPATCH_GATE_SCHEMA_VERSION: u32 = 1;
+pub const PROMPT_DISPATCH_RESERVATION_TTL_MS: i64 = 30_000;
+pub const PROMPT_DISPATCH_POST_DISPATCH_HOLD_MS: i64 = 2_000;
+
+impl PromptDispatchGate {
+    fn blocks_duplicate_dispatch(&self) -> bool {
+        match self.status {
+            PromptDispatchGateStatus::Reserved => self
+                .reservation_expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|deadline| deadline > Local::now().fixed_offset())
+                .unwrap_or(true),
+            PromptDispatchGateStatus::Accepted => self
+                .hold_until
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|deadline| deadline > Local::now().fixed_offset())
+                .unwrap_or(true),
+            PromptDispatchGateStatus::Held => self
+                .hold_until
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|deadline| deadline > Local::now().fixed_offset())
+                .unwrap_or(true),
+            PromptDispatchGateStatus::Failed | PromptDispatchGateStatus::Released => false,
+        }
+    }
+
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != PROMPT_DISPATCH_GATE_SCHEMA_VERSION {
+            bail!("unsupported PromptDispatchGate schema version");
+        }
+        for (field, value) in [
+            ("gate_id", self.gate_id.as_str()),
+            ("key_hash", self.key_hash.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("message_kind", self.message_kind.as_str()),
+            ("source", self.source.as_str()),
+            ("prompt_hash", self.prompt_hash.as_str()),
+            ("created_at", self.created_at.as_str()),
+            ("updated_at", self.updated_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("PromptDispatchGate {field} cannot be empty");
+            }
+        }
+        if self
+            .semantic_dedupe_key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            bail!("PromptDispatchGate semantic_dedupe_key cannot be empty");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.gate_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.gate_hash.clear();
+        self.validate_payload()?;
+        self.gate_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        if self.key_hash.len() < 16 {
+            bail!("PromptDispatchGate key_hash is too short");
+        }
+        if self.gate_hash != self.expected_hash()? {
+            bail!("PromptDispatchGate integrity hash mismatch");
+        }
+        if self.gate_id != format!("prompt_dispatch_{}", &self.key_hash[..16]) {
+            bail!("PromptDispatchGate id mismatch");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptDispatchDecision {
+    Acquired(PromptDispatchGate),
+    Duplicate(PromptDispatchGate),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSettleEvent {
+    Busy,
+    Idle,
+    Error,
+    ContextPressure,
+    UserStopped,
+    BackgroundCompleted,
+    FallbackRetry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSettleAction {
+    Hold,
+    Dispatch,
+    Stop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptSettleDecision {
+    pub schema_version: u32,
+    pub decision_id: String,
+    pub key_hash: String,
+    pub goal_id: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub run_epoch: usize,
+    pub source: String,
+    pub event: PromptSettleEvent,
+    pub action: PromptSettleAction,
+    pub reason: String,
+    pub created_at: String,
+    pub decision_hash: String,
+}
+
+pub const PROMPT_SETTLE_DECISION_SCHEMA_VERSION: u32 = 1;
+
+impl PromptSettleDecision {
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != PROMPT_SETTLE_DECISION_SCHEMA_VERSION {
+            bail!("unsupported PromptSettleDecision schema version");
+        }
+        for (field, value) in [
+            ("decision_id", self.decision_id.as_str()),
+            ("key_hash", self.key_hash.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("source", self.source.as_str()),
+            ("reason", self.reason.as_str()),
+            ("created_at", self.created_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("PromptSettleDecision {field} cannot be empty");
+            }
+        }
+        if self.key_hash.len() < 16 {
+            bail!("PromptSettleDecision key_hash is too short");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.decision_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.decision_hash.clear();
+        self.validate_payload()?;
+        self.decision_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        if self.decision_hash != self.expected_hash()? {
+            bail!("PromptSettleDecision integrity hash mismatch");
+        }
+        if self.decision_id != format!("prompt_settle_{}", &self.key_hash[..16]) {
+            bail!("PromptSettleDecision id mismatch");
+        }
+        Ok(())
+    }
+
+    fn action_for_event(event: &PromptSettleEvent) -> (PromptSettleAction, &'static str) {
+        match event {
+            PromptSettleEvent::Idle
+            | PromptSettleEvent::BackgroundCompleted
+            | PromptSettleEvent::FallbackRetry => (
+                PromptSettleAction::Dispatch,
+                "event permits one continuation dispatch",
+            ),
+            PromptSettleEvent::Busy | PromptSettleEvent::Error => (
+                PromptSettleAction::Hold,
+                "event requires settling before another dispatch",
+            ),
+            PromptSettleEvent::ContextPressure => (
+                PromptSettleAction::Stop,
+                "context pressure must not trigger another continuation",
+            ),
+            PromptSettleEvent::UserStopped => (
+                PromptSettleAction::Stop,
+                "user stop must not be overridden by automatic continuation",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptSettleDecisionResult {
+    pub decision: PromptSettleDecision,
+    pub duplicate: bool,
+}
+
+impl ModelCallLedgerEntry {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != MODEL_CALL_LEDGER_SCHEMA_VERSION {
+            bail!(
+                "unsupported ModelCallLedgerEntry schema version {}",
+                self.schema_version
+            );
+        }
+        for (field, value) in [
+            ("call_id", self.call_id.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("plan_id", self.plan_id.as_str()),
+            ("phase", self.phase.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("worker_kind", self.worker_kind.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("status", self.status.as_str()),
+            ("started_at", self.started_at.as_str()),
+            ("finished_at", self.finished_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("ModelCallLedgerEntry {field} cannot be empty");
+            }
+        }
+        for event in &self.observation_events {
+            event.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// One role's immutable evidence in a Prometheus/Metis/Momus/Oracle review
+/// epoch. Usage remains explicitly unknown when a provider omits telemetry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEpochRoleEvidence {
+    pub role: String,
+    pub execution_id: String,
+    pub phase_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_session_id: Option<String>,
+    pub receipt_hash: String,
+    pub receipt_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<String>,
+}
+
+impl ReviewEpochRoleEvidence {
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("role", self.role.as_str()),
+            ("execution_id", self.execution_id.as_str()),
+            ("phase_session_id", self.phase_session_id.as_str()),
+            ("receipt_hash", self.receipt_hash.as_str()),
+            ("receipt_path", self.receipt_path.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("review epoch role evidence {field} cannot be empty");
+            }
+        }
+        if self.actual_session_id.as_deref().is_some_and(str::is_empty) {
+            bail!("review epoch role evidence actual_session_id cannot be empty");
+        }
+        let usage_known = self.requested_tokens.is_some()
+            || self.actual_tokens.is_some()
+            || self.cost_micros.is_some()
+            || self.duration_ms.is_some()
+            || self.cache_hit.is_some();
+        if !usage_known
+            && self
+                .unknown_reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+        {
+            bail!("review epoch role evidence needs usage or an unknown reason");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEpochBundle {
+    pub schema_version: u32,
+    pub bundle_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub roles: Vec<ReviewEpochRoleEvidence>,
+    pub metis_required: bool,
+    pub complete: bool,
+    pub created_at: String,
+    pub bundle_hash: String,
+}
+
+pub const REVIEW_EPOCH_BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+impl ReviewEpochBundle {
+    pub fn seal(
+        goal_id: &str,
+        epoch_id: &str,
+        plan: &crate::plan_graph::PlanGraph,
+        mut roles: Vec<ReviewEpochRoleEvidence>,
+        metis_required: bool,
+    ) -> Result<Self> {
+        roles.sort_by(|left, right| left.role.cmp(&right.role));
+        let mut bundle = Self {
+            schema_version: REVIEW_EPOCH_BUNDLE_SCHEMA_VERSION,
+            bundle_id: String::new(),
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            plan_revision: plan.revision,
+            plan_hash: plan.plan_hash.clone(),
+            roles,
+            metis_required,
+            complete: false,
+            created_at: timestamp(),
+            bundle_hash: String::new(),
+        };
+        bundle.complete = bundle.has_required_roles();
+        bundle.bundle_hash = bundle.expected_hash()?;
+        bundle.bundle_id = format!("review_epoch_{}", &bundle.bundle_hash[..16]);
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != REVIEW_EPOCH_BUNDLE_SCHEMA_VERSION {
+            bail!("unsupported ReviewEpochBundle schema version");
+        }
+        for (field, value) in [
+            ("bundle_id", self.bundle_id.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("epoch_id", self.epoch_id.as_str()),
+            ("plan_id", self.plan_id.as_str()),
+            ("plan_hash", self.plan_hash.as_str()),
+            ("created_at", self.created_at.as_str()),
+            ("bundle_hash", self.bundle_hash.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("ReviewEpochBundle {field} cannot be empty");
+            }
+        }
+        let mut role_names = HashSet::new();
+        for role in &self.roles {
+            role.validate()?;
+            if !role_names.insert(role.role.as_str()) {
+                bail!("ReviewEpochBundle contains duplicate role {}", role.role);
+            }
+        }
+        if self.complete && !self.has_required_roles() {
+            bail!("complete ReviewEpochBundle is missing a required role");
+        }
+        if self.bundle_hash.len() < 16
+            || self.bundle_id != format!("review_epoch_{}", &self.bundle_hash[..16])
+        {
+            bail!("ReviewEpochBundle id mismatch");
+        }
+        if self.bundle_hash != self.expected_hash()? {
+            bail!("ReviewEpochBundle hash mismatch");
+        }
+        Ok(())
+    }
+
+    fn has_required_roles(&self) -> bool {
+        let mut required = vec!["planner", "momus", "oracle"];
+        if self.metis_required {
+            required.push("metis");
+        }
+        required
+            .iter()
+            .all(|required| self.roles.iter().any(|role| role.role == *required))
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.bundle_id.clear();
+        payload.bundle_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryObservationStatus {
+    Verified,
+    Unverified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryObservationReceipt {
+    pub schema_version: u32,
+    pub receipt_id: String,
+    pub role: String,
+    pub goal_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub worker_task_id: String,
+    pub session_id: String,
+    pub transcript_sha256: String,
+    pub observed_tool_count: usize,
+    pub observed_paths: Vec<String>,
+    #[serde(default)]
+    pub observed_events: Vec<RepositoryObservationEvent>,
+    pub status: RepositoryObservationStatus,
+    pub issued_at: String,
+    pub receipt_hash: String,
+}
+
+pub const REPOSITORY_OBSERVATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+impl RepositoryObservationReceipt {
+    pub fn seal(
+        role: &str,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        plan_hash: &str,
+        worker_task_id: &str,
+        session_id: &str,
+        transcript_sha256: Option<String>,
+        observed_tool_count: usize,
+        observed_paths: Vec<String>,
+        observed_events: Vec<RepositoryObservationEvent>,
+    ) -> Result<Self> {
+        let mut receipt = Self {
+            schema_version: REPOSITORY_OBSERVATION_RECEIPT_SCHEMA_VERSION,
+            receipt_id: String::new(),
+            role: role.to_string(),
+            goal_id: goal_id.to_string(),
+            plan_id: plan_id.to_string(),
+            plan_revision,
+            plan_hash: plan_hash.to_string(),
+            worker_task_id: worker_task_id.to_string(),
+            session_id: session_id.to_string(),
+            transcript_sha256: transcript_sha256.unwrap_or_default(),
+            observed_tool_count,
+            observed_paths,
+            observed_events,
+            status: RepositoryObservationStatus::Unverified,
+            issued_at: timestamp(),
+            receipt_hash: String::new(),
+        };
+        receipt.status = if receipt.observed_tool_count > 0
+            && !receipt.observed_paths.is_empty()
+            && !receipt.observed_events.is_empty()
+        {
+            RepositoryObservationStatus::Verified
+        } else {
+            RepositoryObservationStatus::Unverified
+        };
+        receipt.receipt_hash = receipt.expected_hash()?;
+        receipt.receipt_id = format!("repository_observation_{}", &receipt.receipt_hash[..16]);
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != REPOSITORY_OBSERVATION_RECEIPT_SCHEMA_VERSION {
+            bail!("unsupported repository observation receipt schema version");
+        }
+        for (field, value) in [
+            ("receipt_id", self.receipt_id.as_str()),
+            ("role", self.role.as_str()),
+            ("goal_id", self.goal_id.as_str()),
+            ("plan_id", self.plan_id.as_str()),
+            ("plan_hash", self.plan_hash.as_str()),
+            ("worker_task_id", self.worker_task_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("issued_at", self.issued_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("repository observation receipt {field} cannot be empty");
+            }
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("repository observation receipt hash mismatch");
+        }
+        if self.receipt_id != format!("repository_observation_{}", &self.receipt_hash[..16]) {
+            bail!("repository observation receipt id mismatch");
+        }
+        if matches!(self.status, RepositoryObservationStatus::Verified)
+            && (self.observed_tool_count == 0
+                || self.observed_paths.is_empty()
+                || self.observed_events.is_empty())
+        {
+            bail!("verified repository observation is missing tool/path/event evidence");
+        }
+        for event in &self.observed_events {
+            event.validate()?;
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_id.clear();
+        payload.receipt_hash.clear();
+        let bytes = serde_json::to_vec(&payload)
+            .context("failed to serialize repository observation receipt")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 pub const PLAN_NODE_RUN_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+impl PlanNodeRun {
+    pub fn record_criterion_evidence(
+        &mut self,
+        criterion_id: &str,
+        status: CriterionEvidenceStatus,
+        attempt: usize,
+        evidence_path: &str,
+        evidence_sha256: &str,
+    ) -> Result<()> {
+        let evidence = PlanCriterionEvidence::seal(
+            criterion_id,
+            status,
+            attempt,
+            evidence_path,
+            evidence_sha256,
+        )?;
+        if let Some(existing) = self
+            .criterion_evidence
+            .iter()
+            .find(|existing| existing.criterion_id == criterion_id && existing.attempt == attempt)
+        {
+            if existing != &evidence {
+                bail!("criterion evidence was rewritten for the same attempt");
+            }
+            return Ok(());
+        }
+        self.criterion_evidence.push(evidence);
+        self.criterion_evidence
+            .sort_by(|left, right| left.criterion_id.cmp(&right.criterion_id));
+        self.updated_at = timestamp();
+        Ok(())
+    }
+
+    pub fn all_criteria_passed(&self, required_criteria: &[String]) -> bool {
+        if self.attempt == 0 || required_criteria.is_empty() {
+            return false;
+        }
+        required_criteria.iter().all(|criterion| {
+            self.criterion_evidence.iter().any(|evidence| {
+                evidence.criterion_id == *criterion
+                    && evidence.attempt == self.attempt
+                    && evidence.status == CriterionEvidenceStatus::Pass
+            })
+        })
+    }
+}
 
 impl PlanNodeRunLedger {
     pub fn from_plan(
@@ -494,6 +1963,7 @@ impl PlanNodeRunLedger {
                     green_evidence_paths: Vec::new(),
                     review_evidence_path: None,
                     error: None,
+                    criterion_evidence: Vec::new(),
                     updated_at: timestamp(),
                 })
                 .collect(),
@@ -535,6 +2005,12 @@ impl PlanNodeRunLedger {
                     node.task_id
                 );
             }
+            for evidence in &node.criterion_evidence {
+                evidence.validate()?;
+                if evidence.attempt > node.attempt && node.attempt > 0 {
+                    bail!("PlanNodeRun criterion evidence belongs to a future attempt");
+                }
+            }
         }
         Ok(())
     }
@@ -545,6 +2021,15 @@ impl PlanNodeRunLedger {
             .filter(|node| node.status == PlanNodeRunStatus::Completed)
             .map(|node| node.task_id.clone())
             .collect()
+    }
+
+    pub fn all_criteria_passed(&self, plan: &crate::plan_graph::PlanGraph) -> bool {
+        plan.draft.tasks.iter().all(|task| {
+            self.nodes
+                .iter()
+                .find(|node| node.task_id == task.task_id)
+                .is_some_and(|node| node.all_criteria_passed(&task.completion_predicates))
+        })
     }
 
     pub fn active_task_ids(&self) -> HashSet<String> {
@@ -1055,6 +2540,64 @@ impl ObjectiveGraph {
         self.reseal()
     }
 
+    /// Promote one verified final-review blocker into a bounded child goal.
+    ///
+    /// This differs from strategist continuation: the parent is blocked by a
+    /// concrete review receipt, and replaying that same receipt/objective is
+    /// idempotent.
+    pub fn append_final_review_blocker_child(
+        &mut self,
+        parent_goal_id: &str,
+        parent_epoch_id: &str,
+        review_receipt_hash: &str,
+        mut child: GoalGraphNode,
+    ) -> Result<bool> {
+        let parent_index = self
+            .nodes
+            .iter()
+            .position(|node| node.goal_id == parent_goal_id)
+            .context("final review blocker references an unknown parent goal")?;
+        if self.nodes.iter().any(|node| {
+            node.parent_goal_id.as_deref() == Some(parent_goal_id)
+                && node.parent_epoch_id.as_deref() == Some(parent_epoch_id)
+                && node.parent_strategist_receipt_hash.as_deref() == Some(review_receipt_hash)
+                && node.objective_hash == child.objective_hash
+        }) {
+            return Ok(false);
+        }
+        let parent = &self.nodes[parent_index];
+        if parent.epoch_id != parent_epoch_id
+            || !matches!(parent.status, GoalStatus::Running | GoalStatus::Verifying)
+        {
+            bail!("final review blocker parent is not an active final candidate");
+        }
+        if parent.final_wave_receipt_hash.is_none() {
+            bail!("final review blocker parent is missing final wave evidence");
+        }
+        if self.active_goal_id.as_deref() != Some(parent_goal_id) {
+            bail!("final review blocker parent is not the active objective frontier");
+        }
+        if review_receipt_hash.trim().is_empty() {
+            bail!("final review blocker requires a review receipt hash");
+        }
+        child.parent_goal_id = Some(parent_goal_id.to_string());
+        child.parent_epoch_id = Some(parent_epoch_id.to_string());
+        child.parent_strategist_receipt_hash = Some(review_receipt_hash.to_string());
+        child.status = GoalStatus::Planning;
+        child.validate()?;
+        self.nodes[parent_index].status = GoalStatus::Blocked;
+        self.nodes[parent_index].terminal_reason =
+            Some("final review blocker promoted to a bounded child goal".to_string());
+        self.nodes[parent_index].updated_at = timestamp();
+        self.nodes.push(child);
+        self.active_goal_id = self.nodes.last().map(|node| node.goal_id.clone());
+        self.status = ObjectiveStatus::Running;
+        self.stop_reason = None;
+        self.updated_at = timestamp();
+        self.reseal()?;
+        Ok(true)
+    }
+
     pub fn active_node(&self) -> Option<&GoalGraphNode> {
         self.active_goal_id
             .as_deref()
@@ -1370,6 +2913,7 @@ pub enum ObjectiveEventKind {
     GoalOutcomeRecorded,
     StrategistContinueAccepted,
     ChildDispatchReserved,
+    FinalReviewBlockerPromoted,
     ObjectiveBudgetSettled,
     FrontierAdvanced,
     NeedsUser,
@@ -1503,6 +3047,7 @@ fn validate_objective_event_transition(
         | ObjectiveEventKind::GoalOutcomeRecorded
         | ObjectiveEventKind::StrategistContinueAccepted
         | ObjectiveEventKind::ChildDispatchReserved
+        | ObjectiveEventKind::FinalReviewBlockerPromoted
         | ObjectiveEventKind::ObjectiveBudgetSettled
         | ObjectiveEventKind::FrontierAdvanced => {
             if !*active {
@@ -1562,6 +3107,14 @@ fn validate_objective_event_payload(event: &ObjectiveEvent) -> Result<()> {
             required_non_empty("reservation_id")?;
             required_non_empty("goal_id")?;
             required_non_empty("epoch_id")?;
+        }
+        ObjectiveEventKind::FinalReviewBlockerPromoted => {
+            required_non_empty("parent_goal_id")?;
+            required_non_empty("parent_epoch_id")?;
+            required_non_empty("child_goal_id")?;
+            required_non_empty("child_epoch_id")?;
+            required_non_empty("review_receipt_hash")?;
+            required_non_empty("blocker_signature")?;
         }
         ObjectiveEventKind::ObjectiveBudgetSettled => {
             required_non_empty("reservation_id")?;
@@ -1840,6 +3393,10 @@ impl StateStore {
             self.goals_dir(),
             self.tasks_dir(),
             self.plan_node_runs_dir(),
+            self.plan_wave_runs_dir(),
+            self.plan_node_session_bindings_dir(),
+            self.task_route_receipts_dir(),
+            self.model_call_ledger_dir(),
             self.plans_dir(),
             self.plan_reviews_dir(),
             self.events_dir(),
@@ -1873,6 +3430,54 @@ impl StateStore {
 
     pub fn plan_node_runs_path(&self, goal_id: &str) -> PathBuf {
         self.plan_node_runs_dir().join(format!("{goal_id}.json"))
+    }
+
+    pub fn plan_wave_runs_dir(&self) -> PathBuf {
+        self.root.join("plan-wave-runs")
+    }
+
+    pub fn plan_wave_run_path(&self, goal_id: &str, epoch_id: &str, wave_id: &str) -> PathBuf {
+        self.plan_wave_runs_dir()
+            .join(format!("{goal_id}-{epoch_id}-{wave_id}.json"))
+    }
+
+    pub fn plan_node_session_bindings_dir(&self) -> PathBuf {
+        self.root.join("plan-node-session-bindings")
+    }
+
+    pub fn model_call_ledger_dir(&self) -> PathBuf {
+        self.root.join("model-call-ledger")
+    }
+
+    pub fn task_route_receipts_dir(&self) -> PathBuf {
+        self.root.join("task-route-receipts")
+    }
+
+    pub fn task_route_receipt_path(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        task_id: &str,
+        attempt: usize,
+    ) -> PathBuf {
+        self.task_route_receipts_dir()
+            .join(format!("{goal_id}-{epoch_id}-{task_id}-{attempt}.json"))
+    }
+
+    pub fn model_call_ledger_path(&self, goal_id: &str) -> PathBuf {
+        self.model_call_ledger_dir()
+            .join(format!("{goal_id}.jsonl"))
+    }
+
+    pub fn plan_node_session_binding_path(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        task_id: &str,
+        attempt: usize,
+    ) -> PathBuf {
+        self.plan_node_session_bindings_dir()
+            .join(format!("{goal_id}-{epoch_id}-{task_id}-{attempt}.json"))
     }
 
     pub fn plans_dir(&self) -> PathBuf {
@@ -2390,6 +3995,61 @@ impl StateStore {
         self.continuation_dir().join(session_id).join("state.json")
     }
 
+    pub fn continuation_stuck_path_for_session(&self, session_id: &str) -> PathBuf {
+        self.continuation_dir()
+            .join(session_id)
+            .join("auto-resume.stuck")
+    }
+
+    pub fn continuation_guard_path_for_session(&self, session_id: &str) -> PathBuf {
+        self.continuation_dir().join(session_id).join("guard.json")
+    }
+
+    pub fn read_continuation_guard_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ContinuationGuardState>> {
+        let path = self.continuation_guard_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let guard: ContinuationGuardState =
+            read_json_file(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        guard.validate()?;
+        if guard.session_id != session_id {
+            bail!("continuation guard session binding mismatch");
+        }
+        Ok(Some(guard))
+    }
+
+    pub fn write_continuation_guard(&self, guard: &ContinuationGuardState) -> Result<PathBuf> {
+        let sealed = guard.clone().seal()?;
+        let path = self.continuation_guard_path_for_session(&sealed.session_id);
+        write_json_atomic(&path, &sealed)?;
+        Ok(path)
+    }
+
+    pub fn update_continuation_guard(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        epoch_id: &str,
+        update: impl FnOnce(&mut ContinuationGuardState),
+    ) -> Result<ContinuationGuardState> {
+        let mut guard = self
+            .read_continuation_guard_for_session(session_id)?
+            .unwrap_or_else(|| ContinuationGuardState::new(session_id, goal_id, epoch_id));
+        if guard.goal_id != goal_id {
+            guard = ContinuationGuardState::new(session_id, goal_id, epoch_id);
+        }
+        guard.epoch_id = epoch_id.to_string();
+        update(&mut guard);
+        guard.updated_at = timestamp();
+        let sealed = guard.seal()?;
+        self.write_continuation_guard(&sealed)?;
+        Ok(sealed)
+    }
+
     /// Read continuation state for a specific session
     pub fn read_continuation_state_for_session(
         &self,
@@ -2413,17 +4073,144 @@ impl StateStore {
         goal_id: &str,
         status: ContinuationStatus,
     ) -> Result<PathBuf> {
+        let previous = self.read_continuation_state_for_session(session_id)?;
+        let reset_progress = status == ContinuationStatus::Completed;
         let state = ContinuationState {
             session_id: session_id.to_string(),
             goal_id: goal_id.to_string(),
             status,
             updated_at: timestamp(),
-            parent_session_id: None,
-            root_session_id: None,
+            parent_session_id: previous
+                .as_ref()
+                .and_then(|state| state.parent_session_id.clone()),
+            root_session_id: previous
+                .as_ref()
+                .and_then(|state| state.root_session_id.clone()),
+            resume_count: if reset_progress {
+                0
+            } else {
+                previous.as_ref().map_or(0, |state| state.resume_count)
+            },
+            last_progress_marker: if reset_progress {
+                None
+            } else {
+                previous
+                    .as_ref()
+                    .and_then(|state| state.last_progress_marker.clone())
+            },
+            stuck_reason: if reset_progress {
+                None
+            } else {
+                previous
+                    .as_ref()
+                    .and_then(|state| state.stuck_reason.clone())
+            },
         };
         let path = self.continuation_state_path_for_session(session_id);
         write_json(&path, &state)?;
+        if reset_progress {
+            let stuck_path = self.continuation_stuck_path_for_session(session_id);
+            if stuck_path.exists() {
+                fs::remove_file(&stuck_path)
+                    .with_context(|| format!("failed to clear {}", stuck_path.display()))?;
+            }
+        }
         Ok(path)
+    }
+
+    /// Return a stable marker for work progress without counting retry-only
+    /// bookkeeping such as attempt numbers, timestamps, or event sequence.
+    pub fn continuation_progress_marker(&self, goal_id: &str) -> Result<String> {
+        let Some(ledger) = self.read_plan_node_runs(goal_id)? else {
+            return Ok("missing".to_string());
+        };
+        let snapshot = ledger
+            .nodes
+            .iter()
+            .map(|node| {
+                serde_json::json!({
+                    "task_id": node.task_id,
+                    "status": node.status,
+                    "green_evidence_paths": node.green_evidence_paths,
+                    "review_evidence_path": node.review_evidence_path,
+                    "error": node.error,
+                    "criterion_evidence": node.criterion_evidence,
+                })
+            })
+            .collect::<Vec<_>>();
+        let bytes =
+            serde_json::to_vec(&snapshot).context("failed to serialize continuation progress")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    /// Persist one continuation decision and enforce OMO's bounded automatic
+    /// resume behavior. A retry is considered progress only when the durable
+    /// PlanNodeRun projection changes; newly appended runtime events alone do
+    /// not reset the counter.
+    pub fn prepare_continuation_resume(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+    ) -> Result<ContinuationResumeDecision> {
+        let previous = self.read_continuation_state_for_session(session_id)?;
+        let progress_marker = self.continuation_progress_marker(goal_id)?;
+        let progress_advanced = previous.as_ref().is_none_or(|state| {
+            state.goal_id != goal_id
+                || state.last_progress_marker.as_deref() != Some(progress_marker.as_str())
+        });
+        let resume_count = if progress_advanced {
+            0
+        } else {
+            previous
+                .as_ref()
+                .map_or(0, |state| state.resume_count)
+                .saturating_add(1)
+        };
+        let stuck_reason = (resume_count > MAX_CONTINUATION_AUTO_RESUMES).then(|| {
+            format!(
+                "continuation stopped after {} retries without durable PlanNodeRun progress",
+                MAX_CONTINUATION_AUTO_RESUMES
+            )
+        });
+        let state = ContinuationState {
+            session_id: session_id.to_string(),
+            goal_id: goal_id.to_string(),
+            status: if stuck_reason.is_some() {
+                ContinuationStatus::Stopped
+            } else {
+                ContinuationStatus::Running
+            },
+            updated_at: timestamp(),
+            parent_session_id: previous
+                .as_ref()
+                .and_then(|state| state.parent_session_id.clone()),
+            root_session_id: previous
+                .as_ref()
+                .and_then(|state| state.root_session_id.clone()),
+            resume_count,
+            last_progress_marker: Some(progress_marker),
+            stuck_reason: stuck_reason.clone(),
+        };
+        let path = self.continuation_state_path_for_session(session_id);
+        write_json(&path, &state)?;
+        if let Some(reason) = stuck_reason {
+            let stuck_path = self.continuation_stuck_path_for_session(session_id);
+            write_json(
+                &stuck_path,
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "goal_id": goal_id,
+                    "resume_count": resume_count,
+                    "reason": reason,
+                    "updated_at": state.updated_at,
+                }),
+            )?;
+        }
+        Ok(ContinuationResumeDecision {
+            should_resume: state.status == ContinuationStatus::Running,
+            state,
+            progress_advanced,
+        })
     }
 
     /// Check if continuation is stopped for a specific session
@@ -2506,6 +4293,286 @@ impl StateStore {
             return Ok(None);
         }
         Ok(Some(read_json_file(&path)?))
+    }
+
+    pub fn write_plan_wave_run(&self, ledger: &PlanWaveRunLedger) -> Result<PathBuf> {
+        ledger.validate()?;
+        let path = self.plan_wave_run_path(&ledger.goal_id, &ledger.epoch_id, &ledger.wave_id);
+        write_json_atomic(&path, ledger)?;
+        Ok(path)
+    }
+
+    pub fn read_plan_wave_run(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        wave_id: &str,
+    ) -> Result<Option<PlanWaveRunLedger>> {
+        let path = self.plan_wave_run_path(goal_id, epoch_id, wave_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let ledger: PlanWaveRunLedger = read_json_file(&path)?;
+        ledger.validate()?;
+        if ledger.goal_id != goal_id || ledger.epoch_id != epoch_id || ledger.wave_id != wave_id {
+            bail!("plan wave ledger path identity does not match its contents");
+        }
+        Ok(Some(ledger))
+    }
+
+    pub fn write_plan_node_session_binding(
+        &self,
+        binding: &PlanNodeSessionBinding,
+    ) -> Result<PathBuf> {
+        binding.validate()?;
+        let path = self.plan_node_session_binding_path(
+            &binding.goal_id,
+            &binding.epoch_id,
+            &binding.task_id,
+            binding.attempt,
+        );
+        write_json_atomic(&path, binding)?;
+        Ok(path)
+    }
+
+    pub fn read_plan_node_session_binding(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        task_id: &str,
+        attempt: usize,
+    ) -> Result<Option<PlanNodeSessionBinding>> {
+        let path = self.plan_node_session_binding_path(goal_id, epoch_id, task_id, attempt);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let binding: PlanNodeSessionBinding = read_json_file(&path)?;
+        binding.validate()?;
+        if binding.goal_id != goal_id
+            || binding.epoch_id != epoch_id
+            || binding.task_id != task_id
+            || binding.attempt != attempt
+        {
+            bail!("plan node session binding path identity does not match its contents");
+        }
+        Ok(Some(binding))
+    }
+
+    pub fn write_task_route_decision_receipt(
+        &self,
+        receipt: &TaskRouteDecisionReceipt,
+    ) -> Result<PathBuf> {
+        receipt.validate()?;
+        let path = self.task_route_receipt_path(
+            &receipt.goal_id,
+            &receipt.epoch_id,
+            &receipt.task_id,
+            receipt.attempt,
+        );
+        write_json_atomic(&path, receipt)?;
+        Ok(path)
+    }
+
+    pub fn read_task_route_decision_receipt(
+        &self,
+        goal_id: &str,
+        epoch_id: &str,
+        task_id: &str,
+        attempt: usize,
+    ) -> Result<Option<TaskRouteDecisionReceipt>> {
+        let path = self.task_route_receipt_path(goal_id, epoch_id, task_id, attempt);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let receipt: TaskRouteDecisionReceipt = read_json_file(&path)?;
+        receipt.validate()?;
+        if receipt.goal_id != goal_id
+            || receipt.epoch_id != epoch_id
+            || receipt.task_id != task_id
+            || receipt.attempt != attempt
+        {
+            bail!("task route decision receipt path identity does not match its contents");
+        }
+        Ok(Some(receipt))
+    }
+
+    pub fn write_repository_observation_receipt(
+        &self,
+        receipt: &RepositoryObservationReceipt,
+    ) -> Result<PathBuf> {
+        receipt.validate()?;
+        if !receipt
+            .role
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            bail!("repository observation role must be an ASCII identifier");
+        }
+        let task = receipt
+            .worker_task_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let session = receipt
+            .session_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let path = self.plan_review_dir(&receipt.goal_id).join(format!(
+            "revision-{:03}-{}-{}-{}-repository-observation.json",
+            receipt.plan_revision, receipt.role, task, session
+        ));
+        write_json_atomic(&path, receipt)?;
+        Ok(path)
+    }
+
+    pub fn read_repository_observation_receipt_for_task(
+        &self,
+        goal_id: &str,
+        revision: usize,
+        role: &str,
+        worker_task_id: &str,
+        session_id: &str,
+    ) -> Result<Option<RepositoryObservationReceipt>> {
+        let sanitize = |value: &str| {
+            value
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        };
+        let path = self.plan_review_dir(goal_id).join(format!(
+            "revision-{revision:03}-{role}-{}-{}-repository-observation.json",
+            sanitize(worker_task_id),
+            sanitize(session_id)
+        ));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let receipt: RepositoryObservationReceipt = read_json_file(&path)?;
+        receipt.validate()?;
+        if receipt.goal_id != goal_id
+            || receipt.plan_revision != revision
+            || receipt.role != role
+            || receipt.worker_task_id != worker_task_id
+            || receipt.session_id != session_id
+        {
+            bail!("repository observation task index binding mismatch");
+        }
+        Ok(Some(receipt))
+    }
+
+    pub fn read_repository_observation_receipt(
+        &self,
+        goal_id: &str,
+        revision: usize,
+        role: &str,
+    ) -> Result<Option<RepositoryObservationReceipt>> {
+        let path = self.plan_review_dir(goal_id).join(format!(
+            "revision-{revision:03}-{role}-repository-observation.json"
+        ));
+        let path = if path.is_file() {
+            Some(path)
+        } else {
+            let prefix = format!("revision-{revision:03}-{role}-");
+            let suffix = "-repository-observation.json";
+            let mut candidates = Vec::new();
+            let review_dir = self.plan_review_dir(goal_id);
+            if review_dir.is_dir() {
+                for entry in fs::read_dir(&review_dir)? {
+                    let entry = entry?;
+                    let candidate = entry.path();
+                    let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    if name.starts_with(&prefix) && name.ends_with(suffix) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            candidates.sort();
+            candidates.into_iter().next()
+        };
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let receipt: RepositoryObservationReceipt = read_json_file(&path)?;
+        receipt.validate()?;
+        if receipt.goal_id != goal_id || receipt.plan_revision != revision || receipt.role != role {
+            bail!("repository observation receipt path identity mismatch");
+        }
+        Ok(Some(receipt))
+    }
+
+    pub fn append_model_call_ledger_entry(&self, entry: &ModelCallLedgerEntry) -> Result<PathBuf> {
+        entry.validate()?;
+        let path = self.model_call_ledger_path(&entry.goal_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if path.is_file() {
+            for line in fs::read_to_string(&path)?
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                let existing: ModelCallLedgerEntry = serde_json::from_str(line)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                existing.validate()?;
+                if existing.call_id == entry.call_id {
+                    if existing == *entry {
+                        return Ok(path);
+                    }
+                    bail!("model call ledger call id was reused with different content");
+                }
+            }
+        }
+        let line = serde_json::to_string(entry).context("failed to serialize model call entry")?;
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        writeln!(file, "{line}").with_context(|| format!("failed to append {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn read_model_call_ledger(&self, goal_id: &str) -> Result<Vec<ModelCallLedgerEntry>> {
+        let path = self.model_call_ledger_path(goal_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        fs::read_to_string(&path)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let entry: ModelCallLedgerEntry = serde_json::from_str(line)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                entry.validate()?;
+                Ok(entry)
+            })
+            .collect()
     }
 
     pub fn write_plan_graph(&self, plan_graph: &crate::plan_graph::PlanGraph) -> Result<PathBuf> {
@@ -2591,6 +4658,35 @@ impl StateStore {
             .validate()
             .with_context(|| format!("invalid plan approval state at {}", path.display()))?;
         Ok(Some(state))
+    }
+
+    pub fn review_epoch_bundle_path(&self, goal_id: &str, plan_revision: usize) -> PathBuf {
+        self.plan_review_dir(goal_id)
+            .join(format!("revision-{plan_revision:03}-review-epoch.json"))
+    }
+
+    pub fn write_review_epoch_bundle(&self, bundle: &ReviewEpochBundle) -> Result<PathBuf> {
+        bundle.validate()?;
+        let path = self.review_epoch_bundle_path(&bundle.goal_id, bundle.plan_revision);
+        write_json_atomic(&path, bundle)?;
+        Ok(path)
+    }
+
+    pub fn read_review_epoch_bundle(
+        &self,
+        goal_id: &str,
+        plan_revision: usize,
+    ) -> Result<Option<ReviewEpochBundle>> {
+        let path = self.review_epoch_bundle_path(goal_id, plan_revision);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bundle: ReviewEpochBundle = read_json_file(&path)?;
+        bundle.validate()?;
+        if bundle.goal_id != goal_id || bundle.plan_revision != plan_revision {
+            bail!("review epoch bundle path binding mismatch");
+        }
+        Ok(Some(bundle))
     }
 
     pub fn write_plan_verifier_report(
@@ -2960,7 +5056,23 @@ impl StateStore {
         {
             bail!("approval manifest does not match its persisted receipt chain");
         }
-        if plan_graph.draft.tasks.len() > 1 {
+        if let Some(bundle) = self.read_review_epoch_bundle(&plan_graph.goal_id, revision)? {
+            if bundle.plan_id != plan_graph.plan_id
+                || bundle.plan_hash != plan_graph.plan_hash
+                || !bundle.complete
+            {
+                bail!("review epoch bundle does not bind a complete approved plan");
+            }
+            let oracle_hash = bundle
+                .roles
+                .iter()
+                .find(|role| role.role == "oracle")
+                .map(|role| role.receipt_hash.as_str())
+                .context("review epoch bundle is missing Oracle evidence")?;
+            if approval.secondary_critic_receipt_hash.as_deref() != Some(oracle_hash) {
+                bail!("review epoch bundle Oracle hash disagrees with approval manifest");
+            }
+        } else if plan_graph.draft.tasks.len() > 1 {
             let oracle_hash = approval
                 .secondary_critic_receipt_hash
                 .as_deref()
@@ -3374,6 +5486,241 @@ impl StateStore {
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
+
+    pub fn prompt_dispatch_gate_path(&self, gate_id: &str) -> PathBuf {
+        self.root
+            .join("prompt-dispatch-gates")
+            .join(format!("{gate_id}.json"))
+    }
+
+    pub fn reserve_prompt_dispatch(
+        &self,
+        goal_id: &str,
+        task_id: &str,
+        session_id: &str,
+        run_epoch: usize,
+        message_kind: &str,
+        source: &str,
+        prompt: &str,
+    ) -> Result<PromptDispatchDecision> {
+        self.reserve_prompt_dispatch_with_options(
+            goal_id,
+            task_id,
+            session_id,
+            run_epoch,
+            message_kind,
+            source,
+            prompt,
+            None,
+        )
+    }
+
+    pub fn reserve_prompt_dispatch_with_options(
+        &self,
+        goal_id: &str,
+        task_id: &str,
+        session_id: &str,
+        run_epoch: usize,
+        message_kind: &str,
+        source: &str,
+        prompt: &str,
+        semantic_dedupe_key: Option<&str>,
+    ) -> Result<PromptDispatchDecision> {
+        for (field, value) in [
+            ("goal_id", goal_id),
+            ("task_id", task_id),
+            ("session_id", session_id),
+            ("message_kind", message_kind),
+            ("source", source),
+        ] {
+            if value.trim().is_empty() {
+                bail!("prompt dispatch {field} cannot be empty");
+            }
+        }
+        let prompt_hash = format!("{:x}", Sha256::digest(prompt.as_bytes()));
+        let semantic_dedupe_key = semantic_dedupe_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(ToString::to_string);
+        let dedupe_material = semantic_dedupe_key.as_deref().unwrap_or(&prompt_hash);
+        let key_hash = format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{goal_id}\0{task_id}\0{session_id}\0{run_epoch}\0{message_kind}\0{source}\0{dedupe_material}"
+                )
+                .as_bytes(),
+            )
+        );
+        let gate_id = format!("prompt_dispatch_{}", &key_hash[..16]);
+        let path = self.prompt_dispatch_gate_path(&gate_id);
+        let existing = if path.is_file() {
+            let gate: PromptDispatchGate = read_json_file(&path)?;
+            gate.validate()?;
+            if gate.key_hash != key_hash
+                || gate.goal_id != goal_id
+                || gate.task_id != task_id
+                || gate.session_id != session_id
+                || gate.run_epoch != run_epoch
+                || gate.message_kind != message_kind
+                || gate.source != source
+                || (gate.semantic_dedupe_key.is_none() && gate.prompt_hash != prompt_hash)
+                || gate.semantic_dedupe_key != semantic_dedupe_key
+            {
+                bail!("prompt dispatch gate binding mismatch");
+            }
+            Some(gate)
+        } else {
+            None
+        };
+        if let Some(gate) = existing.as_ref()
+            && gate.blocks_duplicate_dispatch()
+        {
+            return Ok(PromptDispatchDecision::Duplicate(gate.clone()));
+        }
+        let now = timestamp();
+        let gate = PromptDispatchGate {
+            schema_version: PROMPT_DISPATCH_GATE_SCHEMA_VERSION,
+            gate_id,
+            key_hash,
+            goal_id: goal_id.to_string(),
+            task_id: task_id.to_string(),
+            session_id: session_id.to_string(),
+            run_epoch,
+            message_kind: message_kind.to_string(),
+            source: source.to_string(),
+            prompt_hash,
+            semantic_dedupe_key,
+            status: PromptDispatchGateStatus::Reserved,
+            reservation_expires_at: Some(
+                (Local::now() + Duration::milliseconds(PROMPT_DISPATCH_RESERVATION_TTL_MS))
+                    .to_rfc3339(),
+            ),
+            hold_until: None,
+            reason: None,
+            created_at: existing
+                .as_ref()
+                .map(|gate| gate.created_at.clone())
+                .unwrap_or_else(|| now.clone()),
+            updated_at: now,
+            gate_hash: String::new(),
+        }
+        .seal()?;
+        write_json_atomic(&path, &gate)?;
+        Ok(PromptDispatchDecision::Acquired(gate))
+    }
+
+    pub fn settle_prompt_dispatch_gate(
+        &self,
+        gate: &PromptDispatchGate,
+        status: PromptDispatchGateStatus,
+        hold_until: Option<String>,
+        reason: Option<String>,
+    ) -> Result<PromptDispatchGate> {
+        let path = self.prompt_dispatch_gate_path(&gate.gate_id);
+        let existing: PromptDispatchGate = read_json_file(&path)?;
+        existing.validate()?;
+        if existing.gate_hash != gate.gate_hash {
+            bail!("prompt dispatch gate changed before settlement");
+        }
+        let hold_until = match status {
+            PromptDispatchGateStatus::Held | PromptDispatchGateStatus::Accepted => hold_until
+                .or_else(|| {
+                    Some(
+                        (Local::now()
+                            + Duration::milliseconds(PROMPT_DISPATCH_POST_DISPATCH_HOLD_MS))
+                        .to_rfc3339(),
+                    )
+                }),
+            _ => None,
+        };
+        let reservation_expires_at =
+            matches!(status, PromptDispatchGateStatus::Reserved).then(|| {
+                (Local::now() + Duration::milliseconds(PROMPT_DISPATCH_RESERVATION_TTL_MS))
+                    .to_rfc3339()
+            });
+        let updated = PromptDispatchGate {
+            status,
+            hold_until,
+            reservation_expires_at,
+            reason,
+            updated_at: timestamp(),
+            ..existing
+        }
+        .seal()?;
+        write_json_atomic(&path, &updated)?;
+        Ok(updated)
+    }
+
+    pub fn prompt_settle_decision_path(&self, decision_id: &str) -> PathBuf {
+        self.root
+            .join("prompt-settle-decisions")
+            .join(format!("{decision_id}.json"))
+    }
+
+    pub fn record_prompt_settle_decision(
+        &self,
+        goal_id: &str,
+        task_id: &str,
+        session_id: &str,
+        run_epoch: usize,
+        source: &str,
+        event: PromptSettleEvent,
+    ) -> Result<PromptSettleDecisionResult> {
+        for (field, value) in [
+            ("goal_id", goal_id),
+            ("task_id", task_id),
+            ("session_id", session_id),
+            ("source", source),
+        ] {
+            if value.trim().is_empty() {
+                bail!("prompt settle {field} cannot be empty");
+            }
+        }
+        let event_key = serde_json::to_string(&event)?;
+        let key_hash = format!(
+            "{:x}",
+            Sha256::digest(
+                format!("{goal_id}\0{task_id}\0{session_id}\0{run_epoch}\0{source}\0{event_key}")
+                    .as_bytes(),
+            )
+        );
+        let decision_id = format!("prompt_settle_{}", &key_hash[..16]);
+        let path = self.prompt_settle_decision_path(&decision_id);
+        if path.is_file() {
+            let decision: PromptSettleDecision = read_json_file(&path)?;
+            decision.validate()?;
+            if decision.key_hash != key_hash {
+                bail!("prompt settle decision binding mismatch");
+            }
+            return Ok(PromptSettleDecisionResult {
+                decision,
+                duplicate: true,
+            });
+        }
+        let (action, reason) = PromptSettleDecision::action_for_event(&event);
+        let decision = PromptSettleDecision {
+            schema_version: PROMPT_SETTLE_DECISION_SCHEMA_VERSION,
+            decision_id,
+            key_hash,
+            goal_id: goal_id.to_string(),
+            task_id: task_id.to_string(),
+            session_id: session_id.to_string(),
+            run_epoch,
+            source: source.to_string(),
+            event,
+            action,
+            reason: reason.to_string(),
+            created_at: timestamp(),
+            decision_hash: String::new(),
+        }
+        .seal()?;
+        write_json_atomic(&path, &decision)?;
+        Ok(PromptSettleDecisionResult {
+            decision,
+            duplicate: false,
+        })
+    }
 }
 
 fn budget_ledger_totals(
@@ -3723,6 +6070,74 @@ mod epoch_tests {
     }
 
     #[test]
+    fn final_review_blocker_child_promotion_is_idempotent() -> Result<()> {
+        let policy = ObjectivePolicy::rolling_default();
+        let mut graph = ObjectiveGraph::new(
+            "objective-blocker",
+            "session-root",
+            "/tmp/workspace",
+            "Ship the product",
+            "scope-hash",
+            policy,
+        )?;
+        graph.add_root_node(graph_node(
+            "goal-1",
+            "epoch-1",
+            "session-root",
+            "Ship the product",
+            GoalStatus::Planning,
+            None,
+            None,
+            None,
+        ))?;
+        graph.update_active_node(
+            "goal-1",
+            GoalStatus::Verifying,
+            Some("final-wave-hash".to_string()),
+            Some("/tmp/final-report.md".to_string()),
+            None,
+            Some("review blocker".to_string()),
+        )?;
+        let child = graph_node(
+            "goal-2",
+            "epoch-2",
+            "session-child",
+            "Resolve review blockers",
+            GoalStatus::Planning,
+            None,
+            None,
+            None,
+        );
+        assert!(graph.append_final_review_blocker_child(
+            "goal-1",
+            "epoch-1",
+            "final-wave-hash",
+            child,
+        )?);
+        assert_eq!(graph.active_goal_id.as_deref(), Some("goal-2"));
+        assert_eq!(graph.nodes.len(), 2);
+        let replay = graph_node(
+            "goal-2",
+            "epoch-2",
+            "session-child",
+            "Resolve review blockers",
+            GoalStatus::Planning,
+            Some("goal-1".to_string()),
+            Some("epoch-1".to_string()),
+            Some("final-wave-hash".to_string()),
+        );
+        assert!(!graph.append_final_review_blocker_child(
+            "goal-1",
+            "epoch-1",
+            "final-wave-hash",
+            replay,
+        )?);
+        assert_eq!(graph.nodes.len(), 2);
+        graph.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn objective_event_ledger_is_idempotent_hash_chained_and_terminal() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -4025,6 +6440,677 @@ mod epoch_tests {
                 .is_err()
         );
         lease.release()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plan_wave_tests {
+    use super::*;
+    use crate::plan_graph::{PlanGraph, PlanSource};
+    use crate::state::Scope;
+
+    fn two_task_plan() -> Result<PlanGraph> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let mut draft = crate::plan_graph::deterministic_fallback_draft(
+            "Execute a two node wave",
+            &scope,
+            &["cargo test".to_string()],
+        );
+        let mut second = draft.tasks[0].clone();
+        second.task_id = "task_004".to_string();
+        second.title = "Execute the second independent node".to_string();
+        second.parallel_wave = 0;
+        second.scope.allowed_files = vec!["tests".to_string()];
+        second.scope.write_scope = vec!["tests".to_string()];
+        draft.tasks[0].task_id = "task_003".to_string();
+        draft.tasks.push(second);
+        PlanGraph::seal(
+            "goal-wave",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            draft,
+        )
+    }
+
+    #[test]
+    fn plan_wave_requires_all_nodes_before_barrier_closes() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanWaveRunLedger::new(
+            "goal-wave",
+            "epoch-1",
+            &plan,
+            "wave-0",
+            ["task_004".to_string(), "task_003".to_string()],
+        )?;
+        ledger.open_barrier()?;
+        ledger.mark_dispatched("task_003", 1, "worker-003".to_string())?;
+        ledger.mark_started("task_003")?;
+        ledger.mark_dispatched("task_004", 1, "worker-004".to_string())?;
+        ledger.mark_started("task_004")?;
+        ledger.mark_terminal("task_003", PlanWaveNodeStatus::Completed, None)?;
+        assert!(!ledger.barrier_ready());
+        assert!(!ledger.status.is_terminal());
+        ledger.mark_terminal("task_004", PlanWaveNodeStatus::Completed, None)?;
+        assert!(ledger.barrier_ready());
+        assert_eq!(ledger.status, PlanWaveStatus::Completed);
+        ledger.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn plan_wave_ledger_round_trips_with_path_identity() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let plan = two_task_plan()?;
+        let mut ledger = PlanWaveRunLedger::new(
+            "goal-wave",
+            "epoch-1",
+            &plan,
+            "wave-0",
+            ["task_003".to_string(), "task_004".to_string()],
+        )?;
+        ledger.open_barrier()?;
+        store.write_plan_wave_run(&ledger)?;
+        let replay = store
+            .read_plan_wave_run("goal-wave", "epoch-1", "wave-0")?
+            .context("missing persisted wave ledger")?;
+        assert_eq!(replay, ledger);
+        assert!(
+            store
+                .read_plan_wave_run("goal-wave", "epoch-1", "wave-other")?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn criterion_evidence_requires_every_plan_predicate_on_current_attempt() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        for node in &mut ledger.nodes {
+            node.attempt = 1;
+            node.status = PlanNodeRunStatus::Implemented;
+        }
+
+        let first_task = &plan.draft.tasks[0];
+        let first_criterion = first_task
+            .completion_predicates
+            .first()
+            .context("fallback plan must expose a completion predicate")?
+            .clone();
+        ledger
+            .node_mut(&first_task.task_id)?
+            .record_criterion_evidence(
+                &first_criterion,
+                CriterionEvidenceStatus::Pass,
+                1,
+                "artifacts/task-003.md",
+                "sha-task-003",
+            )?;
+        assert!(!ledger.all_criteria_passed(&plan));
+
+        for task in &plan.draft.tasks {
+            let evidence_path = format!("artifacts/{}.md", task.task_id);
+            for criterion in &task.completion_predicates {
+                if task.task_id == first_task.task_id && criterion == &first_criterion {
+                    continue;
+                }
+                ledger.node_mut(&task.task_id)?.record_criterion_evidence(
+                    criterion,
+                    CriterionEvidenceStatus::Pass,
+                    1,
+                    &evidence_path,
+                    &format!("sha-{}", task.task_id),
+                )?;
+            }
+        }
+        assert!(ledger.all_criteria_passed(&plan));
+        ledger.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn criterion_evidence_rejects_rewrites_and_workspace_escape() -> Result<()> {
+        let mut evidence = PlanCriterionEvidence::seal(
+            "compile",
+            CriterionEvidenceStatus::Pass,
+            1,
+            "artifacts/compile.txt",
+            "sha-1",
+        )?;
+        assert!(
+            PlanCriterionEvidence::seal(
+                "compile",
+                CriterionEvidenceStatus::Pass,
+                1,
+                "../outside.txt",
+                "sha-1",
+            )
+            .is_err()
+        );
+
+        evidence.evidence_sha256 = "sha-2".to_string();
+        assert!(evidence.validate().is_err());
+
+        let mut node = PlanNodeRun {
+            goal_id: "goal-wave".to_string(),
+            epoch_id: "epoch-1".to_string(),
+            plan_id: "plan-1".to_string(),
+            plan_revision: 1,
+            plan_hash: "hash-1".to_string(),
+            task_id: "task-003".to_string(),
+            attempt: 1,
+            dependencies: Vec::new(),
+            status: PlanNodeRunStatus::Implemented,
+            worker_task_id: None,
+            implementation_task_id: None,
+            review_task_id: None,
+            red_evidence_path: None,
+            green_evidence_paths: Vec::new(),
+            review_evidence_path: None,
+            error: None,
+            criterion_evidence: Vec::new(),
+            updated_at: timestamp(),
+        };
+        node.record_criterion_evidence(
+            "compile",
+            CriterionEvidenceStatus::Pass,
+            1,
+            "artifacts/compile.txt",
+            "sha-1",
+        )?;
+        assert!(
+            node.record_criterion_evidence(
+                "compile",
+                CriterionEvidenceStatus::Fail,
+                1,
+                "artifacts/compile.txt",
+                "sha-2",
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_resume_budget_tracks_durable_progress_and_writes_stuck_marker() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let plan = two_task_plan()?;
+        let ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        store.write_plan_node_runs(&ledger)?;
+
+        let first = store.prepare_continuation_resume("session-1", "goal-wave")?;
+        assert!(first.should_resume);
+        assert!(first.progress_advanced);
+        assert_eq!(first.state.resume_count, 0);
+
+        let second = store.prepare_continuation_resume("session-1", "goal-wave")?;
+        let third = store.prepare_continuation_resume("session-1", "goal-wave")?;
+        assert!(second.should_resume);
+        assert!(third.should_resume);
+        assert_eq!(third.state.resume_count, MAX_CONTINUATION_AUTO_RESUMES);
+
+        let stuck = store.prepare_continuation_resume("session-1", "goal-wave")?;
+        assert!(!stuck.should_resume);
+        assert_eq!(stuck.state.status, ContinuationStatus::Stopped);
+        assert!(stuck.state.stuck_reason.is_some());
+        let stuck_path = store.continuation_stuck_path_for_session("session-1");
+        assert!(stuck_path.is_file());
+
+        let mut progressed = ledger;
+        progressed.node_mut("task_003")?.status = PlanNodeRunStatus::Runnable;
+        store.write_plan_node_runs(&progressed)?;
+        let resumed = store.prepare_continuation_resume("session-1", "goal-wave")?;
+        assert!(resumed.should_resume);
+        assert!(resumed.progress_advanced);
+        assert_eq!(resumed.state.resume_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn review_epoch_bundle_round_trips_required_roles_and_unknown_usage() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let plan = two_task_plan()?;
+        let roles = ["planner", "momus", "oracle"]
+            .into_iter()
+            .map(|role| ReviewEpochRoleEvidence {
+                role: role.to_string(),
+                execution_id: format!("{role}-execution"),
+                phase_session_id: format!("{role}-session"),
+                actual_session_id: Some(format!("{role}-actual")),
+                receipt_hash: format!("{role}-receipt"),
+                receipt_path: format!("artifacts/{role}-receipt.json"),
+                observation_path: Some(format!("artifacts/{role}-observation.json")),
+                requested_tokens: None,
+                actual_tokens: None,
+                cost_micros: None,
+                duration_ms: None,
+                cache_hit: None,
+                unknown_reason: Some("provider did not report usage".to_string()),
+            })
+            .collect();
+        let bundle = ReviewEpochBundle::seal("goal-wave", "epoch-1", &plan, roles, false)?;
+        assert!(bundle.complete);
+        let path = store.write_review_epoch_bundle(&bundle)?;
+        assert!(path.is_file());
+        assert_eq!(
+            store.read_review_epoch_bundle("goal-wave", 1)?,
+            Some(bundle)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_node_session_binding_round_trips_without_secrets() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let binding = PlanNodeSessionBinding {
+            schema_version: PLAN_NODE_SESSION_BINDING_SCHEMA_VERSION,
+            binding_id: "binding-1".to_string(),
+            goal_id: "goal-wave".to_string(),
+            epoch_id: "epoch-1".to_string(),
+            plan_id: "plan-1".to_string(),
+            plan_revision: 1,
+            plan_hash: "hash-1".to_string(),
+            task_id: "task_003".to_string(),
+            attempt: 1,
+            worker_task_id: "worker-003".to_string(),
+            worker_kind: "opencode".to_string(),
+            provider_id: Some("opencode".to_string()),
+            model_id: Some("free-model".to_string()),
+            session_id: "session-1".to_string(),
+            capability_fingerprint: "cap-1".to_string(),
+            route_receipt_hash: Some("receipt-1".to_string()),
+            status: PlanNodeSessionBindingStatus::Active,
+            supersedes_binding_id: None,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+        };
+        store.write_plan_node_session_binding(&binding)?;
+        let replay = store
+            .read_plan_node_session_binding("goal-wave", "epoch-1", "task_003", 1)?
+            .context("missing persisted session binding")?;
+        assert_eq!(replay, binding);
+        let serialized = serde_json::to_string(&replay)?;
+        assert!(!serialized.contains("secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn task_route_decision_receipt_round_trips_tier_and_budget_binding() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let plan = two_task_plan()?;
+        let task = plan.task("task_003").context("missing route test task")?;
+        let receipt = TaskRouteDecisionReceipt::seal(
+            "goal-wave",
+            "epoch-1",
+            &plan,
+            task,
+            1,
+            crate::plan_graph::PhaseProfile::ExecutorQuick,
+            Some("quick".to_string()),
+            "opencode_session".to_string(),
+            Some("deepseek-v4-flash-free".to_string()),
+            "quick".to_string(),
+            "selected configured quick worker".to_string(),
+            0,
+            1,
+            "/tmp/phase-route-decision.json".to_string(),
+            Some("epoch-1.worker.1".to_string()),
+        )?;
+        let path = store.write_task_route_decision_receipt(&receipt)?;
+        assert!(path.is_file());
+        let replay = store
+            .read_task_route_decision_receipt("goal-wave", "epoch-1", "task_003", 1)?
+            .context("missing persisted route decision receipt")?;
+        assert_eq!(replay, receipt);
+        assert_eq!(replay.size_tier, task.size_tier());
+        assert_eq!(replay.risk_tier, task.risk_tier());
+        assert_eq!(
+            replay.budget_reservation_id.as_deref(),
+            Some("epoch-1.worker.1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_observation_receipt_requires_structured_tool_events() -> Result<()> {
+        let unverified = RepositoryObservationReceipt::seal(
+            "planner",
+            "goal-wave",
+            "plan-1",
+            1,
+            "plan-hash",
+            "worker-1",
+            "session-1",
+            Some("transcript-hash".to_string()),
+            1,
+            vec!["crates/gearbox_agent/src/state.rs".to_string()],
+            Vec::new(),
+        )?;
+        assert_eq!(unverified.status, RepositoryObservationStatus::Unverified);
+
+        let verified = RepositoryObservationReceipt::seal(
+            "planner",
+            "goal-wave",
+            "plan-1",
+            1,
+            "plan-hash",
+            "worker-1",
+            "session-1",
+            Some("transcript-hash".to_string()),
+            1,
+            vec!["crates/gearbox_agent/src/state.rs".to_string()],
+            vec![RepositoryObservationEvent {
+                operation: "read".to_string(),
+                path: "crates/gearbox_agent/src/state.rs".to_string(),
+                event_id: "tool_1".to_string(),
+                event_hash: "event-hash".to_string(),
+                observed_at: timestamp(),
+            }],
+        )?;
+        assert_eq!(verified.status, RepositoryObservationStatus::Verified);
+        verified.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn repository_observation_index_keeps_same_role_calls_separate() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let event = RepositoryObservationEvent {
+            operation: "read".to_string(),
+            path: "src/lib.rs".to_string(),
+            event_id: "tool-1".to_string(),
+            event_hash: "event-1".to_string(),
+            observed_at: timestamp(),
+        };
+        let first = RepositoryObservationReceipt::seal(
+            "planner",
+            "goal-wave",
+            "pending_goal-wave",
+            0,
+            "pending",
+            "planner_goal-wave",
+            "session-planner",
+            Some("transcript-1".to_string()),
+            1,
+            vec!["src/lib.rs".to_string()],
+            vec![event.clone()],
+        )?;
+        let second = RepositoryObservationReceipt::seal(
+            "planner",
+            "goal-wave",
+            "pending_goal-wave",
+            0,
+            "pending",
+            "planner_goal-wave_repair",
+            "session-planner-repair",
+            Some("transcript-2".to_string()),
+            1,
+            vec!["src/lib.rs".to_string()],
+            vec![event],
+        )?;
+        let first_path = store.write_repository_observation_receipt(&first)?;
+        let second_path = store.write_repository_observation_receipt(&second)?;
+        assert_ne!(first_path, second_path);
+        assert!(
+            store
+                .read_repository_observation_receipt_for_task(
+                    "goal-wave",
+                    0,
+                    "planner",
+                    "planner_goal-wave",
+                    "session-planner",
+                )?
+                .is_some()
+        );
+        assert!(
+            store
+                .read_repository_observation_receipt_for_task(
+                    "goal-wave",
+                    0,
+                    "planner",
+                    "planner_goal-wave_repair",
+                    "session-planner-repair",
+                )?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_dispatch_gate_deduplicates_and_allows_failed_retry() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let acquired = match store.reserve_prompt_dispatch(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            2,
+            "follow_up",
+            "continuation",
+            "resume the current task",
+        )? {
+            PromptDispatchDecision::Acquired(gate) => gate,
+            PromptDispatchDecision::Duplicate(_) => {
+                bail!("first prompt dispatch unexpectedly deduplicated")
+            }
+        };
+        acquired.validate()?;
+        let duplicate = store.reserve_prompt_dispatch(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            2,
+            "follow_up",
+            "continuation",
+            "resume the current task",
+        )?;
+        assert!(matches!(duplicate, PromptDispatchDecision::Duplicate(_)));
+        let failed = store.settle_prompt_dispatch_gate(
+            &acquired,
+            PromptDispatchGateStatus::Failed,
+            None,
+            Some("provider rejected the prompt".to_string()),
+        )?;
+        failed.validate()?;
+        let retry = store.reserve_prompt_dispatch(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            2,
+            "follow_up",
+            "continuation",
+            "resume the current task",
+        )?;
+        assert!(matches!(retry, PromptDispatchDecision::Acquired(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_dispatch_gate_deduplicates_accepted_dispatch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let acquired = match store.reserve_prompt_dispatch(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            2,
+            "follow_up",
+            "runtime_fallback",
+            "retry with fallback model",
+        )? {
+            PromptDispatchDecision::Acquired(gate) => gate,
+            PromptDispatchDecision::Duplicate(_) => {
+                bail!("first accepted dispatch unexpectedly deduplicated")
+            }
+        };
+        let accepted = store.settle_prompt_dispatch_gate(
+            &acquired,
+            PromptDispatchGateStatus::Accepted,
+            None,
+            None,
+        )?;
+        accepted.validate()?;
+
+        let duplicate = store.reserve_prompt_dispatch(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            2,
+            "follow_up",
+            "runtime_fallback",
+            "retry with fallback model",
+        )?;
+        assert!(matches!(duplicate, PromptDispatchDecision::Duplicate(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_dispatch_gate_supports_semantic_dedupe_and_expired_reservation_recovery() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let first = store.reserve_prompt_dispatch_with_options(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            3,
+            "follow_up",
+            "continuation",
+            "resume task with the next step",
+            Some("next-step"),
+        )?;
+        let acquired = match first {
+            PromptDispatchDecision::Acquired(gate) => gate,
+            PromptDispatchDecision::Duplicate(_) => {
+                bail!("first semantic reservation was duplicate")
+            }
+        };
+        let duplicate = store.reserve_prompt_dispatch_with_options(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            3,
+            "follow_up",
+            "continuation",
+            "RESUME TASK WITH A DIFFERENT WORDING",
+            Some("next-step"),
+        )?;
+        assert!(matches!(duplicate, PromptDispatchDecision::Duplicate(_)));
+
+        let expired = PromptDispatchGate {
+            reservation_expires_at: Some((Local::now() - Duration::seconds(1)).to_rfc3339()),
+            ..acquired
+        }
+        .seal()?;
+        let path = store.prompt_dispatch_gate_path(&expired.gate_id);
+        write_json_atomic(&path, &expired)?;
+        let recovered = store.reserve_prompt_dispatch_with_options(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            3,
+            "follow_up",
+            "continuation",
+            "resume task with the next step",
+            Some("next-step"),
+        )?;
+        assert!(matches!(recovered, PromptDispatchDecision::Acquired(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_settle_decision_is_typed_and_idempotent() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let cases = [
+            (PromptSettleEvent::Idle, PromptSettleAction::Dispatch),
+            (
+                PromptSettleEvent::BackgroundCompleted,
+                PromptSettleAction::Dispatch,
+            ),
+            (
+                PromptSettleEvent::FallbackRetry,
+                PromptSettleAction::Dispatch,
+            ),
+            (PromptSettleEvent::Busy, PromptSettleAction::Hold),
+            (PromptSettleEvent::Error, PromptSettleAction::Hold),
+            (PromptSettleEvent::ContextPressure, PromptSettleAction::Stop),
+            (PromptSettleEvent::UserStopped, PromptSettleAction::Stop),
+        ];
+        for (event, expected_action) in cases {
+            let first = store.record_prompt_settle_decision(
+                "goal-settle",
+                "task-settle",
+                "session-settle",
+                1,
+                "test",
+                event.clone(),
+            )?;
+            assert!(!first.duplicate);
+            assert_eq!(first.decision.action, expected_action);
+            first.decision.validate()?;
+            let second = store.record_prompt_settle_decision(
+                "goal-settle",
+                "task-settle",
+                "session-settle",
+                1,
+                "test",
+                event,
+            )?;
+            assert!(second.duplicate);
+            assert_eq!(second.decision, first.decision);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_guard_state_round_trips_and_blocks_omo_idle_conditions() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let initial =
+            store.update_continuation_guard("session-guard", "goal-guard", "epoch-1", |guard| {
+                guard.pending_question = true;
+                guard.in_flight = true;
+                guard.stagnation_count = 2;
+            })?;
+        assert_eq!(
+            initial.blocking_reason(),
+            Some("a user question is pending")
+        );
+        let replay = store
+            .read_continuation_guard_for_session("session-guard")?
+            .context("missing continuation guard")?;
+        replay.validate()?;
+        assert_eq!(replay, initial);
+
+        let updated =
+            store.update_continuation_guard("session-guard", "goal-guard", "epoch-2", |guard| {
+                guard.pending_question = false;
+                guard.in_flight = false;
+                guard.stagnation_count = 0;
+                guard.context_pressure = true;
+            })?;
+        assert_eq!(updated.epoch_id, "epoch-2");
+        assert_eq!(updated.blocking_reason(), Some("context pressure detected"));
         Ok(())
     }
 }

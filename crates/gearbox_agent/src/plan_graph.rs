@@ -127,6 +127,86 @@ pub struct PlanTaskContract {
     pub completion_predicates: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSizeTier {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRiskTier {
+    Normal,
+    Elevated,
+    High,
+}
+
+impl PlanTaskContract {
+    /// Derive a stable worker size from the sealed task contract, not from a
+    /// model's subjective difficulty label.
+    pub fn size_tier(&self) -> TaskSizeTier {
+        let file_count = self
+            .scope
+            .allowed_files
+            .len()
+            .max(self.scope.write_scope.len());
+        let dependency_count = self.dependencies.len();
+        if file_count <= 1 && dependency_count <= 1 && self.scope.max_files_changed <= 1 {
+            TaskSizeTier::Small
+        } else if file_count <= 4 && dependency_count <= 3 && self.scope.max_files_changed <= 4 {
+            TaskSizeTier::Medium
+        } else {
+            TaskSizeTier::Large
+        }
+    }
+
+    /// Risk is independent from size: a one-file concurrency or security
+    /// change must still receive a high-rigor route.
+    pub fn risk_tier(&self) -> TaskRiskTier {
+        let text = format!(
+            "{} {} {} {}",
+            self.title,
+            self.goal,
+            self.deliverable,
+            self.required_capabilities.join(" ")
+        )
+        .to_ascii_lowercase();
+        if [
+            "concurr",
+            "security",
+            "migration",
+            "irreversible",
+            "protocol",
+        ]
+        .iter()
+        .any(|keyword| text.contains(keyword))
+        {
+            TaskRiskTier::High
+        } else if self.dependencies.len() > 2 || self.scope.write_scope.len() > 2 {
+            TaskRiskTier::Elevated
+        } else {
+            TaskRiskTier::Normal
+        }
+    }
+
+    /// Map deterministic task facts to the phase hint used by the worker
+    /// router. Explicit review/repair hints remain caller-owned; this method
+    /// only supplies the default executor profile for a fresh node.
+    pub fn recommended_route_hint(&self) -> Option<&'static str> {
+        if self.risk_tier() == TaskRiskTier::High || self.size_tier() == TaskSizeTier::Large {
+            Some("deep")
+        } else if self.size_tier() == TaskSizeTier::Small
+            && self.risk_tier() == TaskRiskTier::Normal
+        {
+            Some("quick")
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanTaskScope {
     #[serde(default)]
@@ -1157,6 +1237,53 @@ mod tests {
         let mut tampered = receipt.clone();
         tampered.plan_hash = "f".repeat(64);
         assert!(tampered.validate(&graph).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn task_size_and_risk_tiers_are_deterministic_and_independent() -> Result<()> {
+        let scope = Scope::new(vec!["src/main.rs".to_string()], vec![".git".to_string()], 1);
+        let mut draft = deterministic_fallback_draft("small change", &scope, &[]);
+        let task = &draft.tasks[0];
+        assert_eq!(task.size_tier(), TaskSizeTier::Small);
+        assert_eq!(task.risk_tier(), TaskRiskTier::Normal);
+
+        draft.tasks[0].required_capabilities = vec!["concurrency".to_string()];
+        assert_eq!(draft.tasks[0].size_tier(), TaskSizeTier::Small);
+        assert_eq!(draft.tasks[0].risk_tier(), TaskRiskTier::High);
+
+        draft.tasks[0].scope.allowed_files = (0..5).map(|i| format!("src/{i}.rs")).collect();
+        draft.tasks[0].scope.write_scope = draft.tasks[0].scope.allowed_files.clone();
+        draft.tasks[0].scope.max_files_changed = 5;
+        assert_eq!(draft.tasks[0].size_tier(), TaskSizeTier::Large);
+        Ok(())
+    }
+
+    #[test]
+    fn task_tiers_map_to_default_executor_hints_without_overriding_review() -> Result<()> {
+        let scope = Scope::new(vec!["src/main.rs".to_string()], Vec::new(), 1);
+        let mut draft = deterministic_fallback_draft("small task", &scope, &[]);
+        let small = &draft.tasks[0];
+        assert_eq!(small.recommended_route_hint(), Some("quick"));
+
+        draft.tasks[0].title = "large migration".to_string();
+        draft.tasks[0].scope.allowed_files = vec![
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+            "src/c.rs".to_string(),
+            "src/d.rs".to_string(),
+            "src/e.rs".to_string(),
+        ];
+        let allowed_files = draft.tasks[0].scope.allowed_files.clone();
+        draft.tasks[0].scope.write_scope = allowed_files;
+        draft.tasks[0].scope.max_files_changed = 5;
+        assert_eq!(draft.tasks[0].recommended_route_hint(), Some("deep"));
+
+        draft.tasks[0].scope.allowed_files = vec!["src/main.rs".to_string()];
+        draft.tasks[0].scope.write_scope = vec!["src/main.rs".to_string()];
+        draft.tasks[0].scope.max_files_changed = 1;
+        draft.tasks[0].required_capabilities = vec!["concurrency".to_string()];
+        assert_eq!(draft.tasks[0].recommended_route_hint(), Some("deep"));
         Ok(())
     }
 }

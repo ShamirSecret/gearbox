@@ -6,14 +6,17 @@ use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
-use crate::state::{CoordinatorModel, Scope, StateStore, Task, TaskInputs, write_json};
-use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation};
+use crate::state::{CoordinatorModel, Scope, StateStore, Task, TaskInputs, timestamp, write_json};
+use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation_and_timeout};
 use crate::worker_broker::{
-    BrokerCapability, BrokerSessionIdentity, LifecycleStateName, WorkerBroker,
+    BrokerCapability, BrokerSessionIdentity, BrokerUsage, LifecycleStateName, WorkerBroker,
     broker_capabilities_for_kind,
 };
 
@@ -373,7 +376,16 @@ impl CategoryRouter {
             let matching_routes = category
                 .preferred_worker_kinds()
                 .iter()
-                .filter_map(|worker_kind| self.matching_configured_route(config, *worker_kind))
+                .flat_map(|worker_kind| {
+                    config.worker_routes.iter().filter(move |route| {
+                        route.worker_kind == *worker_kind
+                            && !Self::route_model_is_unavailable(
+                                config,
+                                route.worker_kind,
+                                route.worker_model.as_deref(),
+                            )
+                    })
+                })
                 .collect::<Vec<_>>();
             if !matching_routes.is_empty() {
                 let index = attempt
@@ -385,20 +397,32 @@ impl CategoryRouter {
                     .iter()
                     .position(|worker_kind| *worker_kind == route.worker_kind)
                     .unwrap_or(index);
-                let skipped_unavailable_route = category
-                    .preferred_worker_kinds()
+                let selected_route_index = config
+                    .worker_routes
                     .iter()
-                    .take(selected_preferred_index)
-                    .any(|worker_kind| {
-                        config.worker_routes.iter().any(|configured_route| {
-                            configured_route.worker_kind == *worker_kind
-                                && Self::route_model_is_unavailable(
-                                    config,
-                                    configured_route.worker_kind,
-                                    configured_route.worker_model.as_deref(),
-                                )
-                        })
-                    });
+                    .position(|configured_route| std::ptr::eq(configured_route, route))
+                    .unwrap_or(usize::MAX);
+                let skipped_unavailable_route = config.worker_routes.iter().enumerate().any(
+                    |(configured_route_index, configured_route)| {
+                        if !Self::route_model_is_unavailable(
+                            config,
+                            configured_route.worker_kind,
+                            configured_route.worker_model.as_deref(),
+                        ) {
+                            return false;
+                        }
+                        let Some(configured_preferred_index) = category
+                            .preferred_worker_kinds()
+                            .iter()
+                            .position(|worker_kind| *worker_kind == configured_route.worker_kind)
+                        else {
+                            return false;
+                        };
+                        configured_preferred_index < selected_preferred_index
+                            || (configured_preferred_index == selected_preferred_index
+                                && configured_route_index < selected_route_index)
+                    },
+                );
                 return SelectedWorkerRoute {
                     worker_kind: route.worker_kind,
                     worker_command: route.worker_command.as_deref(),
@@ -666,6 +690,7 @@ pub(crate) fn worker_model_is_unavailable(
     };
 
     let normalized_worker_model = canonicalize_model_id(worker_model);
+    let canonical_worker_entry = canonicalize_provider_model_entry(worker_model);
     let qualified_model = worker_kind.provider_id_hint().map(|provider_id| {
         format!(
             "{}/{}",
@@ -677,6 +702,7 @@ pub(crate) fn worker_model_is_unavailable(
     unavailable_worker_models.iter().any(|entry| {
         let normalized_entry = canonicalize_provider_model_entry(entry);
         normalized_entry == normalized_worker_model
+            || normalized_entry == canonical_worker_entry
             || qualified_model
                 .as_ref()
                 .is_some_and(|qualified| normalized_entry == *qualified)
@@ -1275,6 +1301,85 @@ pub struct WorkerOutcome {
     pub exit_code: Option<i32>,
 }
 
+pub const RESIDENT_SESSION_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidentSessionDescriptor {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub worker_kind: WorkerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub workspace: String,
+    pub resumable: bool,
+    pub resume_count: usize,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resumed_at: Option<String>,
+    pub descriptor_hash: String,
+}
+
+impl ResidentSessionDescriptor {
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != RESIDENT_SESSION_DESCRIPTOR_SCHEMA_VERSION {
+            bail!("unsupported resident session descriptor schema version");
+        }
+        for (field, value) in [
+            ("task_id", self.task_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("workspace", self.workspace.as_str()),
+            ("created_at", self.created_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("resident session descriptor {field} cannot be empty");
+            }
+        }
+        if self
+            .provider_session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id.trim().is_empty())
+        {
+            bail!("resident session descriptor provider_session_id cannot be empty");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.descriptor_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    pub fn seal(mut self) -> Result<Self> {
+        self.descriptor_hash.clear();
+        self.validate_payload()?;
+        self.descriptor_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        if self.descriptor_hash != self.expected_hash()? {
+            bail!("resident session descriptor integrity hash mismatch");
+        }
+        Ok(())
+    }
+
+    fn resumable_session_id(&self) -> &str {
+        self.provider_session_id
+            .as_deref()
+            .unwrap_or(self.session_id.as_str())
+    }
+}
+
 pub type WorkerTurnOutcome = WorkerResult;
 
 pub type WorkerEventListener = Arc<dyn Fn(WorkerEvent) + Send + Sync>;
@@ -1320,6 +1425,26 @@ pub enum WorkerEvent {
         kind: String,
         message: String,
     },
+}
+
+/// Thread-safe event fan-out shared by native worker session handles.
+///
+/// Command workers own this hub inside their session handle. Native ACP
+/// adapters use the same abstraction so the orchestration layer can observe
+/// provider turns without depending on a concrete ACP implementation.
+#[derive(Clone, Default)]
+pub struct WorkerEventHub {
+    subscriptions: Arc<WorkerSessionSubscriptions>,
+}
+
+impl WorkerEventHub {
+    pub fn subscribe(&self, listener: WorkerEventListener) -> Result<WorkerSubscription> {
+        self.subscriptions.subscribe(listener)
+    }
+
+    pub fn emit(&self, event: WorkerEvent) {
+        self.subscriptions.emit(event);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1395,6 +1520,24 @@ pub struct WorkerStartRequest<'a> {
     pub coordinator_model: Option<&'a CoordinatorModel>,
     pub coordinator_brief: Option<&'a str>,
     pub route_hint: Option<&'a str>,
+}
+
+impl<'a> WorkerStartRequest<'a> {
+    fn reborrow(&self) -> WorkerStartRequest<'a> {
+        WorkerStartRequest {
+            store: self.store,
+            workspace: self.workspace,
+            task: self.task,
+            route_attempt: self.route_attempt,
+            goal: self.goal,
+            verification_commands: self.verification_commands,
+            config: self.config,
+            cancellation_token: self.cancellation_token.clone(),
+            coordinator_model: self.coordinator_model,
+            coordinator_brief: self.coordinator_brief,
+            route_hint: self.route_hint,
+        }
+    }
 }
 
 pub type WorkerRunRequest<'a> = WorkerStartRequest<'a>;
@@ -1485,6 +1628,25 @@ pub trait NativeWorkerBackend: Send + Sync {
         &self,
         request: WorkerStartRequest<'_>,
     ) -> Result<Arc<dyn WorkerSessionHandle>>;
+
+    /// Optional ACP-backed worker route for provider workers such as
+    /// OpenCode, Codex, or Claude. Returning `None` preserves CLI fallback.
+    fn start_acp_worker(
+        &self,
+        _worker_kind: WorkerKind,
+        _request: WorkerStartRequest<'_>,
+    ) -> Result<Option<Arc<dyn WorkerSessionHandle>>> {
+        Ok(None)
+    }
+
+    /// Capabilities for a native ACP handle, which may be richer than the
+    /// command adapter capabilities for the same worker kind.
+    fn native_broker_capabilities(
+        &self,
+        _worker_kind: WorkerKind,
+    ) -> Option<Vec<BrokerCapability>> {
+        None
+    }
 }
 
 pub trait WorkerSessionHandle: Send + Sync {
@@ -1511,6 +1673,9 @@ pub trait WorkerSessionHandle: Send + Sync {
     fn wait_for_outcome(&self) -> Result<WorkerOutcome>;
     fn wait_for_result(&self) -> Result<WorkerResult>;
     fn last_output(&self) -> Option<String>;
+    fn usage(&self) -> Option<BrokerUsage> {
+        None
+    }
 }
 
 pub trait WorkerAdapter {
@@ -1653,6 +1818,10 @@ impl WorkerRegistry {
         // Dispatch to the appropriate adapter, then wrap through broker if active.
         // Extract needed fields before consuming request in start_direct.
         let task_id = request.task.id.clone();
+        let native_broker_capabilities = self
+            .native_backend
+            .as_ref()
+            .and_then(|backend| backend.native_broker_capabilities(worker_kind));
         let handle = self.start_direct(worker_kind, request)?;
 
         if let Some(broker) = &self.broker {
@@ -1671,18 +1840,21 @@ impl WorkerRegistry {
                         .session_id()
                         .unwrap_or_else(|| format!("{}-{}", worker_kind.as_str(), task_id)),
                     started_at: crate::state::timestamp(),
-                    capabilities: Some(match worker_kind {
-                        WorkerKind::Opencode => OpencodeCommandWorker {}.broker_capabilities(),
-                        WorkerKind::OpencodeSession => {
-                            OpencodeSessionWorker {}.broker_capabilities()
+                    capabilities: Some(native_broker_capabilities.unwrap_or_else(|| {
+                        match worker_kind {
+                            WorkerKind::Opencode => OpencodeCommandWorker {}.broker_capabilities(),
+                            WorkerKind::OpencodeSession => {
+                                OpencodeSessionWorker {}.broker_capabilities()
+                            }
+                            WorkerKind::Codex => CodexCommandWorker {}.broker_capabilities(),
+                            WorkerKind::Claude => ClaudeCommandWorker {}.broker_capabilities(),
+                            WorkerKind::ZedAgent => broker_capabilities_for_kind(
+                                worker_kind,
+                                self.native_backend.is_some(),
+                            ),
+                            WorkerKind::Custom => CustomCommandWorker {}.broker_capabilities(),
                         }
-                        WorkerKind::Codex => CodexCommandWorker {}.broker_capabilities(),
-                        WorkerKind::Claude => ClaudeCommandWorker {}.broker_capabilities(),
-                        WorkerKind::ZedAgent => {
-                            broker_capabilities_for_kind(worker_kind, self.native_backend.is_some())
-                        }
-                        WorkerKind::Custom => CustomCommandWorker {}.broker_capabilities(),
-                    }),
+                    })),
                 };
                 return broker.start(handle, identity);
             }
@@ -1698,10 +1870,24 @@ impl WorkerRegistry {
         request: WorkerStartRequest<'_>,
     ) -> Result<Arc<dyn WorkerSessionHandle>> {
         match worker_kind {
-            WorkerKind::Opencode => OpencodeCommandWorker {}.start(request),
-            WorkerKind::OpencodeSession => OpencodeSessionWorker {}.start(request),
-            WorkerKind::Codex => CodexCommandWorker {}.start(request),
-            WorkerKind::Claude => ClaudeCommandWorker {}.start(request),
+            WorkerKind::Opencode
+            | WorkerKind::OpencodeSession
+            | WorkerKind::Codex
+            | WorkerKind::Claude => {
+                if let Some(native_backend) = self.native_backend.as_ref()
+                    && let Some(handle) =
+                        native_backend.start_acp_worker(worker_kind, request.reborrow())?
+                {
+                    return Ok(handle);
+                }
+                match worker_kind {
+                    WorkerKind::Opencode => OpencodeCommandWorker {}.start(request),
+                    WorkerKind::OpencodeSession => OpencodeSessionWorker {}.start(request),
+                    WorkerKind::Codex => CodexCommandWorker {}.start(request),
+                    WorkerKind::Claude => ClaudeCommandWorker {}.start(request),
+                    _ => bail!("worker kind was not a provider worker"),
+                }
+            }
             WorkerKind::ZedAgent => {
                 if let Some(native_backend) = self.native_backend.as_ref() {
                     native_backend.start_zed_agent(request)
@@ -1985,6 +2171,273 @@ impl_command_backed_worker!(
 );
 impl_command_backed_worker!(CustomCommandWorker, WorkerKind::Custom, "custom_command");
 
+fn resident_session_descriptor_path(store: &StateStore, task_id: &str) -> PathBuf {
+    store.worker_dir(task_id).join("resident-session.json")
+}
+
+fn read_resident_session_descriptor(
+    store: &StateStore,
+    task_id: &str,
+) -> Result<Option<ResidentSessionDescriptor>> {
+    let path = resident_session_descriptor_path(store, task_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let descriptor: ResidentSessionDescriptor =
+        serde_json::from_slice(&fs::read(&path).with_context(|| {
+            format!(
+                "failed to read resident session descriptor {}",
+                path.display()
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "failed to parse resident session descriptor {}",
+                path.display()
+            )
+        })?;
+    descriptor.validate()?;
+    Ok(Some(descriptor))
+}
+
+fn write_resident_session_descriptor(
+    store: &StateStore,
+    descriptor: &ResidentSessionDescriptor,
+) -> Result<PathBuf> {
+    let path = resident_session_descriptor_path(store, &descriptor.task_id);
+    let sealed = descriptor.clone().seal()?;
+    write_json(&path, &sealed)?;
+    Ok(path)
+}
+
+fn prepare_resident_session_descriptor(
+    store: &StateStore,
+    workspace: &Path,
+    task: &Task,
+    worker_kind: WorkerKind,
+    worker_model: Option<String>,
+) -> Result<ResidentSessionDescriptor> {
+    if let Some(mut descriptor) = read_resident_session_descriptor(store, &task.id)? {
+        if descriptor.worker_kind != worker_kind {
+            bail!(
+                "resident session worker mismatch: descriptor has {}, requested {}",
+                descriptor.worker_kind.as_str(),
+                worker_kind.as_str()
+            );
+        }
+        if descriptor.workspace != workspace.to_string_lossy() {
+            bail!("resident session workspace binding mismatch");
+        }
+        if !descriptor.resumable {
+            bail!("resident session was disposed and cannot be reattached");
+        }
+        descriptor.worker_model = worker_model.or(descriptor.worker_model);
+        descriptor.resume_count = descriptor.resume_count.saturating_add(1);
+        descriptor.last_resumed_at = Some(timestamp());
+        return descriptor.seal();
+    }
+
+    ResidentSessionDescriptor {
+        schema_version: RESIDENT_SESSION_DESCRIPTOR_SCHEMA_VERSION,
+        task_id: task.id.clone(),
+        worker_kind,
+        worker_model,
+        session_id: format!("{}_session", task.id),
+        provider_session_id: None,
+        workspace: workspace.to_string_lossy().to_string(),
+        resumable: true,
+        resume_count: 0,
+        created_at: timestamp(),
+        last_resumed_at: None,
+        descriptor_hash: String::new(),
+    }
+    .seal()
+}
+
+fn extract_provider_session_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in ["sessionID", "sessionId", "session_id"] {
+                if let Some(session_id) = object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|session_id| !session_id.is_empty())
+                {
+                    return Some(session_id.to_string());
+                }
+            }
+            object.values().find_map(extract_provider_session_id)
+        }
+        Value::Array(values) => values.iter().find_map(extract_provider_session_id),
+        _ => None,
+    }
+}
+
+fn value_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(string) => string.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+fn value_bool(value: Option<&Value>) -> Option<bool> {
+    value.and_then(|value| match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+fn object_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn usage_from_value(value: &Value, fallback_model: Option<&str>) -> Option<BrokerUsage> {
+    let Value::Object(object) = value else {
+        return match value {
+            Value::Array(values) => values
+                .iter()
+                .find_map(|value| usage_from_value(value, fallback_model)),
+            _ => None,
+        };
+    };
+
+    let nested_usage = object.get("usage").and_then(Value::as_object);
+    let metrics = nested_usage.unwrap_or(object);
+    let tokens = metrics.get("tokens").and_then(Value::as_object);
+    let requested_tokens = value_u64(
+        metrics
+            .get("requested_tokens")
+            .or_else(|| metrics.get("prompt_tokens"))
+            .or_else(|| metrics.get("input_tokens"))
+            .or_else(|| tokens.and_then(|tokens| tokens.get("input"))),
+    );
+    let actual_tokens = value_u64(
+        metrics
+            .get("actual_tokens")
+            .or_else(|| metrics.get("completion_tokens"))
+            .or_else(|| metrics.get("output_tokens"))
+            .or_else(|| tokens.and_then(|tokens| tokens.get("output"))),
+    );
+    let cost_micros = value_u64(metrics.get("cost_micros"));
+    let duration_ms = value_u64(metrics.get("duration_ms"));
+    let cache_hit = value_bool(metrics.get("cache_hit")).or_else(|| {
+        metrics
+            .get("cache")
+            .and_then(Value::as_object)
+            .and_then(|cache| value_u64(cache.get("read")))
+            .map(|read| read > 0)
+    });
+    let has_metrics = requested_tokens.is_some()
+        || actual_tokens.is_some()
+        || cost_micros.is_some()
+        || duration_ms.is_some()
+        || cache_hit.is_some()
+        || nested_usage.is_some();
+    if has_metrics {
+        return Some(BrokerUsage {
+            requested_tokens,
+            actual_tokens,
+            model: object_string(metrics, &["model", "modelID", "model_id"])
+                .or_else(|| fallback_model.map(ToString::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            duration_ms,
+            cost_micros,
+            cache_hit,
+            unavailable_reason: (requested_tokens.is_none()
+                && actual_tokens.is_none()
+                && cost_micros.is_none()
+                && duration_ms.is_none()
+                && cache_hit.is_none())
+            .then(|| "provider usage payload omitted numeric telemetry".to_string()),
+        });
+    }
+
+    object
+        .values()
+        .find_map(|value| usage_from_value(value, fallback_model))
+}
+
+fn extract_worker_usage(
+    stdout: &str,
+    stderr: &str,
+    fallback_model: Option<&str>,
+) -> Option<BrokerUsage> {
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| usage_from_value(&value, fallback_model))
+}
+
+fn update_provider_session_id_from_output(
+    store: &StateStore,
+    task_id: &str,
+    stdout: &str,
+    stderr: &str,
+) -> Result<()> {
+    let Some(provider_session_id) = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| extract_provider_session_id(&value))
+    else {
+        return Ok(());
+    };
+    let Some(mut descriptor) = read_resident_session_descriptor(store, task_id)? else {
+        return Ok(());
+    };
+    if descriptor.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
+        return Ok(());
+    }
+    descriptor.provider_session_id = Some(provider_session_id);
+    write_resident_session_descriptor(store, &descriptor)?;
+    Ok(())
+}
+
+pub fn provider_session_id_for_task(store: &StateStore, task_id: &str) -> Result<Option<String>> {
+    Ok(
+        read_resident_session_descriptor(store, task_id)?.and_then(|descriptor| {
+            descriptor
+                .provider_session_id
+                .map(|session_id| session_id.trim().to_string())
+                .filter(|session_id| !session_id.is_empty())
+        }),
+    )
+}
+
+pub fn seed_provider_session_for_task(
+    store: &StateStore,
+    workspace: &Path,
+    task: &Task,
+    worker_kind: WorkerKind,
+    worker_model: Option<String>,
+    provider_session_id: &str,
+) -> Result<()> {
+    let provider_session_id = provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        bail!("provider session id cannot be empty when seeding a worker task");
+    }
+    let mut descriptor =
+        prepare_resident_session_descriptor(store, workspace, task, worker_kind, worker_model)?;
+    descriptor.provider_session_id = Some(provider_session_id.to_string());
+    write_resident_session_descriptor(store, &descriptor)?;
+    Ok(())
+}
+
 fn start_command_backed_worker(
     request: WorkerStartRequest<'_>,
     supports_interaction: bool,
@@ -2082,6 +2535,14 @@ fn start_command_backed_worker(
     if supports_interaction {
         store.write_worker_file(&task.id, "transcript.jsonl", "")?;
         store.write_worker_file(&task.id, "tool-events.jsonl", "")?;
+        let descriptor = prepare_resident_session_descriptor(
+            store,
+            workspace,
+            task,
+            route.worker_kind,
+            packet.worker_model.clone(),
+        )?;
+        write_resident_session_descriptor(store, &descriptor)?;
     }
 
     Ok(Arc::new(CommandWorkerSessionHandle {
@@ -2091,6 +2552,7 @@ fn start_command_backed_worker(
         worker_name: worker_name.to_string(),
         skip_worker: config.skip_worker,
         command: route.worker_command.map(ToString::to_string),
+        command_timeout: Duration::from_secs(config.stale_task_timeout_secs.max(1) as u64),
         worker_model: packet.worker_model.clone(),
         model_variant: packet.variant_applied.clone(),
         tool_policy: packet.tools,
@@ -2136,6 +2598,7 @@ struct CommandWorkerSessionHandle {
     worker_name: String,
     skip_worker: bool,
     command: Option<String>,
+    command_timeout: Duration,
     worker_model: Option<String>,
     model_variant: Option<String>,
     tool_policy: WorkerToolPolicy,
@@ -2307,17 +2770,42 @@ impl CommandWorkerSessionHandle {
         if let Some(worker_model) = &self.worker_model {
             env.insert("GEARBOX_WORKER_MODEL".to_string(), worker_model.clone());
         }
+        if self.supports_interaction {
+            if let Some(descriptor) = read_resident_session_descriptor(&self.store, &self.task_id)?
+            {
+                env.insert(
+                    "GEARBOX_WORKER_SESSION_ID".to_string(),
+                    descriptor.resumable_session_id().to_string(),
+                );
+                env.insert(
+                    "GEARBOX_WORKER_RESUME".to_string(),
+                    (descriptor.resume_count > 0 || descriptor.provider_session_id.is_some())
+                        .to_string(),
+                );
+                env.insert(
+                    "GEARBOX_WORKER_SESSION_DESCRIPTOR".to_string(),
+                    resident_session_descriptor_path(&self.store, &self.task_id)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
         env.insert(
             "GEARBOX_WORKER_TOOL_POLICY".to_string(),
             serde_json::to_string(&self.tool_policy)
                 .context("failed to serialize worker tool policy for dispatch")?,
         );
+        env.insert(
+            "GEARBOX_WORKER_TIMEOUT_SECS".to_string(),
+            self.command_timeout.as_secs().to_string(),
+        );
 
-        let output = run_shell_command_with_env_and_cancellation(
+        let output = run_shell_command_with_env_and_cancellation_and_timeout(
             &self.workspace,
             command,
             &env,
             Some(&cancellation_token),
+            Some(self.command_timeout),
         );
         self.with_session_state(|state| {
             state.active_command = false;
@@ -2337,6 +2825,21 @@ impl CommandWorkerSessionHandle {
                 return Err(error);
             }
         };
+        update_provider_session_id_from_output(
+            &self.store,
+            &self.task_id,
+            &output.stdout,
+            &output.stderr,
+        )?;
+        if let Some(usage) =
+            extract_worker_usage(&output.stdout, &output.stderr, self.worker_model.as_deref())
+        {
+            self.store.write_worker_file(
+                &self.task_id,
+                "usage.json",
+                &format!("{}\n", serde_json::to_string_pretty(&usage)?),
+            )?;
+        }
         let stdout_path =
             self.store
                 .write_worker_file(&self.task_id, stdout_file, &output.stdout)?;
@@ -2655,8 +3158,14 @@ impl CommandWorkerSessionHandle {
 
 impl WorkerSessionHandle for CommandWorkerSessionHandle {
     fn session_id(&self) -> Option<String> {
-        self.supports_interaction
-            .then(|| format!("{}_session", self.task_id))
+        if !self.supports_interaction {
+            return None;
+        }
+        read_resident_session_descriptor(&self.store, &self.task_id)
+            .ok()
+            .flatten()
+            .map(|descriptor| descriptor.resumable_session_id().to_string())
+            .or_else(|| Some(format!("{}_session", self.task_id)))
     }
 
     fn send_follow_up(&self, prompt: String) -> Result<()> {
@@ -2714,6 +3223,12 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
                 "dispose.md",
                 "# Gear worker dispose\n\nGear disposed the resident worker session.\n",
             )?;
+            if let Some(mut descriptor) =
+                read_resident_session_descriptor(&self.store, &self.task_id)?
+            {
+                descriptor.resumable = false;
+                write_resident_session_descriptor(&self.store, &descriptor)?;
+            }
         }
         Ok(())
     }
@@ -2734,7 +3249,7 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
     }
 
     fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
-        Ok(worker_outcome_from_result(&self.execute()?))
+        worker_outcome_from_result(&self.execute()?)
     }
 
     fn wait_for_result(&self) -> Result<WorkerResult> {
@@ -2746,6 +3261,11 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
             .lock()
             .map(|output| output.clone())
             .unwrap_or(None)
+    }
+
+    fn usage(&self) -> Option<BrokerUsage> {
+        let path = self.store.worker_dir(&self.task_id).join("usage.json");
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
 }
 
@@ -2896,9 +3416,22 @@ fn worker_model_metadata(packet: &WorkerPacket) -> String {
         .join("\n")
 }
 
-pub fn worker_outcome_from_result(result: &WorkerResult) -> WorkerOutcome {
+pub fn worker_outcome_from_result(result: &WorkerResult) -> Result<WorkerOutcome> {
     let parsed_report = parsed_worker_report(result);
-    WorkerOutcome {
+    let known_failures = if parsed_report.known_failures.is_empty() {
+        if result.status == WorkerStatus::Failed {
+            if let Some(marker) = fallback_error_marker_from_stderr(result)? {
+                vec![marker.to_string()]
+            } else {
+                vec![result.summary.clone()]
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        parsed_report.known_failures.clone()
+    };
+    Ok(WorkerOutcome {
         status: result.status.clone(),
         session_id: None,
         session_capability: None,
@@ -2911,15 +3444,7 @@ pub fn worker_outcome_from_result(result: &WorkerResult) -> WorkerOutcome {
         } else {
             parsed_report.commands_run
         },
-        known_failures: if parsed_report.known_failures.is_empty() {
-            if result.status == WorkerStatus::Failed {
-                vec![result.summary.clone()]
-            } else {
-                Vec::new()
-            }
-        } else {
-            parsed_report.known_failures
-        },
+        known_failures,
         raw_output_path: result
             .last_message_path
             .clone()
@@ -2927,7 +3452,48 @@ pub fn worker_outcome_from_result(result: &WorkerResult) -> WorkerOutcome {
             .or_else(|| result.stderr_path.clone()),
         command: result.command.clone(),
         exit_code: result.exit_code,
+    })
+}
+
+fn fallback_error_marker_from_stderr(result: &WorkerResult) -> Result<Option<&'static str>> {
+    let Some(stderr_path) = result.stderr_path.as_ref() else {
+        return Ok(None);
+    };
+    let stderr = fs::read_to_string(stderr_path)
+        .with_context(|| format!("failed to read worker stderr {}", stderr_path.display()))?;
+    let stderr = stderr.to_ascii_lowercase();
+    if stderr.contains("model_not_found")
+        || stderr.contains("model unavailable")
+        || stderr.contains("model not found")
+        || (stderr.contains("model") && stderr.contains("not supported"))
+    {
+        return Ok(Some("model unavailable reported by worker stderr"));
     }
+    if stderr.contains("rate limit")
+        || stderr.contains("rate-limit")
+        || stderr.contains("too many requests")
+        || stderr.contains("quota exceeded")
+        || stderr.contains("usage quota")
+        || stderr.contains("free usage")
+        || stderr.contains("limit exhausted")
+        || stderr.contains("cooling down")
+        || stderr.contains("service unavailable")
+        || stderr.contains("temporarily unavailable")
+        || stderr.contains("overloaded")
+        || stderr
+            .split(|character: char| !character.is_ascii_digit())
+            .any(|status_code| matches!(status_code, "429" | "503" | "529"))
+        || stderr.contains("使用上限")
+        || stderr.contains("频率限制")
+        || stderr.contains("请求过于频繁")
+        || stderr.contains("暂时不可用")
+        || stderr.contains("服务不可用")
+    {
+        return Ok(Some(
+            "provider temporarily unavailable reported by worker stderr",
+        ));
+    }
+    Ok(None)
 }
 
 #[derive(Default)]
@@ -3178,7 +3744,7 @@ pub fn write_result_and_outcome(
     let result_json =
         serde_json::to_string_pretty(result).context("failed to serialize worker result")?;
     store.write_worker_file(task_id, "result.json", &format!("{result_json}\n"))?;
-    let outcome = worker_outcome_from_result(result);
+    let outcome = worker_outcome_from_result(result)?;
     let outcome_json =
         serde_json::to_string_pretty(&outcome).context("failed to serialize worker outcome")?;
     store.write_worker_file(task_id, "outcome.json", &format!("{outcome_json}\n"))?;
@@ -3364,6 +3930,46 @@ mod tests {
         assert_eq!(unknown.worker_kind, WorkerKind::Codex);
         assert_eq!(unknown.category, WorkerCategory::Repair);
         assert!(unknown.route_reason.contains("sequence route"));
+    }
+
+    #[test]
+    fn category_routes_preserve_distinct_models_for_the_same_worker_kind() {
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("opencode run".to_string()),
+            worker_model: None,
+            worker_routes: [
+                "opencode/hy3-free",
+                "opencode/mimo-v2.5-free",
+                "opencode/deepseek-v4-flash-free",
+            ]
+            .into_iter()
+            .map(|worker_model| WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some("opencode run".to_string()),
+                worker_model: Some(worker_model.to_string()),
+            })
+            .collect(),
+            unavailable_worker_models: vec!["opencode/hy3-free".to_string()],
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            require_worker: true,
+        };
+
+        let first = config.selected_route_for_hint(1, Some("deep"));
+        let second = config.selected_route_for_hint(2, Some("deep"));
+
+        assert_eq!(first.worker_model, Some("opencode/mimo-v2.5-free"));
+        assert_eq!(second.worker_model, Some("opencode/deepseek-v4-flash-free"));
+        assert!(
+            first
+                .route_reason
+                .contains("skipping an unavailable provider/model route")
+        );
     }
 
     #[test]
@@ -3704,6 +4310,73 @@ mod tests {
         result: WorkerResult,
     }
 
+    struct FakeAcpBackend {
+        started: Arc<AtomicBool>,
+    }
+
+    impl NativeWorkerBackend for FakeAcpBackend {
+        fn start_zed_agent(
+            &self,
+            _request: WorkerStartRequest<'_>,
+        ) -> Result<Arc<dyn WorkerSessionHandle>> {
+            bail!("fake ACP backend should not receive a ZedAgent route")
+        }
+
+        fn start_acp_worker(
+            &self,
+            worker_kind: WorkerKind,
+            request: WorkerStartRequest<'_>,
+        ) -> Result<Option<Arc<dyn WorkerSessionHandle>>> {
+            if !matches!(
+                worker_kind,
+                WorkerKind::Opencode
+                    | WorkerKind::OpencodeSession
+                    | WorkerKind::Codex
+                    | WorkerKind::Claude
+            ) {
+                return Ok(None);
+            }
+            self.started.store(true, Ordering::SeqCst);
+            let result = WorkerResult {
+                status: WorkerStatus::Skipped,
+                command: Some("native-acp".to_string()),
+                exit_code: None,
+                summary: "native ACP backend".to_string(),
+                packet_path: request
+                    .store
+                    .worker_dir(&request.task.id)
+                    .join("packet.json"),
+                prompt_path: request.store.worker_dir(&request.task.id).join("prompt.md"),
+                stdout_path: None,
+                stderr_path: None,
+                last_message_path: None,
+                result_path: request
+                    .store
+                    .worker_dir(&request.task.id)
+                    .join("result.json"),
+                outcome_path: request
+                    .store
+                    .worker_dir(&request.task.id)
+                    .join("outcome.json"),
+            };
+            Ok(Some(Arc::new(FakeNativeHandle { result })))
+        }
+
+        fn native_broker_capabilities(
+            &self,
+            worker_kind: WorkerKind,
+        ) -> Option<Vec<BrokerCapability>> {
+            matches!(
+                worker_kind,
+                WorkerKind::Opencode
+                    | WorkerKind::OpencodeSession
+                    | WorkerKind::Codex
+                    | WorkerKind::Claude
+            )
+            .then(|| broker_capabilities_for_kind(WorkerKind::OpencodeSession, false))
+        }
+    }
+
     impl WorkerSessionHandle for FakeNativeHandle {
         fn session_id(&self) -> Option<String> {
             Some("native-zed-session".to_string())
@@ -3746,7 +4419,7 @@ mod tests {
         }
 
         fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
-            Ok(worker_outcome_from_result(&self.result))
+            worker_outcome_from_result(&self.result)
         }
 
         fn wait_for_result(&self) -> Result<WorkerResult> {
@@ -3847,6 +4520,60 @@ mod tests {
 
         assert!(started.load(Ordering::SeqCst));
         assert_eq!(result.command.as_deref(), Some("native-zed"));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_registry_routes_provider_workers_to_native_acp_backend() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_native_acp".to_string(),
+            goal_id: "goal_native_acp".to_string(),
+            title: "test native ACP worker".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("codex".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Codex,
+            worker_command: Some("must-not-run".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::Codex,
+            require_worker: false,
+        };
+        let started = Arc::new(AtomicBool::new(false));
+        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeAcpBackend {
+            started: started.clone(),
+        }));
+        let result = registry.run(WorkerRunRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test ACP goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(result.command.as_deref(), Some("native-acp"));
         Ok(())
     }
 
@@ -4637,6 +5364,108 @@ mod tests {
     }
 
     #[test]
+    fn opencode_session_worker_reattaches_from_persisted_descriptor() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_opencode_session_reattach".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test opencode session reattach".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let script_path = temp_dir.path().join("resident-worker.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf '%s:%s\\n' \"$GEARBOX_WORKER_SESSION_ID\" \"$GEARBOX_WORKER_RESUME\" > \"${GEARBOX_WORKER_PACKET}.session\"\nprintf '{\"sessionID\":\"provider-session-1\",\"usage\":{\"input_tokens\":12,\"output_tokens\":7,\"cost_micros\":42,\"cache_hit\":true}}\\n'\n",
+        )?;
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(format!(
+                "sh {}",
+                shell_single_quote(&script_path.to_string_lossy())
+            )),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            require_worker: true,
+        };
+        let request = || WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+
+        let first_handle = OpencodeSessionWorker {}.start(request())?;
+        assert_eq!(
+            first_handle.session_id().as_deref(),
+            Some("task_opencode_session_reattach_session")
+        );
+        assert_eq!(
+            first_handle.wait_for_result()?.status,
+            WorkerStatus::Succeeded
+        );
+        assert_eq!(
+            first_handle.session_id().as_deref(),
+            Some("provider-session-1")
+        );
+        let usage = first_handle.usage().context("worker usage missing")?;
+        assert_eq!(usage.requested_tokens, Some(12));
+        assert_eq!(usage.actual_tokens, Some(7));
+        assert_eq!(usage.cost_micros, Some(42));
+        assert_eq!(usage.cache_hit, Some(true));
+
+        let descriptor_path = resident_session_descriptor_path(&store, &task.id);
+        let descriptor: ResidentSessionDescriptor =
+            serde_json::from_slice(&std::fs::read(&descriptor_path)?)?;
+        descriptor.validate()?;
+        assert_eq!(
+            descriptor.provider_session_id.as_deref(),
+            Some("provider-session-1")
+        );
+        assert_eq!(descriptor.resume_count, 0);
+
+        let second_handle = OpencodeSessionWorker {}.start(request())?;
+        assert_eq!(
+            second_handle.session_id().as_deref(),
+            Some("provider-session-1")
+        );
+        assert_eq!(
+            second_handle.wait_for_result()?.status,
+            WorkerStatus::Succeeded
+        );
+        let env_marker =
+            std::fs::read_to_string(store.worker_dir(&task.id).join("packet.json.session"))?;
+        assert_eq!(env_marker.trim(), "provider-session-1:true");
+        let resumed_descriptor: ResidentSessionDescriptor =
+            serde_json::from_slice(&std::fs::read(&descriptor_path)?)?;
+        assert_eq!(resumed_descriptor.resume_count, 1);
+        resumed_descriptor.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn opencode_session_worker_revives_after_cancel_before_follow_up() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -4987,6 +5816,7 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            command_timeout: Duration::from_secs(30),
             worker_model: None,
             model_variant: None,
             tool_policy: WorkerToolPolicy::default(),
@@ -5133,6 +5963,7 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            command_timeout: Duration::from_secs(30),
             worker_model: None,
             model_variant: None,
             tool_policy: WorkerToolPolicy::default(),
@@ -5231,6 +6062,7 @@ mod tests {
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
+            command_timeout: Duration::from_secs(30),
             worker_model: None,
             model_variant: None,
             tool_policy: WorkerToolPolicy::default(),

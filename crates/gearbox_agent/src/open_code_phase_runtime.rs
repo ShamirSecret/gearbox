@@ -1,5 +1,6 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -18,7 +19,10 @@ use crate::runtime::{
     PlanRevisionInput, PlanRevisionSubmission, PlannerInput, PlannerSubmission,
     StrategistNextGoalInput, StrategistNextGoalSubmission, StrategistNextGoalVerdict,
 };
-use crate::state::{Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp};
+use crate::state::{
+    ModelCallKind, ModelCallLedgerEntry, RepositoryObservationEvent, RepositoryObservationReceipt,
+    Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp, timestamp,
+};
 use crate::task_manager::{
     ManagedTaskStatus, ResidencyState, TaskAttempt, TaskAttemptStatus, TaskRecord,
 };
@@ -39,6 +43,35 @@ pub struct OpenCodePhaseRuntimeFactory {
     cancellation_token: CancellationToken,
     phase_route_table: PhaseRouteTable,
     inventory: LiveModelInventory,
+    call_budget: PhaseCallBudget,
+}
+
+#[derive(Clone, Default)]
+struct PhaseCallBudget {
+    calls_by_goal: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl PhaseCallBudget {
+    fn reserve(&self, goal_id: &str) -> Result<usize> {
+        let max_calls = std::env::var("GEARBOX_MAX_CALLS_PER_EPOCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let mut calls = self
+            .calls_by_goal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("phase call budget mutex poisoned"))?;
+        let entry = calls.entry(goal_id.to_string()).or_default();
+        if *entry >= max_calls {
+            bail!(
+                "phase model call budget exhausted for goal `{goal_id}` at {} calls",
+                max_calls
+            );
+        }
+        *entry = entry.saturating_add(1);
+        Ok(*entry)
+    }
 }
 
 impl OpenCodePhaseRuntimeFactory {
@@ -57,6 +90,7 @@ impl OpenCodePhaseRuntimeFactory {
             cancellation_token,
             phase_route_table,
             inventory,
+            call_budget: PhaseCallBudget::default(),
         }
     }
 
@@ -72,36 +106,42 @@ impl OpenCodePhaseRuntimeFactory {
             worker_config: worker_config.clone(),
             broker_factory: broker_factory.clone(),
             cancellation_token: cancellation_token.clone(),
+            call_budget: self.call_budget.clone(),
         };
         let planner_runner = OpenCodePhaseRunner {
             workspace: workspace.clone(),
             worker_config: worker_config.clone(),
             broker_factory: broker_factory.clone(),
             cancellation_token: cancellation_token.clone(),
+            call_budget: self.call_budget.clone(),
         };
         let critic_runner = OpenCodePhaseRunner {
             workspace: workspace.clone(),
             worker_config: worker_config.clone(),
             broker_factory: broker_factory.clone(),
             cancellation_token: cancellation_token.clone(),
+            call_budget: self.call_budget.clone(),
         };
         let oracle_runner = OpenCodePhaseRunner {
             workspace: workspace.clone(),
             worker_config: worker_config.clone(),
             broker_factory: broker_factory.clone(),
             cancellation_token: cancellation_token.clone(),
+            call_budget: self.call_budget.clone(),
         };
         let revision_runner = OpenCodePhaseRunner {
             workspace: workspace.clone(),
             worker_config: worker_config.clone(),
             broker_factory: broker_factory.clone(),
             cancellation_token: cancellation_token.clone(),
+            call_budget: self.call_budget.clone(),
         };
         let strategist_runner = OpenCodePhaseRunner {
             workspace,
             worker_config,
             broker_factory: broker_factory.clone(),
             cancellation_token,
+            call_budget: self.call_budget,
         };
 
         Ok(PhaseRuntime {
@@ -121,6 +161,7 @@ impl OpenCodePhaseRuntimeFactory {
             max_plan_revisions: crate::runtime::DEFAULT_MAX_PLAN_REVISIONS,
             broker: None,
             broker_factory: Some(broker_factory),
+            direct_model_usage_provider: None,
         })
     }
 }
@@ -133,29 +174,49 @@ pub struct OpenCodePhaseRunner {
     pub workspace: PathBuf,
     pub worker_config: WorkerConfig,
     pub cancellation_token: CancellationToken,
+    call_budget: PhaseCallBudget,
 }
 
 const MAX_PLANNER_SCHEMA_REPAIRS: usize = 2;
 const MAX_INTENT_REPAIRS: usize = 1;
+const MAX_REVIEW_SCHEMA_REPAIRS: usize = 2;
 
 struct OpenCodePhaseOutput {
     raw_output: String,
     execution_identity: PhaseExecutionIdentity,
     artifact_path: String,
+    repository_observation_path: Option<String>,
 }
 
 impl OpenCodePhaseRunner {
+    pub fn new(
+        broker_factory: Arc<PhaseBrokerFactory>,
+        workspace: PathBuf,
+        worker_config: WorkerConfig,
+        cancellation_token: CancellationToken,
+    ) -> Self {
+        Self {
+            broker_factory,
+            workspace,
+            worker_config,
+            cancellation_token,
+            call_budget: PhaseCallBudget::default(),
+        }
+    }
+
     fn run(
         &self,
         decision: &PhaseRouteDecision,
         goal_id: &str,
         plan_id: &str,
         plan_revision: usize,
+        plan_hash: Option<&str>,
         task_id: &str,
         task_kind: crate::state::TaskKind,
         scope: Scope,
         prompt: String,
     ) -> Result<OpenCodePhaseOutput> {
+        let call_ordinal = self.call_budget.reserve(goal_id)?;
         if !matches!(
             decision.candidate.backend,
             PhaseBackend::Worker(WorkerKind::OpencodeSession)
@@ -163,11 +224,10 @@ impl OpenCodePhaseRunner {
             bail!("Gear OpenCode phase runner received a non-OpenCode route");
         }
         let config = decision.overlay_worker_config(&self.worker_config)?;
-        let phase_route_hint = match &task_kind {
-            crate::state::TaskKind::Review => Some("review"),
-            crate::state::TaskKind::Spec | crate::state::TaskKind::Plan => Some("explore"),
-            _ => None,
-        };
+        // The phase decision is authoritative for the task-record route. A
+        // Plan task may be read-only, but recording it as `explore` when the
+        // route selected `deep` makes the receipt disagree with its attempt.
+        let phase_route_hint = Some(decision.category.as_str());
         let store = StateStore::new(&self.workspace);
         store.initialize()?;
         let task = Task {
@@ -217,6 +277,36 @@ impl OpenCodePhaseRunner {
             );
         }
         write_phase_task_record(&store, &task, &config, phase_route_hint, &execution)?;
+        let call_entry = write_model_call_ledger_entry(
+            &store,
+            &self.workspace,
+            decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            call_ordinal,
+            &config,
+            &execution,
+        )?;
+        let observation = RepositoryObservationReceipt::seal(
+            &format!(
+                "{}-{}",
+                phase_role_name(&decision.phase),
+                task_id.replace(':', "_")
+            ),
+            goal_id,
+            plan_id,
+            plan_revision,
+            plan_hash.unwrap_or("pending"),
+            task_id,
+            &execution.session_identity.session_id,
+            call_entry.transcript_sha256.clone(),
+            call_entry.observed_tool_count,
+            call_entry.observed_paths.clone(),
+            call_entry.observation_events.clone(),
+        )?;
+        let observation_path = store.write_repository_observation_receipt(&observation)?;
         let raw_output = execution
             .result
             .last_message_path
@@ -243,6 +333,7 @@ impl OpenCodePhaseRunner {
             raw_output,
             execution_identity: execution.execution_identity,
             artifact_path: execution.result.result_path.to_string_lossy().to_string(),
+            repository_observation_path: Some(observation_path.to_string_lossy().to_string()),
         })
     }
 
@@ -253,6 +344,7 @@ impl OpenCodePhaseRunner {
             &input.goal_id,
             &format!("pending_{}", input.goal_id),
             0,
+            None,
             &format!("intent_fold_{}", input.goal_id),
             crate::state::TaskKind::Spec,
             input.scope.clone(),
@@ -269,6 +361,7 @@ impl OpenCodePhaseRunner {
                     analyst: output.execution_identity,
                     raw_output: output.raw_output,
                     artifact_path: Some(output.artifact_path),
+                    repository_evidence_path: output.repository_observation_path,
                 });
             }
             let repair_prompt =
@@ -278,6 +371,7 @@ impl OpenCodePhaseRunner {
                 &input.goal_id,
                 &format!("pending_{}", input.goal_id),
                 0,
+                None,
                 &format!(
                     "intent_fold_{}_repair_{}",
                     input.goal_id,
@@ -298,6 +392,7 @@ impl OpenCodePhaseRunner {
             &input.goal_id,
             &format!("pending_{}", input.goal_id),
             0,
+            None,
             &format!("planner_{}", input.goal_id),
             crate::state::TaskKind::Plan,
             input.scope.clone(),
@@ -349,6 +444,7 @@ impl OpenCodePhaseRunner {
                             &input.goal_id,
                             &format!("pending_{}", input.goal_id),
                             0,
+                            None,
                             &format!("planner_{}_repair_{}", input.goal_id, repair_attempt + 1),
                             crate::state::TaskKind::Plan,
                             input.scope.clone(),
@@ -361,6 +457,7 @@ impl OpenCodePhaseRunner {
                         planner: output.execution_identity,
                         raw_output: output.raw_output,
                         artifact_path: Some(output.artifact_path),
+                        repository_evidence_path: output.repository_observation_path,
                     });
                 }
                 Err(diagnostic) if repair_attempt < MAX_PLANNER_SCHEMA_REPAIRS => {
@@ -389,6 +486,7 @@ impl OpenCodePhaseRunner {
                         &input.goal_id,
                         &format!("pending_{}", input.goal_id),
                         0,
+                        None,
                         &format!("planner_{}_repair_{}", input.goal_id, repair_attempt + 1),
                         crate::state::TaskKind::Plan,
                         input.scope.clone(),
@@ -426,23 +524,58 @@ impl OpenCodePhaseRunner {
             "{task_prefix}_{}_{}",
             input.plan.goal_id, input.plan.revision
         );
-        let output = self.run(
+        let mut output = self.run(
             &input.route_decision,
             &input.plan.goal_id,
             &input.plan.plan_id,
             input.plan.revision,
+            Some(&input.plan.plan_hash),
             &task_id,
             crate::state::TaskKind::Review,
             Scope::new(Vec::new(), Vec::new(), 1),
             prompt,
         )?;
-        let verdict = PlanCriticVerdict::parse(&output.raw_output)?;
-        Ok(PlanCriticSubmission {
-            reviewer: output.execution_identity,
-            verdict,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        for repair_attempt in 0..=MAX_REVIEW_SCHEMA_REPAIRS {
+            match PlanCriticVerdict::parse(&output.raw_output) {
+                Ok(verdict) => {
+                    return Ok(PlanCriticSubmission {
+                        reviewer: output.execution_identity,
+                        verdict,
+                        raw_output: output.raw_output,
+                        artifact_path: Some(output.artifact_path),
+                        repository_evidence_path: output.repository_observation_path,
+                    });
+                }
+                Err(error) if repair_attempt < MAX_REVIEW_SCHEMA_REPAIRS => {
+                    let repair_prompt = gear_opencode_review_repair_prompt(
+                        &input,
+                        task_prefix,
+                        &output.raw_output,
+                        &error.to_string(),
+                        repair_attempt + 1,
+                    )?;
+                    output = self.run(
+                        &input.route_decision,
+                        &input.plan.goal_id,
+                        &input.plan.plan_id,
+                        input.plan.revision,
+                        Some(&input.plan.plan_hash),
+                        &format!("{task_id}_repair_{}", repair_attempt + 1),
+                        crate::state::TaskKind::Review,
+                        Scope::new(Vec::new(), Vec::new(), 1),
+                        repair_prompt,
+                    )?;
+                }
+                Err(error) => {
+                    bail!(
+                        "{task_prefix} schema repair exhausted after {} attempt(s): {}",
+                        MAX_REVIEW_SCHEMA_REPAIRS,
+                        error
+                    );
+                }
+            }
+        }
+        bail!("{task_prefix} review repair loop terminated unexpectedly")
     }
 
     pub fn revise(&self, input: PlanRevisionInput) -> Result<PlanRevisionSubmission> {
@@ -456,6 +589,7 @@ impl OpenCodePhaseRunner {
             &input.plan.goal_id,
             &input.plan.plan_id,
             input.plan.revision,
+            Some(&input.plan.plan_hash),
             &task_id,
             crate::state::TaskKind::Plan,
             Scope::new(Vec::new(), Vec::new(), 1),
@@ -481,6 +615,7 @@ impl OpenCodePhaseRunner {
             &input.goal_id,
             &input.plan.plan_id,
             input.plan.revision,
+            Some(&input.plan.plan_hash),
             &task_id,
             crate::state::TaskKind::Review,
             Scope::new(Vec::new(), Vec::new(), 1),
@@ -558,9 +693,252 @@ fn write_phase_task_record(
     Ok(())
 }
 
+fn phase_role_name(phase: &crate::plan_graph::PhaseProfile) -> &'static str {
+    match phase {
+        crate::plan_graph::PhaseProfile::Planner => "planner",
+        crate::plan_graph::PhaseProfile::PlanCritic => "plan_critic",
+        crate::plan_graph::PhaseProfile::Orchestrator => "orchestrator",
+        crate::plan_graph::PhaseProfile::ExecutorQuick => "executor_quick",
+        crate::plan_graph::PhaseProfile::ExecutorDeep => "executor_deep",
+        crate::plan_graph::PhaseProfile::ReviewerTask => "reviewer_task",
+        crate::plan_graph::PhaseProfile::ReviewerFinal => "reviewer_final",
+        crate::plan_graph::PhaseProfile::StrategistNextGoal => "strategist_next_goal",
+        crate::plan_graph::PhaseProfile::Summarizer => "summarizer",
+    }
+}
+
+fn write_model_call_ledger_entry(
+    store: &StateStore,
+    workspace: &Path,
+    decision: &PhaseRouteDecision,
+    goal_id: &str,
+    plan_id: &str,
+    plan_revision: usize,
+    task_id: &str,
+    call_ordinal: usize,
+    config: &WorkerConfig,
+    execution: &crate::worker_broker::PhaseWorkerExecution,
+) -> Result<ModelCallLedgerEntry> {
+    let finished_at = timestamp();
+    let session_id = execution.session_identity.session_id.clone();
+    let transcript_path = execution.session_dir.join("transcript.jsonl");
+    let (transcript_sha256, observed_tool_count, observed_paths, observation_events) =
+        if transcript_path.is_file() {
+            let contents = std::fs::read_to_string(&transcript_path)?;
+            let mut tool_count = 0usize;
+            let mut paths = std::collections::BTreeSet::new();
+            let mut events = Vec::new();
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                let value = serde_json::from_str::<serde_json::Value>(line).ok();
+                let serialized = value
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| line.to_string());
+                if serialized.contains("tool_name") || serialized.contains("\"tool\"") {
+                    tool_count = tool_count.saturating_add(1);
+                }
+                if let Some(value) = value.as_ref() {
+                    let (operation, candidates, has_tool_marker) =
+                        transcript_tool_observation(value);
+                    if has_tool_marker {
+                        let event_hash = sha256_hex(line);
+                        if let Some(operation) = operation {
+                            if let Some(path) = candidates.into_iter().find_map(|candidate| {
+                                workspace_relative_observation_path(workspace, &candidate)
+                            }) {
+                                paths.insert(path.clone());
+                                events.push(RepositoryObservationEvent {
+                                    operation,
+                                    path,
+                                    event_id: format!("tool_{}", &event_hash[..16]),
+                                    event_hash,
+                                    observed_at: finished_at.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            (
+                Some(sha256_hex(&contents)),
+                tool_count,
+                paths.into_iter().collect(),
+                events,
+            )
+        } else {
+            (None, 0, Vec::new(), Vec::new())
+        };
+    let kind = if task_id.contains("review") || task_id.contains("oracle") {
+        ModelCallKind::ReviewRetry
+    } else if task_id.contains("repair") {
+        if task_id.contains("planner") {
+            ModelCallKind::SchemaRepair
+        } else {
+            ModelCallKind::SemanticRepair
+        }
+    } else {
+        ModelCallKind::Primary
+    };
+    let route = config.selected_route_for_hint(1, None);
+    let (provider_id, model_id) = route
+        .worker_model
+        .and_then(|model| model.split_once('/'))
+        .map_or(
+            (None, route.worker_model.map(ToString::to_string)),
+            |(provider, model)| (Some(provider.to_string()), Some(model.to_string())),
+        );
+    let parent_task_id = task_id
+        .split_once("_repair_")
+        .map(|(base, _)| base)
+        .or_else(|| task_id.split_once("_retry_").map(|(base, _)| base));
+    let parent_call_id = parent_task_id.and_then(|parent_task_id| {
+        store
+            .read_model_call_ledger(goal_id)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|entry| entry.plan_revision == plan_revision && entry.task_id == parent_task_id)
+            .map(|entry| entry.call_id)
+    });
+    let entry = ModelCallLedgerEntry {
+        schema_version: crate::state::MODEL_CALL_LEDGER_SCHEMA_VERSION,
+        call_id: format!("{goal_id}:{plan_revision}:{call_ordinal}:{task_id}:{session_id}"),
+        parent_call_id,
+        goal_id: goal_id.to_string(),
+        plan_id: plan_id.to_string(),
+        plan_revision,
+        phase: format!("{:?}", decision.phase),
+        task_id: task_id.to_string(),
+        kind,
+        worker_kind: route.worker_kind.as_str().to_string(),
+        provider_id,
+        model_id,
+        session_id,
+        status: execution.result.status.as_str().to_string(),
+        artifact_path: Some(execution.result.result_path.to_string_lossy().to_string()),
+        transcript_path: transcript_path
+            .is_file()
+            .then(|| transcript_path.to_string_lossy().to_string()),
+        transcript_sha256,
+        observed_tool_count,
+        observed_paths,
+        observation_events,
+        requested_tokens: execution
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.requested_tokens),
+        actual_tokens: execution
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.actual_tokens),
+        cost_micros: execution.usage.as_ref().and_then(|usage| usage.cost_micros),
+        duration_ms: execution.usage.as_ref().and_then(|usage| usage.duration_ms),
+        cache_hit: execution.usage.as_ref().and_then(|usage| usage.cache_hit),
+        unavailable_reason: execution
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.unavailable_reason.clone())
+            .or_else(|| {
+                execution
+                    .usage
+                    .is_none()
+                    .then(|| "phase worker usage receipt omitted usage".to_string())
+            }),
+        started_at: finished_at.clone(),
+        finished_at,
+    };
+    store.append_model_call_ledger_entry(&entry)?;
+    Ok(entry)
+}
+
 fn sha256_hex(value: &str) -> String {
     use sha2::{Digest as _, Sha256};
     format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn transcript_tool_observation(value: &serde_json::Value) -> (Option<String>, Vec<String>, bool) {
+    let mut operation = None;
+    let mut candidates = Vec::new();
+    let mut has_tool_marker = false;
+    if let serde_json::Value::Object(object) = value {
+        for (key, child) in object {
+            if matches!(key.as_str(), "tool_name" | "tool" | "name") {
+                if let Some(name) = child.as_str() {
+                    has_tool_marker |= matches!(key.as_str(), "tool_name" | "tool");
+                    operation = operation.or_else(|| observation_operation(name));
+                }
+            }
+            if matches!(
+                key.as_str(),
+                "path" | "filePath" | "file_path" | "directory" | "dir"
+            ) {
+                if let Some(path) = child.as_str() {
+                    candidates.push(path.to_string());
+                }
+            }
+            let (nested_operation, nested_candidates, nested_marker) =
+                transcript_tool_observation(child);
+            operation = operation.or(nested_operation);
+            candidates.extend(nested_candidates);
+            has_tool_marker |= nested_marker;
+        }
+    } else if let serde_json::Value::Array(values) = value {
+        for child in values {
+            let (nested_operation, nested_candidates, nested_marker) =
+                transcript_tool_observation(child);
+            operation = operation.or(nested_operation);
+            candidates.extend(nested_candidates);
+            has_tool_marker |= nested_marker;
+        }
+    }
+    (operation, candidates, has_tool_marker)
+}
+
+fn observation_operation(tool_name: &str) -> Option<String> {
+    let normalized = tool_name.to_ascii_lowercase();
+    if normalized.contains("read") {
+        Some("read".to_string())
+    } else if normalized.contains("search")
+        || normalized.contains("grep")
+        || normalized.contains("find")
+    {
+        Some("search".to_string())
+    } else if normalized.contains("list") || normalized == "ls" || normalized.contains("glob") {
+        Some("list".to_string())
+    } else {
+        None
+    }
+}
+
+fn workspace_relative_observation_path(workspace: &Path, candidate: &str) -> Option<String> {
+    let candidate_path = Path::new(candidate);
+    let candidate_path = if candidate_path.is_absolute() {
+        candidate_path.to_path_buf()
+    } else {
+        workspace.join(candidate_path)
+    };
+    let workspace = workspace.canonicalize().ok()?;
+    let candidate = candidate_path.canonicalize().ok()?;
+    let relative = candidate.strip_prefix(workspace).ok()?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    (!relative.is_empty() && relative != ".." && !relative.starts_with("../")).then_some(relative)
+}
+
+fn gear_opencode_review_repair_prompt(
+    input: &PlanCriticInput,
+    role: &str,
+    raw_output: &str,
+    error: &str,
+    attempt: usize,
+) -> Result<String> {
+    Ok(format!(
+        "You are the same Gear {role} reviewer on bounded fresh repair turn {attempt}. Output ONLY one JSON object. Do not use `status`, `verdict` at the top level, `goal_id`, `plan_id`, `revision`, `plan_hash`, or an object/map for `checks`. `checks` MUST be an array of exactly seven objects. Convert the previous answer into this exact skeleton, preserving its meaning: {{\"schema_version\":1,\"reviewed_goal_id\":\"{goal}\",\"reviewed_plan_id\":\"{plan}\",\"reviewed_plan_revision\":{revision},\"reviewed_plan_hash\":\"{hash}\",\"reviewed_planner_execution_id\":\"{planner}\",\"decision\":\"approve|revise|reject\",\"checks\":[{{\"dimension\":\"references\",\"verdict\":\"pass|fail\",\"summary\":\"...\",\"evidence_refs\":[]}}],\"findings\":[],\"revision_instructions\":null,\"needs_user_reason\":null,\"summary\":\"...\"}}. Each finding severity is only `blocking` or `advisory`; each check verdict is only `pass` or `fail`.\n\nRust parse error:\n{error}\n\nPrevious invalid output:\n{raw_output}",
+        goal = input.plan.goal_id,
+        plan = input.plan.plan_id,
+        revision = input.plan.revision,
+        hash = input.plan.plan_hash,
+        planner = input.planner_receipt.identity.execution_id,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +1205,7 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             workspace: temp_dir.path().to_path_buf(),
             worker_config: config,
             cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
         };
         let decision =
             routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
@@ -870,6 +1249,7 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             workspace: temp_dir.path().to_path_buf(),
             worker_config: config.clone(),
             cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
         };
 
         let planner_decision =
@@ -943,6 +1323,7 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             workspace: temp_dir.path().to_path_buf(),
             worker_config: config,
             cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
         };
         let decision =
             routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
