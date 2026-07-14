@@ -4179,6 +4179,8 @@ impl TaskManager {
                         .attempts
                         .into_iter()
                         .map(|attempt| {
+                            let result_path = attempt.result_path.clone();
+                            let outcome_path = attempt.outcome_path.clone();
                             let artifact_dir = attempt
                                 .result_path
                                 .as_ref()
@@ -4198,8 +4200,8 @@ impl TaskManager {
                                 worker_model: attempt.worker_model,
                                 worker_category: attempt.worker_category,
                                 status: attempt.status,
-                                result_path: attempt.result_path,
-                                outcome_path: attempt.outcome_path,
+                                result_path,
+                                outcome_path,
                                 route_transform_path,
                                 summary: attempt.summary,
                                 error: attempt.error,
@@ -4222,6 +4224,128 @@ impl TaskManager {
             tasks,
             current_output: self.control.current_last_output()?,
         })
+    }
+
+    /// Reconstruct a read-only task projection from durable worker records.
+    /// Persisted tasks deliberately expose no messageability because their
+    /// in-memory worker handles are not available after a restart.
+    pub fn durable_snapshot(
+        store: &StateStore,
+        session_id: Option<&str>,
+    ) -> Result<Option<TaskManagerSnapshot>> {
+        let Ok(entries) = fs::read_dir(store.workers_dir()) else {
+            return Ok(None);
+        };
+        let mut records = Vec::new();
+        for entry in entries.flatten().take(64) {
+            let task_record_path = entry.path().join("task-record.json");
+            if !task_record_path.is_file() {
+                continue;
+            }
+            let Ok(json) = fs::read_to_string(&task_record_path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<TaskRecord>(&json) else {
+                continue;
+            };
+            if session_id.is_some_and(|session_id| {
+                ![
+                    record.session_id.as_deref(),
+                    record.parent_session_id.as_deref(),
+                    record.root_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|record_session_id| record_session_id == session_id)
+            }) {
+                continue;
+            }
+            records.push(record);
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let mut counts = TaskManagerSnapshotCounts::default();
+        for record in &records {
+            match &record.status {
+                ManagedTaskStatus::Pending => counts.pending += 1,
+                ManagedTaskStatus::Running => counts.running += 1,
+                ManagedTaskStatus::Completed => counts.completed += 1,
+                ManagedTaskStatus::Failed => counts.failed += 1,
+                ManagedTaskStatus::Cancelled => counts.cancelled += 1,
+                ManagedTaskStatus::Interrupted => counts.interrupted += 1,
+                ManagedTaskStatus::Lost => counts.lost += 1,
+                ManagedTaskStatus::Skipped => counts.skipped += 1,
+            }
+        }
+        let tasks = records
+            .into_iter()
+            .map(|record| {
+                let attempts_len = record.attempts.len();
+                let status = record.status.clone();
+                let has_failure_kind = record.failure_kind.is_some();
+                let has_retry_reason = record.retry_reason.is_some();
+                let summary_head = summary_head_for_record(&record);
+                let continuation_hint = continuation_hint_for_record(&record);
+                TaskSnapshot {
+                    task_id: record.task_id,
+                    status: record.status,
+                    residency_state: record.residency_state,
+                    messageability: None,
+                    run_epoch: record.run_epoch,
+                    notified_epoch: record.notified_epoch,
+                    parent_task_id: record.parent_task_id,
+                    worker_kind: record.worker_kind,
+                    worker_model: record.worker_model,
+                    worker_category: record.worker_category,
+                    attempts: record
+                        .attempts
+                        .into_iter()
+                        .map(|attempt| {
+                            let result_path = attempt.result_path.clone();
+                            let outcome_path = attempt.outcome_path.clone();
+                            let artifact_dir = attempt
+                                .result_path
+                                .as_ref()
+                                .or(attempt.outcome_path.as_ref())
+                                .and_then(|path| path.parent());
+                            TaskAttemptSnapshot {
+                                attempt: attempt.attempt,
+                                worker_kind: attempt.worker_kind,
+                                worker_model: attempt.worker_model,
+                                worker_category: attempt.worker_category,
+                                status: attempt.status,
+                                result_path,
+                                outcome_path,
+                                route_transform_path: task_attempt_route_transform_path(
+                                    artifact_dir,
+                                    attempt.attempt,
+                                    attempts_len,
+                                    &status,
+                                    has_failure_kind,
+                                    has_retry_reason,
+                                ),
+                                summary: attempt.summary,
+                                error: attempt.error,
+                            }
+                        })
+                        .collect(),
+                    result_path: record.result_path,
+                    outcome_path: record.outcome_path,
+                    summary_head,
+                    continuation_hint,
+                    summary: record.summary,
+                    retry_reason: record.retry_reason,
+                }
+            })
+            .collect();
+        Ok(Some(TaskManagerSnapshot {
+            counts,
+            artifacts_root: Some(store.artifacts_dir()),
+            tasks,
+            current_output: None,
+        }))
     }
 
     fn can_start_queued_task(&self, queued_task: &QueuedTask) -> bool {

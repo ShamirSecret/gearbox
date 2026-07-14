@@ -14,17 +14,23 @@ mod tools;
 
 use context_server::ContextServerId;
 pub use db::*;
+pub use gearbox_agent::gui::{
+    GearRuntimeBudgetSummary, GearRuntimeEventClass, GearRuntimeEventEnvelope, GearRuntimeHealth,
+    GearRuntimeLifecycle, GearRuntimeSnapshot,
+};
 pub use gearbox_agent::task_manager::ManagedTaskStatus as GearManagedTaskStatus;
 pub use gearbox_agent::task_manager::{
     Messageability as GearTaskMessageability, TaskAttemptSnapshot as GearTaskAttemptSnapshot,
     TaskAttemptStatus as GearTaskAttemptStatus, TaskManagerSnapshot as GearTaskManagerSnapshot,
     TaskSnapshot as GearTaskSnapshot,
 };
+
+const GEAR_RESUME_CONTINUATION_MARKER: &str = "__gear_resume_continuation__";
 // Broker contract types — re-exported for external backends to use
 pub use gearbox_agent::worker_broker::{
     BrokerCapability, BrokerLifecycleReceipt, BrokerOutcome, BrokerPermissionEvidence,
-    BrokerPermissionType, BrokerPhaseRequest, BrokerSessionIdentity, ModelAvailability,
-    BrokerUsage, PhaseBrokerFactory, UnavailableReason, WorkerBroker,
+    BrokerPermissionType, BrokerPhaseRequest, BrokerSessionIdentity, BrokerUsage,
+    ModelAvailability, PhaseBrokerFactory, UnavailableReason, WorkerBroker,
 };
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
@@ -52,7 +58,7 @@ use agent_skills::{
     SkillSource, SkillSummary, builtin_skills, global_skills_dir, load_skills_from_directory,
     parse_skill_frontmatter, project_skills_relative_path, read_skill_body_from_content,
 };
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
 
@@ -60,6 +66,10 @@ use fs::Fs;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
+use gearbox_agent::gui::{
+    GEAR_GUI_EVENT_BUFFER_CAPACITY, GEAR_GUI_REVIEW_QUEUE_CAPACITY,
+    GEAR_GUI_WORKER_DISPATCH_CAPACITY,
+};
 use gearbox_agent::phase_routing::{
     LiveModelInventory, ModelSelectorId, OpenCodeModelProfiles, PhaseBackend, PhaseRouteCandidate,
     PhaseRouteSource, PhaseRouteTable,
@@ -78,7 +88,7 @@ use gearbox_agent::runtime::{
     objective_policy_from_env,
 };
 use gearbox_agent::state::{
-    Budget, ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, event, id_timestamp,
+    Budget, ContinuationStatus, CoordinatorModel, EventKind, StateStore, event, id_timestamp,
 };
 use gearbox_agent::task_manager::{
     ActionOutcome, ManagedTaskStatus, OutcomeContext, SendOutcome, SharedTaskManager, SteerOutcome,
@@ -87,8 +97,8 @@ use gearbox_agent::task_manager::{
 };
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{
-    NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig, WorkerKind,
-    WorkerEvent, WorkerEventHub, WorkerOutcome, WorkerPacket, WorkerRegistry, WorkerResult,
+    NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig, WorkerEvent,
+    WorkerEventHub, WorkerKind, WorkerOutcome, WorkerPacket, WorkerRegistry, WorkerResult,
     WorkerRoute, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
     category_resolution_for_route, sanitize_model_fields, worker_outcome_from_result,
     worker_prompt, write_result_and_outcome,
@@ -260,6 +270,9 @@ struct Session {
     gear_task_manager_control: Option<TaskManagerControl>,
     gear_task_manager: Option<SharedTaskManager>,
     gear_task_manager_tick_loop: Option<TaskManagerTickLoop>,
+    gear_runtime_snapshot: Option<GearRuntimeSnapshot>,
+    gear_runtime_snapshot_error: Option<String>,
+    gear_runtime_snapshot_task: Option<Task<()>>,
     #[cfg(test)]
     gear_lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
     project_id: EntityId,
@@ -907,6 +920,9 @@ impl NativeAgent {
                 gear_task_manager_control: None,
                 gear_task_manager: None,
                 gear_task_manager_tick_loop: None,
+                gear_runtime_snapshot: None,
+                gear_runtime_snapshot_error: None,
+                gear_runtime_snapshot_task: None,
                 #[cfg(test)]
                 gear_lifecycle_events: None,
                 project_id,
@@ -2252,6 +2268,36 @@ impl NativeAgentConnection {
         }
     }
 
+    pub fn gear_runtime_snapshot(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<GearRuntimeSnapshot> {
+        if !self.is_gear() {
+            return None;
+        }
+        self.agent
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.gear_runtime_snapshot.clone())
+    }
+
+    pub fn gear_runtime_snapshot_error(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<String> {
+        if !self.is_gear() {
+            return None;
+        }
+        self.agent
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.gear_runtime_snapshot_error.clone())
+    }
+
     fn gear_task_manager(
         &self,
         session_id: &acp::SessionId,
@@ -2338,6 +2384,74 @@ impl NativeAgentConnection {
             )
     }
 
+    pub fn cancel_gear_task_for(
+        &self,
+        session_id: &acp::SessionId,
+        task_id: &str,
+        run_epoch: u64,
+        cx: &App,
+    ) -> Result<ActionOutcome> {
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
+        };
+        let mut task_manager = task_manager
+            .lock()
+            .map_err(|_| anyhow!("gear task manager mutex poisoned"))?;
+        let task = task_manager
+            .snapshot()?
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .context("selected Gear task no longer exists")?;
+        if task.run_epoch != run_epoch {
+            bail!("Gear task {task_id} epoch changed; refresh the runtime panel");
+        }
+        task_manager.cancel_task_with_context(
+            task_id,
+            &TaskCommandContext {
+                caller_session_id: Some(session_id.to_string()),
+                all_scope: false,
+            },
+        )
+    }
+
+    pub fn interrupt_gear_task_for(
+        &self,
+        session_id: &acp::SessionId,
+        task_id: &str,
+        run_epoch: u64,
+        cx: &App,
+    ) -> Result<ActionOutcome> {
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(ActionOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
+        };
+        let mut task_manager = task_manager
+            .lock()
+            .map_err(|_| anyhow!("gear task manager mutex poisoned"))?;
+        let task = task_manager
+            .snapshot()?
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .context("selected Gear task no longer exists")?;
+        if task.run_epoch != run_epoch {
+            bail!("Gear task {task_id} epoch changed; refresh the runtime panel");
+        }
+        task_manager.interrupt_task_with_context(
+            task_id,
+            &TaskCommandContext {
+                caller_session_id: Some(session_id.to_string()),
+                all_scope: false,
+            },
+        )
+    }
+
     pub fn stop_gear_continuation(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
         let (workspace, control, task_manager, cancellation_token) = self
             .agent
@@ -2407,7 +2521,11 @@ impl NativeAgentConnection {
         Ok(true)
     }
 
-    pub fn restart_gear_continuation(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+    pub fn restart_gear_continuation(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Result<bool> {
         let workspace = self
             .agent
             .read_with(cx, |agent, cx| -> Result<Option<std::path::PathBuf>> {
@@ -2417,7 +2535,22 @@ impl NativeAgentConnection {
                 Ok(Some(gear_workspace_for_session(session, agent, cx)?))
             })?
             .context("Gear session not found")?;
-        StateStore::new(workspace).clear_continuation_stop_for_session(&session_id.to_string())?;
+        let store = StateStore::new(&workspace);
+        store.clear_continuation_stop_for_session(&session_id.to_string())?;
+        let has_live_task_manager = self
+            .agent
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.gear_task_manager.is_some());
+        if !has_live_task_manager {
+            let params = acp::PromptRequest::new(
+                session_id.clone(),
+                vec![GEAR_RESUME_CONTINUATION_MARKER.into()],
+            );
+            self.send_gear_prompt(acp_thread::ClientUserMessageId::new(), params, cx)
+                .detach_and_log_err(cx);
+        }
         Ok(true)
     }
 
@@ -2475,6 +2608,98 @@ impl NativeAgentConnection {
                     all_scope: false,
                 },
             )
+    }
+
+    pub fn send_follow_up_gear_task_for(
+        &self,
+        session_id: &acp::SessionId,
+        task_id: &str,
+        run_epoch: u64,
+        prompt: String,
+        cx: &App,
+    ) -> Result<SendOutcome> {
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(SendOutcome::Noop(OutcomeContext::default()));
+        };
+        let mut task_manager = task_manager
+            .lock()
+            .map_err(|_| anyhow!("gear task manager mutex poisoned"))?;
+        let Some(task) = task_manager
+            .snapshot()?
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+        else {
+            return Ok(SendOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
+        };
+        if task.run_epoch != run_epoch {
+            bail!("Gear task {task_id} epoch changed; refresh the runtime panel");
+        }
+        task_manager.send_follow_up_task_with_context(
+            task_id,
+            prompt,
+            &TaskCommandContext {
+                caller_session_id: Some(session_id.to_string()),
+                all_scope: false,
+            },
+        )
+    }
+
+    pub fn steer_gear_task_for(
+        &self,
+        session_id: &acp::SessionId,
+        task_id: &str,
+        run_epoch: u64,
+        prompt: String,
+        cx: &App,
+    ) -> Result<SteerOutcome> {
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(SteerOutcome::Noop(OutcomeContext::default()));
+        };
+        let mut task_manager = task_manager
+            .lock()
+            .map_err(|_| anyhow!("gear task manager mutex poisoned"))?;
+        let Some(task) = task_manager
+            .snapshot()?
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+        else {
+            return Ok(SteerOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.to_string()),
+                ..OutcomeContext::default()
+            }));
+        };
+        if task.run_epoch != run_epoch {
+            bail!("Gear task {task_id} epoch changed; refresh the runtime panel");
+        }
+        task_manager.steer_task_with_context(
+            task_id,
+            prompt,
+            &TaskCommandContext {
+                caller_session_id: Some(session_id.to_string()),
+                all_scope: false,
+            },
+        )
+    }
+
+    pub fn revive_gear_task_for(
+        &self,
+        session_id: &acp::SessionId,
+        task_id: &str,
+        run_epoch: u64,
+        cx: &App,
+    ) -> Result<SendOutcome> {
+        self.send_follow_up_gear_task_for(
+            session_id,
+            task_id,
+            run_epoch,
+            "Retry the selected Gear task using its original goal, worker route, and verification contract. Preserve the previous failure as evidence and report the new attempt.".to_string(),
+            cx,
+        )
     }
 
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The
@@ -2690,8 +2915,11 @@ impl NativeAgentConnection {
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
         let session_id = params.session_id.clone();
-        let prompt_blocks = params.prompt;
-        let request = gear_request_from_prompt(&prompt_blocks);
+        let mut prompt_blocks = params.prompt;
+        let resume_requested = gear_request_from_prompt(&prompt_blocks)
+            .trim()
+            .eq(GEAR_RESUME_CONTINUATION_MARKER);
+        let mut request = gear_request_from_prompt(&prompt_blocks);
         let cancellation_token = CancellationToken::new();
         let task_manager_control = TaskManagerControl::default();
 
@@ -2721,6 +2949,27 @@ impl NativeAgentConnection {
             Ok(session) => session,
             Err(error) => return Task::ready(Err(error)),
         };
+
+        if resume_requested {
+            let store = StateStore::new(&workspace);
+            let goal_id = match store.read_continuation_state_for_session(&session_id.to_string()) {
+                Ok(Some(state)) => state.goal_id,
+                Ok(None) => {
+                    return Task::ready(Err(anyhow!("Gear continuation has no durable goal")));
+                }
+                Err(error) => return Task::ready(Err(error)),
+            };
+            request = match store.read_goal(&goal_id) {
+                Ok(Some(goal)) if !goal.request.trim().is_empty() => goal.request,
+                Ok(_) => {
+                    return Task::ready(Err(anyhow!("Gear continuation goal has no request")));
+                }
+                Err(error) => return Task::ready(Err(error)),
+            };
+            prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "继续执行已持久化的 Gear 目标。",
+            ))];
+        }
 
         let (_thread_model, coordinator_language_model) = thread.update(cx, |thread, cx| {
             thread.push_acp_user_block(
@@ -2776,7 +3025,7 @@ impl NativeAgentConnection {
         };
 
         let (native_worker_tx, native_worker_rx) =
-            async_channel::unbounded::<GearZedWorkerDispatch>();
+            async_channel::bounded::<GearZedWorkerDispatch>(GEAR_GUI_WORKER_DISPATCH_CAPACITY);
         let running_native_zed_sessions = Arc::new(Mutex::new(HashMap::default()));
         spawn_gear_zed_worker_dispatcher(
             self.agent.downgrade(),
@@ -2788,7 +3037,8 @@ impl NativeAgentConnection {
             cx,
         );
 
-        let (acp_broker_tx, acp_broker_rx) = async_channel::unbounded::<GearAcpBrokerDispatch>();
+        let (acp_broker_tx, acp_broker_rx) =
+            async_channel::bounded::<GearAcpBrokerDispatch>(GEAR_GUI_WORKER_DISPATCH_CAPACITY);
         let running_acp_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>> =
             Arc::new(Mutex::new(HashMap::default()));
         spawn_gear_acp_broker_dispatcher(
@@ -2830,16 +3080,75 @@ impl NativeAgentConnection {
             }
         });
 
-        let (event_tx, event_rx) = async_channel::unbounded::<String>();
-        let (review_tx, review_rx) = async_channel::unbounded::<GearCoordinatorReviewJob>();
-        let (plan_critic_tx, plan_critic_rx) = async_channel::unbounded::<GearPlanCriticJob>();
+        let snapshot_agent = self.agent.downgrade();
+        let snapshot_workspace = workspace.clone();
+        let snapshot_session_id = session_id.clone();
+        let snapshot_task_manager = task_manager.clone();
+        let runtime_snapshot_task = cx.spawn(async move |cx| {
+            loop {
+                let workspace = snapshot_workspace.clone();
+                let session_id = snapshot_session_id.clone();
+                let task_manager = snapshot_task_manager.clone();
+                let snapshot = cx
+                    .background_spawn(async move {
+                        let task_snapshot = task_manager
+                            .lock()
+                            .map_err(|_| anyhow!("gear task manager mutex poisoned"))?
+                            .snapshot()?;
+                        gearbox_agent::gui::GearRuntimeSnapshot::from_store(
+                            &StateStore::new(&workspace),
+                            workspace.display().to_string(),
+                            session_id.to_string(),
+                            Some(task_snapshot),
+                        )
+                    })
+                    .await;
+                let update_result = snapshot_agent.update(cx, |agent, _cx| {
+                    if let Some(session) = agent.sessions.get_mut(&snapshot_session_id) {
+                        match snapshot {
+                            Ok(snapshot) => {
+                                session.gear_runtime_snapshot = Some(snapshot);
+                                session.gear_runtime_snapshot_error = None;
+                            }
+                            Err(error) => {
+                                session.gear_runtime_snapshot_error = Some(gear_truncate_text(
+                                    &format!("{error:#}"),
+                                    1200,
+                                ));
+                            }
+                        }
+                    }
+                });
+                if update_result.is_err() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+            }
+        });
+        self.agent.update(cx, |agent, _cx| {
+            if let Some(session) = agent.sessions.get_mut(&session_id) {
+                session.gear_runtime_snapshot_task = Some(runtime_snapshot_task);
+            }
+        });
+
+        let (event_tx, event_rx) = async_channel::bounded::<String>(GEAR_GUI_EVENT_BUFFER_CAPACITY);
+        let (review_tx, review_rx) =
+            async_channel::bounded::<GearCoordinatorReviewJob>(GEAR_GUI_REVIEW_QUEUE_CAPACITY);
+        let (plan_critic_tx, plan_critic_rx) =
+            async_channel::bounded::<GearPlanCriticJob>(GEAR_GUI_REVIEW_QUEUE_CAPACITY);
         let (plan_revision_tx, plan_revision_rx) =
-            async_channel::unbounded::<GearPlanRevisionJob>();
+            async_channel::bounded::<GearPlanRevisionJob>(GEAR_GUI_REVIEW_QUEUE_CAPACITY);
 
         let agent = self.agent.clone();
         let cancellation_session_id = session_id.clone();
         let run_broker = broker;
         let run_broker_factory = broker_factory;
+        #[cfg(not(test))]
+        let gui_gear_session = self.is_gear();
+        #[cfg(test)]
+        let gui_gear_session = false;
         cx.spawn(async move |cx| {
             let planner_uses_opencode =
                 gear_phase_uses_opencode_worker(&phase_models, PhaseProfile::Planner)?;
@@ -3012,6 +3321,11 @@ impl NativeAgentConnection {
             };
             let continuation_session_id = cancellation_session_id.to_string();
             let objective_policy = objective_policy_from_env()?;
+            let objective_policy = if gui_gear_session && objective_policy.is_none() {
+                Some(gearbox_agent::state::ObjectivePolicy::default())
+            } else {
+                objective_policy
+            };
             let run_task = cx.background_spawn(smol::unblock(move || {
                 if objective_policy.is_none() {
                     StateStore::new(&workspace)
@@ -3189,6 +3503,7 @@ fn clear_gear_cancellation_token(
             if should_clear_manager {
                 session.gear_task_manager_tick_loop = None;
                 session.gear_task_manager = None;
+                session.gear_runtime_snapshot_task = None;
             }
         }
     });
@@ -4390,14 +4705,18 @@ fn gear_opencode_free_fallback_routes(command: Option<String>) -> Vec<WorkerRout
         "if [ \"$GEARBOX_WORKER_RESUME\" = \"true\" ]; then opencode run --pure --format json --session \"$GEARBOX_WORKER_SESSION_ID\" --model \"$GEARBOX_WORKER_MODEL\" < \"$GEARBOX_WORKER_PROMPT\"; else opencode run --pure --format json --model \"$GEARBOX_WORKER_MODEL\" < \"$GEARBOX_WORKER_PROMPT\"; fi"
             .to_string()
     });
-    ["opencode/hy3-free", "opencode/mimo-v2.5-free", "opencode/deepseek-v4-flash-free"]
-        .into_iter()
-        .map(|worker_model| WorkerRoute {
-            worker_kind: WorkerKind::OpencodeSession,
-            worker_command: Some(command.clone()),
-            worker_model: Some(worker_model.to_string()),
-        })
-        .collect()
+    [
+        "opencode/hy3-free",
+        "opencode/mimo-v2.5-free",
+        "opencode/deepseek-v4-flash-free",
+    ]
+    .into_iter()
+    .map(|worker_model| WorkerRoute {
+        worker_kind: WorkerKind::OpencodeSession,
+        worker_command: Some(command.clone()),
+        worker_model: Some(worker_model.to_string()),
+    })
+    .collect()
 }
 
 fn gear_opencode_free_fallback_uses_command_backend(
@@ -4408,9 +4727,7 @@ fn gear_opencode_free_fallback_uses_command_backend(
         && matches!(
             worker_model.map(str::trim),
             Some(
-                "opencode/hy3-free"
-                    | "opencode/mimo-v2.5-free"
-                    | "opencode/deepseek-v4-flash-free"
+                "opencode/hy3-free" | "opencode/mimo-v2.5-free" | "opencode/deepseek-v4-flash-free"
             )
         )
 }
@@ -6721,7 +7038,10 @@ impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
         true
     }
 
-    fn subscribe(&self, listener: gearbox_agent::workers::WorkerEventListener) -> Result<gearbox_agent::workers::WorkerSubscription> {
+    fn subscribe(
+        &self,
+        listener: gearbox_agent::workers::WorkerEventListener,
+    ) -> Result<gearbox_agent::workers::WorkerSubscription> {
         let event_hub = self
             .state
             .0
@@ -6765,7 +7085,11 @@ impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
     }
 
     fn usage(&self) -> Option<BrokerUsage> {
-        self.state.0.lock().ok().and_then(|state| state.usage.clone())
+        self.state
+            .0
+            .lock()
+            .ok()
+            .and_then(|state| state.usage.clone())
     }
 }
 
@@ -8205,6 +8529,7 @@ mod internal_tests {
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
     use agent_settings::COMPACTION_PROMPT;
     use fs::FakeFs;
+    use gearbox_agent::state::Scope;
     use gearbox_agent::workers::{CategoryResolution, CategoryResolutionResult, FallbackRoute};
     use gpui::TestAppContext;
     use indoc::formatdoc;
@@ -8618,16 +8943,13 @@ mod internal_tests {
         );
         assert!(routes.iter().all(|route| {
             route.worker_kind == WorkerKind::OpencodeSession
-                && route
-                    .worker_command
-                    .as_deref()
-                    .is_some_and(|command| {
-                        command.contains("--model \"$GEARBOX_WORKER_MODEL\"")
-                            && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
-                            && command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
-                            && command.contains("GEARBOX_WORKER_RESUME")
-                            && !command.contains("$(cat")
-                    })
+                && route.worker_command.as_deref().is_some_and(|command| {
+                    command.contains("--model \"$GEARBOX_WORKER_MODEL\"")
+                        && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
+                        && command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
+                        && command.contains("GEARBOX_WORKER_RESUME")
+                        && !command.contains("$(cat")
+                })
                 && gear_opencode_free_fallback_uses_command_backend(
                     route.worker_kind,
                     route.worker_model.as_deref(),
@@ -8641,8 +8963,7 @@ mod internal_tests {
 
     #[test]
     fn gear_worker_routes_from_env_enables_free_fallbacks_only_when_requested() {
-        let original_free_fallbacks =
-            std::env::var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS").ok();
+        let original_free_fallbacks = std::env::var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS").ok();
         let original_sequence = std::env::var("GEARBOX_GEAR_WORKER_SEQUENCE").ok();
         unsafe {
             std::env::set_var("GEARBOX_GEAR_OPENCODE_FREE_FALLBACKS", "1");
@@ -9210,8 +9531,8 @@ mod internal_tests {
         gear_finished.store(true, Ordering::SeqCst);
         assert_eq!(
             worker_responder.join().unwrap(),
-            3,
-            "Gear should approve the plan, execute one native implementation worker, and run one independent final reviewer"
+            4,
+            "Gear should run planner/PlanCritic/independent Oracle, execute one native implementation worker, and run one final reviewer"
         );
         cx.run_until_parked();
 

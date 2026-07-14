@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod gui;
 pub mod languages;
 pub mod open_code_phase_runtime;
 pub mod phase_routing;

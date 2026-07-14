@@ -598,8 +598,12 @@ pub struct ThreadView {
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub gear_task_manager_expanded: bool,
+    pub gear_selected_task_id: Option<String>,
+    pub gear_last_action_receipt: Option<String>,
     gear_task_manager_filter: GearTaskManagerFilter,
     gear_task_manager_show_all: bool,
+    gear_runtime_feedback_show_all: bool,
+    gear_runtime_timeline_show_all: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -1016,8 +1020,12 @@ impl ThreadView {
             plan_expanded: false,
             queue_expanded: true,
             gear_task_manager_expanded: true,
+            gear_selected_task_id: None,
+            gear_last_action_receipt: None,
             gear_task_manager_filter: GearTaskManagerFilter::All,
             gear_task_manager_show_all: false,
+            gear_runtime_feedback_show_all: false,
+            gear_runtime_timeline_show_all: false,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -2021,7 +2029,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<bool> {
-        if !self.is_gear_thread() || self.thread.read(cx).status() == ThreadStatus::Idle {
+        if !self.is_gear_thread() {
             return Ok(false);
         }
 
@@ -2032,13 +2040,56 @@ impl ThreadView {
             return Ok(false);
         };
 
-        let (accepted, reason) = if steer {
-            let outcome = connection.steer_gear_task(&self.session_id, prompt, cx)?;
-            (outcome.is_accepted(), outcome.reason())
-        } else {
-            let outcome = connection.send_follow_up_gear_task(&self.session_id, prompt, cx)?;
-            (outcome.is_accepted(), outcome.reason())
+        let Some(runtime_snapshot) = self.gear_runtime_snapshot(cx) else {
+            return Ok(false);
         };
+        let Some(task) = runtime_snapshot.task_manager.as_ref().and_then(|snapshot| {
+            self.gear_selected_task_id
+                .as_deref()
+                .and_then(|task_id| snapshot.tasks.iter().find(|task| task.task_id == task_id))
+                .or_else(|| {
+                    snapshot.tasks.iter().find(|task| {
+                        matches!(
+                            task.status,
+                            agent::GearManagedTaskStatus::Running
+                                | agent::GearManagedTaskStatus::Pending
+                        )
+                    })
+                })
+        }) else {
+            return Ok(false);
+        };
+        let task_id = task.task_id.clone();
+        let run_epoch = task.run_epoch;
+
+        let (accepted, reason, receipt) = if steer {
+            let outcome = connection.steer_gear_task_for(
+                &self.session_id,
+                &task_id,
+                run_epoch,
+                prompt,
+                cx,
+            )?;
+            (
+                outcome.is_accepted(),
+                outcome.reason(),
+                format!("{outcome:?}"),
+            )
+        } else {
+            let outcome = connection.send_follow_up_gear_task_for(
+                &self.session_id,
+                &task_id,
+                run_epoch,
+                prompt,
+                cx,
+            )?;
+            (
+                outcome.is_accepted(),
+                outcome.reason(),
+                format!("{outcome:?}"),
+            )
+        };
+        self.gear_last_action_receipt = Some(receipt);
         let warning = Self::gear_ambiguous_dispatch_warning(accepted, reason.as_deref());
         if !accepted {
             if let Some(reason) = reason {
@@ -2093,7 +2144,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.is_gear_thread() || self.thread.read(cx).status() == ThreadStatus::Idle {
+        if !self.is_gear_thread() {
             return false;
         }
 
@@ -3243,12 +3294,9 @@ impl ThreadView {
         editor_bg_color.blend(active_color.opacity(0.3))
     }
 
-    pub(crate) fn gear_task_manager_snapshot(
-        &self,
-        cx: &App,
-    ) -> Option<agent::GearTaskManagerSnapshot> {
+    pub(crate) fn gear_runtime_snapshot(&self, cx: &App) -> Option<agent::GearRuntimeSnapshot> {
         self.as_native_connection(cx)?
-            .gear_task_manager_snapshot(&self.session_id, cx)
+            .gear_runtime_snapshot(&self.session_id, cx)
     }
 
     pub fn render_activity_bar(
@@ -3364,10 +3412,66 @@ impl ThreadView {
         window: &mut Window,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let snapshot = self.gear_task_manager_snapshot(cx)?;
-        if snapshot.tasks.is_empty() {
+        if !self.is_gear_thread() {
             return None;
         }
+        let snapshot_error = self
+            .as_native_connection(cx)
+            .and_then(|connection| connection.gear_runtime_snapshot_error(&self.session_id, cx));
+        let Some(runtime_snapshot) = self.gear_runtime_snapshot(cx) else {
+            return Some(
+                v_flex()
+                    .p_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new("Gear Runtime · initializing durable snapshot")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Runtime controls and worker feedback will appear when the session state is ready.")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when_some(snapshot_error.as_ref(), |this, error| {
+                        this.child(
+                            Label::new(format!("Snapshot refresh error: {error}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        )
+                    })
+                    .into_any(),
+            );
+        };
+        let snapshot = runtime_snapshot.task_manager.as_ref();
+        let task_count = snapshot.map_or(0, |snapshot| snapshot.tasks.len());
+        let request_preview = runtime_snapshot
+            .request_summary
+            .chars()
+            .take(240)
+            .collect::<String>();
+        let continuation_status = runtime_snapshot
+            .lifecycle
+            .continuation_status
+            .as_deref()
+            .unwrap_or_default();
+        let resume_disabled = continuation_status.eq_ignore_ascii_case("running");
+        let stop_disabled = matches!(
+            continuation_status.to_ascii_lowercase().as_str(),
+            "stopped" | "complete" | "completed" | "failed" | "limited"
+        );
+        let feedback_limit = if self.gear_runtime_feedback_show_all {
+            runtime_snapshot.feedback_events.len().min(32)
+        } else {
+            8
+        };
+        let timeline_limit = if self.gear_runtime_timeline_show_all {
+            runtime_snapshot.timeline.len().min(500)
+        } else {
+            8
+        };
 
         let expanded = self.gear_task_manager_expanded;
         Some(
@@ -3382,9 +3486,355 @@ impl ThreadView {
                         .border_color(cx.theme().colors().border)
                         .rounded_md()
                         .overflow_hidden()
-                        .child(self.render_gear_task_manager_summary(&snapshot, window, cx))
-                        .when(expanded, |this| {
-                            this.child(self.render_gear_task_manager_entries(&snapshot, window, cx))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child(Label::new(format!(
+                                "Gear Runtime · {} · {} tasks · objective {} · goal {} · epoch {}",
+                                runtime_snapshot
+                                    .lifecycle
+                                    .phase
+                                    .as_deref()
+                                    .unwrap_or("active"),
+                                task_count,
+                                runtime_snapshot
+                                    .objective
+                                    .as_ref()
+                                    .map(|objective| objective.status.as_str())
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot
+                                    .goal
+                                    .as_ref()
+                                    .map(|goal| goal.status.as_str())
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot.epoch_id.as_deref().unwrap_or("none")
+                            ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted))
+                                .when(runtime_snapshot.goal.is_some(), |this| {
+                                    this.child(
+                                        Button::new("gear-runtime-resume", "Resume Gear")
+                                    .label_size(LabelSize::XSmall)
+                                    .disabled(resume_disabled)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(connection) = this.as_native_connection(cx) {
+                                            match connection.restart_gear_continuation(
+                                                &this.session_id,
+                                                cx,
+                                            ) {
+                                                Ok(result) => {
+                                                    this.gear_last_action_receipt = Some(format!(
+                                                        "resume_continuation={result}"
+                                                    ));
+                                                    cx.notify();
+                                                }
+                                                Err(error) => this.handle_thread_error(error, cx),
+                                            }
+                                        }
+                                    })),
+                                    )
+                                    .child(
+                                        Button::new("gear-runtime-stop", "Stop Gear")
+                                            .label_size(LabelSize::XSmall)
+                                            .disabled(stop_disabled)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(connection) =
+                                                    this.as_native_connection(cx)
+                                                {
+                                                    match connection.stop_gear_continuation(
+                                                        &this.session_id,
+                                                        cx,
+                                                    ) {
+                                                        Ok(result) => {
+                                                            this.gear_last_action_receipt =
+                                                                Some(format!(
+                                                                    "stop_continuation={result}"
+                                                                ));
+                                                            cx.notify();
+                                                        }
+                                                        Err(error) => {
+                                                            this.handle_thread_error(error, cx)
+                                                        }
+                                                    }
+                                                }
+                                            })),
+                                    )
+                                }),
+                        )
+                        .child(
+                            Label::new(format!(
+                                "Snapshot v{} · seq {} · workspace {} · session {} · objective {} · goal {}",
+                                runtime_snapshot.schema_version,
+                                runtime_snapshot.sequence,
+                                runtime_snapshot.workspace,
+                                runtime_snapshot.session_id,
+                                runtime_snapshot.objective_id.as_deref().unwrap_or("none"),
+                                runtime_snapshot.goal_id.as_deref().unwrap_or("none")
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!(
+                                "Budget calls {}/{} · tokens {}/{} · cost {}/{}μ · unknown {} · tools {} · permissions {} · tasks {} · worker errors {} · review {} · recovery {}/{} · stop {}",
+                                runtime_snapshot.budget.calls_used.unwrap_or_default(),
+                                runtime_snapshot.budget.calls_reserved.unwrap_or_default(),
+                                runtime_snapshot.budget.tokens_used.unwrap_or_default(),
+                                runtime_snapshot.budget.tokens_reserved.unwrap_or_default(),
+                                runtime_snapshot.budget.cost_micros_used.unwrap_or_default(),
+                                runtime_snapshot.budget.cost_micros_reserved.unwrap_or_default(),
+                                runtime_snapshot.budget.unknown_usage_calls,
+                                runtime_snapshot.feedback.tool_calls,
+                                runtime_snapshot.feedback.permission_events,
+                                runtime_snapshot.feedback.task_events,
+                                runtime_snapshot.feedback.worker_errors,
+                                runtime_snapshot
+                                    .review
+                                    .as_ref()
+                                    .map(|review| review.status.as_str())
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot
+                                    .recovery
+                                    .continuation_status
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot
+                                    .lifecycle
+                                    .recovery_state
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot
+                                    .lifecycle
+                                    .stop_reason
+                                    .as_deref()
+                                    .unwrap_or("none")
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .when_some(runtime_snapshot.review.as_ref(), |this, review| {
+                            this.child(
+                                Label::new(format!(
+                                    "Review detail: latest {} · epoch events {} · plan revision {:?} · bundle complete {:?}",
+                                    review.latest_event.as_deref().unwrap_or("none"),
+                                    review.epoch_events,
+                                    review.plan_revision,
+                                    review.bundle_complete,
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                        })
+                        .when(
+                            runtime_snapshot.recovery.stuck_reason.is_some()
+                                || runtime_snapshot.recovery.last_progress_marker.is_some(),
+                            |this| {
+                                this.child(
+                                    Label::new(format!(
+                                        "Recovery detail: resumes {} · stuck {} · progress {}",
+                                        runtime_snapshot.recovery.resume_count,
+                                        runtime_snapshot
+                                            .recovery
+                                            .stuck_reason
+                                            .as_deref()
+                                            .unwrap_or("none"),
+                                        runtime_snapshot
+                                            .recovery
+                                            .last_progress_marker
+                                            .as_deref()
+                                            .unwrap_or("none"),
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                )
+                            },
+                        )
+                        .when(!request_preview.is_empty(), |this| {
+                            this.child(
+                                Label::new(format!("Request: {request_preview}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .child(
+                            Label::new(format!(
+                                "Health activity {} · children {} · rust {} · telemetry dropped/coalesced {}/{}{}",
+                                runtime_snapshot
+                                    .health
+                                    .last_activity_at
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot.health.owned_child_processes,
+                                runtime_snapshot
+                                    .health
+                                    .rust_work_state
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                runtime_snapshot.health.dropped_telemetry,
+                                runtime_snapshot.health.coalesced_telemetry,
+                                if runtime_snapshot.health.refresh_required {
+                                    " · refresh required"
+                                } else {
+                                    ""
+                                }
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .when_some(runtime_snapshot.health.last_error.as_ref(), |this, error| {
+                            this.child(
+                                Label::new(format!("Runtime error: {error}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error),
+                            )
+                        })
+                        .when_some(snapshot_error.as_ref(), |this, error| {
+                            this.child(
+                                Label::new(format!("Snapshot refresh error: {error}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error),
+                            )
+                        })
+                        .when(!runtime_snapshot.feedback_events.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .p_2()
+                                    .gap_0p5()
+                                    .border_b_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .child(
+                                        Label::new("Worker Feedback")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(
+                                        runtime_snapshot
+                                            .feedback_events
+                                            .iter()
+                                            .rev()
+                                            .take(feedback_limit)
+                                            .enumerate()
+                                            .map(|(index, event)| {
+                                                let task_id = event.task_id.clone();
+                                                Button::new(
+                                                    format!("gear-feedback-{index}-{task_id}"),
+                                                    format!(
+                                                        "{} · {} · {}",
+                                                        event.kind, event.task_id, event.message
+                                                    ),
+                                                )
+                                                .label_size(LabelSize::XSmall)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.gear_selected_task_id = Some(task_id.clone());
+                                                    cx.notify();
+                                                }))
+                                            }),
+                                    )
+                                    .when(runtime_snapshot.feedback_events.len() > 8, |this| {
+                                        this.child(
+                                            Button::new(
+                                                "gear-feedback-show-more",
+                                                if self.gear_runtime_feedback_show_all {
+                                                    "Show Less"
+                                                } else {
+                                                    "Show More"
+                                                },
+                                            )
+                                            .label_size(LabelSize::XSmall)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.gear_runtime_feedback_show_all =
+                                                    !this.gear_runtime_feedback_show_all;
+                                                cx.notify();
+                                            })),
+                                        )
+                                    }),
+                            )
+                        })
+                        .when_some(self.gear_last_action_receipt.as_ref(), |this, receipt| {
+                            this.child(
+                                Label::new(format!("Last action: {receipt}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(!runtime_snapshot.timeline.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .p_2()
+                                    .gap_0p5()
+                                    .border_b_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .child(
+                                        Label::new("Runtime Timeline")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(runtime_snapshot.timeline.iter().rev().take(timeline_limit).map(
+                                        |event| {
+                                            let task_id = event.task_id.clone();
+                                            let payload = event
+                                                .payload
+                                                .as_ref()
+                                                .and_then(|payload| {
+                                                    serde_json::to_string(payload).ok()
+                                                })
+                                                .map(|payload| {
+                                                    let mut summary = payload
+                                                        .chars()
+                                                        .take(180)
+                                                        .collect::<String>();
+                                                    if payload.chars().count() > 180 {
+                                                        summary.push_str("…");
+                                                    }
+                                                    summary
+                                                });
+                                            let message = payload.map_or_else(
+                                                || event.message.clone(),
+                                                |payload| format!("{} · {}", event.message, payload),
+                                            );
+                                            Button::new(
+                                                format!("gear-timeline-{}", event.sequence),
+                                                format!(
+                                                    "#{} · {} · {}",
+                                                    event.sequence, event.semantic_key, message
+                                                ),
+                                            )
+                                            .label_size(LabelSize::XSmall)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(task_id) = task_id.clone() {
+                                                    this.gear_selected_task_id = Some(task_id);
+                                                    cx.notify();
+                                                }
+                                            }))
+                                        },
+                                    ))
+                                    .when(runtime_snapshot.timeline.len() > 8, |this| {
+                                        this.child(
+                                            Button::new(
+                                                "gear-timeline-show-more",
+                                                if self.gear_runtime_timeline_show_all {
+                                                    "Show Less"
+                                                } else {
+                                                    "Show More"
+                                                },
+                                            )
+                                            .label_size(LabelSize::XSmall)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.gear_runtime_timeline_show_all =
+                                                    !this.gear_runtime_timeline_show_all;
+                                                cx.notify();
+                                            })),
+                                        )
+                                    }),
+                            )
+                        })
+                        .when_some(snapshot, |this, snapshot| {
+                            this.child(self.render_gear_task_manager_summary(snapshot, window, cx))
+                                .when(expanded, |this| {
+                                    this.child(self.render_gear_task_manager_entries(
+                                        snapshot, window, cx,
+                                    ))
+                                })
                         }),
                 )
                 .into_any(),
@@ -3892,8 +4342,14 @@ impl ThreadView {
             counts.running, counts.pending, counts.completed, counts.failed
         );
         let current_output = snapshot.current_output.clone();
-        let gear_thread_is_idle = self.thread.read(cx).status() == ThreadStatus::Idle;
         let has_follow_up_draft = !self.message_editor.read(cx).is_empty(cx);
+        let has_messageable_task = snapshot.tasks.iter().any(|task| {
+            task.messageability.is_some()
+                && matches!(
+                    task.status,
+                    agent::GearManagedTaskStatus::Pending | agent::GearManagedTaskStatus::Running
+                )
+        });
         let active_count = snapshot
             .tasks
             .iter()
@@ -3917,6 +4373,21 @@ impl ThreadView {
                 )
             })
             .count();
+        let selected_task = self
+            .gear_selected_task_id
+            .as_deref()
+            .and_then(|task_id| snapshot.tasks.iter().find(|task| task.task_id == task_id))
+            .map(|task| (task.task_id.clone(), task.run_epoch));
+        let selected_task_revivable = self
+            .gear_selected_task_id
+            .as_deref()
+            .and_then(|task_id| snapshot.tasks.iter().find(|task| task.task_id == task_id))
+            .is_some_and(|task| {
+                matches!(
+                    task.messageability,
+                    Some(agent::GearTaskMessageability::Revive)
+                )
+            });
 
         h_flex()
             .p_1()
@@ -3956,7 +4427,7 @@ impl ThreadView {
                     .child(
                         Button::new("gear-task-manager-follow-up", "Follow Up")
                             .label_size(LabelSize::XSmall)
-                            .disabled(gear_thread_is_idle || !has_follow_up_draft)
+                            .disabled(!has_messageable_task || !has_follow_up_draft)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let _ = this.try_send_gear_follow_up(
                                     this.message_editor.clone(),
@@ -3969,7 +4440,7 @@ impl ThreadView {
                     .child(
                         Button::new("gear-task-manager-steer", "Steer")
                             .label_size(LabelSize::XSmall)
-                            .disabled(gear_thread_is_idle || !has_follow_up_draft)
+                            .disabled(!has_messageable_task || !has_follow_up_draft)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let _ = this.try_send_gear_follow_up(
                                     this.message_editor.clone(),
@@ -3978,6 +4449,34 @@ impl ThreadView {
                                     cx,
                                 );
                             })),
+                    )
+                    .child(
+                        Button::new("gear-task-manager-retry", "Retry")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!selected_task_revivable)
+                            .on_click({
+                                let selected_task = selected_task.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    let Some((task_id, run_epoch)) = selected_task.as_ref() else {
+                                        return;
+                                    };
+                                    if let Some(connection) = this.as_native_connection(cx) {
+                                        match connection.revive_gear_task_for(
+                                            &this.session_id,
+                                            task_id,
+                                            *run_epoch,
+                                            cx,
+                                        ) {
+                                            Ok(outcome) => {
+                                                this.gear_last_action_receipt =
+                                                    Some(format!("{outcome:?}"));
+                                                cx.notify();
+                                            }
+                                            Err(error) => this.handle_thread_error(error, cx),
+                                        }
+                                    }
+                                })
+                            }),
                     )
                     .child(
                         Button::new("gear-task-manager-view-output", "View Output")
@@ -4007,27 +4506,63 @@ impl ThreadView {
                         Button::new("gear-task-manager-interrupt", "Interrupt")
                             .label_size(LabelSize::XSmall)
                             .disabled(counts.running == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(connection) = this.as_native_connection(cx) {
-                                    match connection.interrupt_gear_task(&this.session_id, cx) {
-                                        Ok(_) => cx.notify(),
-                                        Err(error) => this.handle_thread_error(error, cx),
+                            .on_click({
+                                let selected_task = selected_task.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(connection) = this.as_native_connection(cx) {
+                                        let result = selected_task.as_ref().map_or_else(
+                                            || connection.interrupt_gear_task(&this.session_id, cx),
+                                            |(task_id, run_epoch)| {
+                                                connection.interrupt_gear_task_for(
+                                                    &this.session_id,
+                                                    task_id,
+                                                    *run_epoch,
+                                                    cx,
+                                                )
+                                            },
+                                        );
+                                        match result {
+                                            Ok(outcome) => {
+                                                this.gear_last_action_receipt =
+                                                    Some(format!("{outcome:?}"));
+                                                cx.notify();
+                                            }
+                                            Err(error) => this.handle_thread_error(error, cx),
+                                        }
                                     }
-                                }
-                            })),
+                                })
+                            }),
                     )
                     .child(
                         Button::new("gear-task-manager-cancel", "Cancel Task")
                             .label_size(LabelSize::XSmall)
                             .disabled(counts.running == 0 && counts.pending == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(connection) = this.as_native_connection(cx) {
-                                    match connection.cancel_gear_task(&this.session_id, cx) {
-                                        Ok(_) => cx.notify(),
-                                        Err(error) => this.handle_thread_error(error, cx),
+                            .on_click({
+                                let selected_task = selected_task.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(connection) = this.as_native_connection(cx) {
+                                        let result = selected_task.as_ref().map_or_else(
+                                            || connection.cancel_gear_task(&this.session_id, cx),
+                                            |(task_id, run_epoch)| {
+                                                connection.cancel_gear_task_for(
+                                                    &this.session_id,
+                                                    task_id,
+                                                    *run_epoch,
+                                                    cx,
+                                                )
+                                            },
+                                        );
+                                        match result {
+                                            Ok(outcome) => {
+                                                this.gear_last_action_receipt =
+                                                    Some(format!("{outcome:?}"));
+                                                cx.notify();
+                                            }
+                                            Err(error) => this.handle_thread_error(error, cx),
+                                        }
                                     }
-                                }
-                            })),
+                                })
+                            }),
                     )
                     .child(
                         Button::new("gear-task-manager-stop-continuation", "Stop Continuation")
@@ -4035,7 +4570,11 @@ impl ThreadView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(connection) = this.as_native_connection(cx) {
                                     match connection.stop_gear_continuation(&this.session_id, cx) {
-                                        Ok(_) => cx.notify(),
+                                        Ok(result) => {
+                                            this.gear_last_action_receipt =
+                                                Some(format!("stop_continuation={result}"));
+                                            cx.notify();
+                                        }
                                         Err(error) => this.handle_thread_error(error, cx),
                                     }
                                 }
@@ -4223,7 +4762,34 @@ impl ThreadView {
                                         .and_then(|attempt| attempt.route_transform_path.as_ref()),
                                     cx,
                                 ),
-                            ),
+                            )
+                            .id(format!("gear-task-header-{}", task.task_id))
+                            .on_click({
+                                let task_id = task.task_id.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    this.gear_selected_task_id = Some(task_id.clone());
+                                    cx.notify();
+                                })
+                            }),
+                    )
+                    .child(
+                        Button::new(
+                            format!("gear-task-manager-restart-continuation-{}", task.task_id),
+                            "Restart Continuation",
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(connection) = this.as_native_connection(cx) {
+                                match connection.restart_gear_continuation(&this.session_id, cx) {
+                                    Ok(result) => {
+                                        this.gear_last_action_receipt =
+                                            Some(format!("restart_continuation={result}"));
+                                        cx.notify();
+                                    }
+                                    Err(error) => this.handle_thread_error(error, cx),
+                                }
+                            }
+                        })),
                     )
                     .child(
                         h_flex()

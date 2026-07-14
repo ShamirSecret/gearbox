@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio as StdStdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ use crate::state::{CommandRecord, Scope};
 
 const OUTPUT_LIMIT: usize = 12_000;
 static COMMAND_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(1);
+static GEAR_RUST_COMMAND_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
@@ -114,9 +115,18 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
     cancellation_token: Option<&CancellationToken>,
     timeout: Option<Duration>,
 ) -> Result<ShellCommandResult> {
+    let started_at = Instant::now();
     check_cancelled(cancellation_token, command)?;
 
-    let started_at = Instant::now();
+    // Gear owns this admission gate. It serializes its own Cargo/Rust
+    // commands without inspecting or terminating unrelated IDE processes.
+    // The file lease extends that protection to another Gear process using
+    // the same workspace, while the in-process mutex avoids needless polling
+    // when two workers belong to this process.
+    let _rust_command_lease = is_rust_build_command(command)
+        .then(|| acquire_rust_command_lease(workspace, cancellation_token, timeout, started_at))
+        .transpose()?;
+
     let stdout_path = command_output_path(workspace, "stdout")?;
     let stderr_path = command_output_path(workspace, "stderr")?;
     let stdout = fs::File::create(&stdout_path)
@@ -179,6 +189,95 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
         stderr: truncate(&stderr, OUTPUT_LIMIT),
         duration_ms: started_at.elapsed().as_millis(),
     })
+}
+
+fn acquire_rust_command_lease(
+    workspace: &Path,
+    cancellation_token: Option<&CancellationToken>,
+    timeout: Option<Duration>,
+    started_at: Instant,
+) -> Result<RustCommandLease> {
+    let lock_directory = workspace.join(".gearbox-agent").join("locks");
+    fs::create_dir_all(&lock_directory).with_context(|| {
+        format!(
+            "failed to create Rust command lock directory {}",
+            lock_directory.display()
+        )
+    })?;
+    let lock_path = lock_directory.join("rust-build.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open Rust command lock {}", lock_path.display()))?;
+    let process_guard = GEAR_RUST_COMMAND_GATE.get_or_init(|| Mutex::new(()));
+
+    loop {
+        check_cancelled(cancellation_token, "Rust command admission")?;
+        if let Some(timeout) = timeout {
+            if started_at.elapsed() >= timeout {
+                bail!(
+                    "Gear Rust command admission timed out after {} seconds",
+                    timeout.as_secs()
+                );
+            }
+        }
+
+        let process_guard = match process_guard.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+        };
+
+        if try_lock_rust_command_file(&lock_file)? {
+            return Ok(RustCommandLease {
+                _process_guard: process_guard,
+                _lock_file: lock_file,
+            });
+        }
+
+        drop(process_guard);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+struct RustCommandLease {
+    _process_guard: MutexGuard<'static, ()>,
+    _lock_file: fs::File,
+}
+
+#[cfg(unix)]
+fn try_lock_rust_command_file(lock_file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(true)
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error()).context("failed to acquire Rust command lock")
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_rust_command_file(_lock_file: &fs::File) -> Result<bool> {
+    Ok(true)
+}
+
+fn is_rust_build_command(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let mut token = tokens.next();
+    while token.is_some_and(|value| value == "env" || value.contains('=')) {
+        token = tokens.next();
+    }
+    token
+        .and_then(|value| value.rsplit('/').next())
+        .is_some_and(|value| matches!(value, "cargo" | "rustc" | "rust-analyzer"))
 }
 
 pub fn git_snapshot(workspace: &Path) -> Result<DiffSnapshot> {
@@ -503,6 +602,16 @@ mod tests {
     }
 
     #[test]
+    fn rust_command_gate_only_matches_owned_rust_build_tokens() {
+        assert!(is_rust_build_command("cargo test -p gearbox_agent"));
+        assert!(is_rust_build_command(
+            "env CARGO_BUILD_JOBS=1 rustc src/main.rs"
+        ));
+        assert!(!is_rust_build_command("echo cargo"));
+        assert!(!is_rust_build_command("python build.py"));
+    }
+
+    #[test]
     fn cancelled_command_returns_error_before_spawn() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let cancellation_token = CancellationToken::new();
@@ -569,6 +678,38 @@ mod tests {
         assert!(
             !process_exists,
             "background command child {child_pid} survived"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_command_admission_times_out_when_another_process_holds_workspace_lease() {
+        use std::os::fd::AsRawFd;
+
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let lock_directory = temp_dir.path().join(".gearbox-agent").join("locks");
+        fs::create_dir_all(&lock_directory).expect("failed to create lock directory");
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_directory.join("rust-build.lock"))
+            .expect("failed to open lock file");
+        let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0, "test must own the workspace lease");
+
+        let error = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "cargo --version",
+            &HashMap::new(),
+            None,
+            Some(Duration::from_millis(40)),
+        )
+        .expect_err("held workspace lease should prevent command admission");
+
+        assert_eq!(
+            error.to_string(),
+            "Gear Rust command admission timed out after 0 seconds"
         );
     }
 }

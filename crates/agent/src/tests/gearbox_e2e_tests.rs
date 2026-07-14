@@ -14,17 +14,17 @@ use gearbox_agent::plan_graph::deterministic_fallback_draft;
 use gearbox_agent::runtime::{
     ReviewDimension, ReviewDimensionResult, ReviewGate, ReviewerEvidence,
 };
+use gearbox_agent::state::write_json;
 use gearbox_agent::state::{Scope, StateStore, WorkLineage};
 use gearbox_agent::worker_broker::{
-    BrokerCapability, BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest,
-    BrokerSessionIdentity, BrokerUsage, ModelAvailability, UnavailableReason,
-    validate_session_ledger, BROKER_SCHEMA_VERSION,
+    BROKER_SCHEMA_VERSION, BrokerCapability, BrokerLifecycleReceipt, BrokerOutcome,
+    BrokerPhaseRequest, BrokerSessionIdentity, BrokerUsage, ModelAvailability, UnavailableReason,
+    validate_session_ledger,
 };
 use gearbox_agent::workers::{
     NativeWorkerBackend, WorkerCapabilities, WorkerCategory, WorkerConfig, WorkerKind,
     WorkerOutcome, WorkerRegistry, WorkerResult, WorkerSessionHandle, WorkerStartRequest,
 };
-use gearbox_agent::state::write_json;
 use language_model::LanguageModelRegistry;
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -492,10 +492,7 @@ async fn test_gearbox_component_complete_after_review(_cx: &mut TestAppContext) 
 
 // ─── Test 6: Production broker e2e — fails now, passes after GBX-007-003/004 ─
 
-async fn broker_e2e_wait_for_completion(
-    model: &FakeLanguageModel,
-    cx: &mut TestAppContext,
-) {
+async fn broker_e2e_wait_for_completion(model: &FakeLanguageModel, cx: &mut TestAppContext) {
     for _ in 0..100 {
         cx.run_until_parked();
         if model.completion_count() > 0 {
@@ -557,10 +554,9 @@ fn broker_e2e_respond_to_completions(
                 let goal_id = evidence["plan"]["goal_id"].as_str().unwrap();
                 let plan_id = evidence["plan"]["plan_id"].as_str().unwrap();
                 let plan_revision = evidence["plan"]["revision"].as_u64().unwrap();
-                let planner_execution_id =
-                    evidence["planner_receipt"]["identity"]["execution_id"]
-                        .as_str()
-                        .unwrap();
+                let planner_execution_id = evidence["planner_receipt"]["identity"]["execution_id"]
+                    .as_str()
+                    .unwrap();
                 json!({
                     "schema_version": 1,
                     "reviewed_goal_id": goal_id,
@@ -655,11 +651,9 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
 
     let acp_thread = cx
         .update(|cx| {
-            connection.clone().new_session(
-                project.clone(),
-                PathList::new(&[workspace.path()]),
-                cx,
-            )
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[workspace.path()]), cx)
         })
         .await
         .unwrap();
@@ -778,10 +772,8 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
                         if !bs_dir.is_dir() {
                             continue;
                         }
-                        for session_entry in
-                            std::fs::read_dir(&bs_dir).unwrap_or_else(|e| {
-                                panic!("failed to read broker-sessions dir: {e}")
-                            })
+                        for session_entry in std::fs::read_dir(&bs_dir)
+                            .unwrap_or_else(|e| panic!("failed to read broker-sessions dir: {e}"))
                         {
                             let session_entry = session_entry.unwrap();
                             let session_dir = session_entry.path();
@@ -801,18 +793,12 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
                                 session_dir.display()
                             );
                             let receipts_dir = session_dir.join("receipts");
-                            assert!(
-                                receipts_dir.is_dir(),
-                                "Receipts directory must exist"
-                            );
+                            assert!(receipts_dir.is_dir(), "Receipts directory must exist");
                             let receipt_count = std::fs::read_dir(&receipts_dir)
                                 .unwrap()
                                 .filter_map(|e| e.ok())
                                 .count();
-                            assert!(
-                                receipt_count >= 1,
-                                "At least one receipt must exist"
-                            );
+                            assert!(receipt_count >= 1, "At least one receipt must exist");
                             assert!(
                                 session_dir.join("terminal-outcome.json").is_file(),
                                 "A production phase ledger must record its terminal outcome"
@@ -827,11 +813,11 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
                                     });
                             let identity: BrokerSessionIdentity =
                                 serde_json::from_str(&identity_contents).unwrap_or_else(|error| {
-                                panic!(
-                                    "failed to parse session identity for {}: {error}",
-                                    session_dir.display()
-                                )
-                            });
+                                    panic!(
+                                        "failed to parse session identity for {}: {error}",
+                                        session_dir.display()
+                                    )
+                                });
                             session_ids.push(identity.session_id);
                             validated_ledgers += 1;
                         }
@@ -940,13 +926,11 @@ where
     write_json(&receipt_path, &receipt).expect("write receipt");
 
     let raw = std::fs::read_to_string(&receipt_path).expect("read receipt");
-    let mut value: serde_json::Value =
-        serde_json::from_str(&raw).expect("parse receipt json");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("parse receipt json");
 
     modify(&mut value);
 
-    let tampered_json =
-        serde_json::to_string_pretty(&value).expect("serialize tampered");
+    let tampered_json = serde_json::to_string_pretty(&value).expect("serialize tampered");
     std::fs::write(&receipt_path, tampered_json).expect("write tampered");
 
     let tampered_raw = std::fs::read_to_string(&receipt_path).expect("read tampered");
@@ -963,9 +947,8 @@ where
 #[test]
 fn tamper_usage_evidence_fails() {
     tamper_and_verify_fails(|value| {
-        value["usage"]["actual_tokens"] = serde_json::Value::Number(
-            serde_json::Number::from(99999u64),
-        );
+        value["usage"]["actual_tokens"] =
+            serde_json::Value::Number(serde_json::Number::from(99999u64));
     });
 }
 
@@ -995,9 +978,7 @@ fn tamper_actual_model_fails() {
 #[test]
 fn tamper_interaction_ordinal_fails() {
     tamper_and_verify_fails(|value| {
-        value["interaction_ordinal"] = serde_json::Value::Number(
-            serde_json::Number::from(42u64),
-        );
+        value["interaction_ordinal"] = serde_json::Value::Number(serde_json::Number::from(42u64));
     });
 }
 

@@ -6516,7 +6516,15 @@ fn build_approved_plan_graph_inner(
         let submission = submission_result?;
         check_run_cancelled(cancellation_token)?;
         validate_phase_execution_identity(&critic_decision, &submission.reviewer)?;
-        if broker_factory.is_some() {
+        // OpenCode worker phases create a verified observation receipt during
+        // their repository-aware session. Native deterministic/direct-model
+        // reviewers are explicitly read-only and must not fabricate one.
+        if broker_factory.is_some()
+            && matches!(
+                critic_decision.candidate.backend,
+                PhaseBackend::Worker(WorkerKind::Opencode | WorkerKind::OpencodeSession)
+            )
+        {
             require_verified_repository_observation(
                 store,
                 &plan,
@@ -6654,7 +6662,13 @@ fn build_approved_plan_graph_inner(
                         &oracle_decision,
                         &oracle_submission.reviewer,
                     )?;
-                    if phase_runtime.broker_factory.is_some() {
+                    // Apply the same evidence rule to the independent Oracle.
+                    if phase_runtime.broker_factory.is_some()
+                        && matches!(
+                            oracle_decision.candidate.backend,
+                            PhaseBackend::Worker(WorkerKind::Opencode | WorkerKind::OpencodeSession)
+                        )
+                    {
                         require_verified_repository_observation(
                             store,
                             &plan,
