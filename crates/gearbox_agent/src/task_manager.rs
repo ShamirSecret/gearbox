@@ -19,12 +19,14 @@ use crate::state::{
 use crate::tools::CancellationToken;
 use crate::worker_broker::WorkerBroker;
 use crate::workers::{
-    WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome, WorkerRegistry, WorkerResult,
-    WorkerSessionHandle, WorkerStartRequest, WorkerStatus, WorkerSubscription,
+    is_free_model, WorkerCategory, WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome,
+    WorkerRegistry,
+    WorkerResult, WorkerSessionHandle, WorkerStartRequest, WorkerStatus, WorkerSubscription,
     category_requires_worker_evidence, discard_resident_session_for_model_switch,
     provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
-    validate_worker_evidence_receipt, worker_kind_supports_evidence_contract,
-    worker_model_is_unavailable, write_result_and_outcome_with_outcome,
+    snapshot_worker_evidence_paths, validate_worker_evidence_receipt_with_baseline,
+    worker_kind_supports_evidence_contract, worker_model_is_unavailable,
+    write_result_and_outcome_with_outcome,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +265,7 @@ pub enum TaskFailureKind {
 }
 
 const WORKER_EVIDENCE_RETRY_PREFIX: &str = "worker evidence gate:";
-const MAX_WORKER_EVIDENCE_ATTEMPTS: usize = 3;
+pub(crate) const MAX_WORKER_EVIDENCE_ATTEMPTS: usize = 2;
 const WORKER_EVIDENCE_REPAIR_PROMPT: &str = "Gear evidence gate repair: inspect the work you just performed, run the relevant verification, write a non-empty regular receipt file under .gearbox-agent/evidence/, and end the worker response with EVIDENCE_RECORDED: <path>. Do not claim completion until that receipt exists.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1704,6 +1706,7 @@ pub struct TaskManager {
     registry: WorkerRegistry,
     records: HashMap<String, TaskRecord>,
     task_record_paths: HashMap<String, PathBuf>,
+    evidence_baselines: HashMap<String, Vec<PathBuf>>,
     running_tasks: HashMap<String, RunningTask>,
     resident_tasks: HashMap<String, ResidentTask>,
     queued_tasks: VecDeque<QueuedTask>,
@@ -1819,6 +1822,7 @@ impl Default for TaskManager {
             registry: WorkerRegistry::default(),
             records: HashMap::new(),
             task_record_paths: HashMap::new(),
+            evidence_baselines: HashMap::new(),
             running_tasks: HashMap::new(),
             resident_tasks: HashMap::new(),
             queued_tasks: VecDeque::new(),
@@ -2425,6 +2429,7 @@ impl TaskManager {
 
         self.concurrency.release(&running_task.queued_task);
         self.running_tasks.remove(task_id);
+        self.evidence_baselines.remove(task_id);
         self.activity_heartbeats.remove(task_id);
         self.tool_call_circuit_states.remove(task_id);
         Ok(true)
@@ -2444,6 +2449,7 @@ impl TaskManager {
     ///   - record, archive, control, concurrency, release_guard all cleaned up
     fn destroy_resident_task(&mut self, task_id: &str, cause: &str) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
+        self.evidence_baselines.remove(task_id);
         self.activity_heartbeats.remove(task_id);
         self.tool_call_circuit_states.remove(task_id);
         self.pending_revives
@@ -2723,7 +2729,31 @@ impl TaskManager {
         let stale_tasks = self
             .running_tasks
             .iter()
-            .filter(|(_, running_task)| {
+            .filter(|(task_id, running_task)| {
+                // Free-model workers must not be killed by stale-task sweep.
+                // See GBX-063/064: free models may have long periods without text
+                // output while the process is still alive. Only explicit errors,
+                // cancellation, non-zero exit, or tool meltdown should terminate them.
+                // Check multiple model sources because the task record's model
+                // may not be populated when the sweep runs.
+                let task_id = task_id.as_str();
+                if is_free_model(
+                    self
+                        .records
+                        .get(task_id)
+                        .and_then(|record| record.worker_model.as_deref())
+                        .or_else(|| running_task.queued_task.config.worker_model.as_deref())
+                        .or_else(|| {
+                            running_task
+                                .queued_task
+                                .config
+                                .worker_routes
+                                .iter()
+                                .find_map(|route| route.worker_model.as_deref())
+                        }),
+                ) {
+                    return false;
+                }
                 let last_activity = match self
                     .activity_heartbeats
                     .get(running_task.queued_task.task.id.as_str())
@@ -2810,9 +2840,15 @@ impl TaskManager {
                     && category_requires_worker_evidence(&record.worker_category)
                     && worker_kind_supports_evidence_contract(&record.worker_kind)
                 {
-                    Some(validate_worker_evidence_receipt(
+                    let evidence_baseline = self
+                        .evidence_baselines
+                        .get(task_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    Some(validate_worker_evidence_receipt_with_baseline(
                         &result,
                         &running_task.queued_task.workspace,
+                        &evidence_baseline,
                     ))
                 } else {
                     None
@@ -4693,7 +4729,14 @@ impl TaskManager {
         let selected_route = queued_task
             .config
             .selected_route_for_hint(queued_task.route_attempt, queued_task.route_hint.as_deref());
-        if selected_route.worker_kind != WorkerKind::OpencodeSession {
+        // A review must be an independent execution. Reusing the goal's
+        // provider session would make the reviewer share the executor's
+        // session identity, which invalidates the typed receipt's
+        // reviewed-execution binding and weakens the review gate.
+        if selected_route.worker_kind != WorkerKind::OpencodeSession
+            || selected_route.category == WorkerCategory::Review
+            || queued_task.route_hint.as_deref() == Some("review")
+        {
             return Ok(());
         }
         let Some(provider_session_id) = self.goal_provider_sessions.get(&queued_task.task.goal_id)
@@ -4796,6 +4839,15 @@ impl TaskManager {
                 return Ok(());
             }
 
+            let evidence_baseline = match snapshot_worker_evidence_paths(&queued_task.workspace) {
+                Ok(paths) => paths,
+                Err(reason) => {
+                    eprintln!(
+                        "failed to snapshot Gear worker evidence before task `{task_id}`: {reason}"
+                    );
+                    Vec::new()
+                }
+            };
             let handle = match self.registry.start(WorkerStartRequest {
                 store: &queued_task.store,
                 workspace: &queued_task.workspace,
@@ -4863,6 +4915,8 @@ impl TaskManager {
                     return Err(error);
                 }
             };
+            self.evidence_baselines
+                .insert(task_id.clone(), evidence_baseline);
             if let Some(record) = self.records.get_mut(&task_id) {
                 let transition = transition_task_record(
                     record,
@@ -6232,6 +6286,9 @@ fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut Que
     {
         return;
     }
+    // Only route to an explicitly configured Codex `worker_routes` entry.
+    // Never implicitly create a Codex route — that would bypass the operator's
+    // explicit routing policy and could spawn a second analyzer tree.
     if queued_task
         .config
         .worker_routes
@@ -6239,20 +6296,7 @@ fn maybe_append_failure_upgrade_route(record: &TaskRecord, queued_task: &mut Que
         .any(|route| route.worker_kind == candidate_worker_kind)
     {
         queued_task.route_hint = Some("deep".to_string());
-        return;
     }
-    let Some(worker_command) = candidate_worker_kind.default_command(None) else {
-        return;
-    };
-    queued_task
-        .config
-        .worker_routes
-        .push(crate::workers::WorkerRoute {
-            worker_kind: candidate_worker_kind,
-            worker_command: Some(worker_command),
-            worker_model: None,
-        });
-    queued_task.route_hint = Some("deep".to_string());
 }
 
 fn failure_kind_from_worker_result(
@@ -7400,9 +7444,9 @@ mod tests {
 
         assert_eq!(run.result.status, WorkerStatus::Failed);
         assert_eq!(run.record.status, ManagedTaskStatus::Failed);
-        assert_eq!(run.record.attempts.len(), 3);
+        assert_eq!(run.record.attempts.len(), MAX_WORKER_EVIDENCE_ATTEMPTS);
         assert!(run.record.summary.contains("evidence gate"));
-        for attempt in 1..=3 {
+        for attempt in 1..=MAX_WORKER_EVIDENCE_ATTEMPTS {
             let artifact = store
                 .worker_dir(&task.id)
                 .join(format!("evidence-gate-attempt-{attempt}.json"));
@@ -7465,6 +7509,174 @@ mod tests {
         )?;
         assert!(artifact.contains(r#""status": "accepted""#));
         assert!(artifact.contains("receipt.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_accepts_one_new_worker_evidence_file_without_marker() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_discovered_worker_evidence");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(
+                r#"mkdir -p .gearbox-agent/evidence && printf 'verified\n' > .gearbox-agent/evidence/discovered.md && printf 'done without marker\n' > "$GEARBOX_WORKER_LAST_MESSAGE""#
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "discover evidence receipt",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 1);
+        let artifact = fs::read_to_string(
+            store
+                .worker_dir(&task.id)
+                .join("evidence-gate-attempt-1.json"),
+        )?;
+        assert!(artifact.contains(r#""status": "accepted""#));
+        assert!(artifact.contains("discovered.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_baseline_rejects_reused_receipt_across_attempts() -> Result<()> {
+        // GBX-073 regression: a subsequent evidence attempt for the same
+        // managed task must not reuse a receipt that the previous attempt
+        // left behind.  The baseline snapshotted before the attempt starts
+        // includes the old receipt, so the validation must reject it.
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gearbox-agent/evidence");
+        fs::create_dir_all(&evidence_root)?;
+
+        let old_receipt = evidence_root.join("receipt.md");
+        fs::write(&old_receipt, "verified by prior attempt\n")?;
+
+        let baseline = snapshot_worker_evidence_paths(workspace.path())
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(baseline.len(), 1, "baseline must contain the prior receipt");
+
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n",
+        )?;
+
+        let error = validate_worker_evidence_receipt_with_baseline(
+            &WorkerResult {
+                status: WorkerStatus::Succeeded,
+                command: None,
+                exit_code: Some(0),
+                summary: "worker attempted".to_string(),
+                packet_path: PathBuf::from("packet.json"),
+                prompt_path: PathBuf::from("prompt.md"),
+                stdout_path: None,
+                stderr_path: None,
+                last_message_path: Some(message),
+                result_path: PathBuf::from("result.json"),
+                outcome_path: PathBuf::from("outcome.json"),
+            },
+            workspace.path(),
+            &baseline,
+        )
+        .expect_err(
+            "a receipt from a prior attempt must not satisfy a later evidence gate",
+        );
+
+        assert!(
+            error.contains("present before this worker attempt"),
+            "expected baseline rejection, got: {error}"
+        );
+
+        // Step 2: a subsequent new receipt (different path) must be accepted
+        // against the same baseline, proving attempt isolation.
+        let new_receipt = evidence_root.join("new-receipt.md");
+        fs::write(&new_receipt, "verified by new attempt\n")?;
+
+        let snapshot_after = snapshot_worker_evidence_paths(workspace.path())
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            snapshot_after.len(),
+            2,
+            "snapshot must see both old and new receipts after creating new_receipt"
+        );
+        assert!(
+            snapshot_after.iter().any(|p| p.ends_with("receipt.md")),
+            "snapshot must contain old receipt path"
+        );
+        assert!(
+            snapshot_after.iter().any(|p| p.ends_with("new-receipt.md")),
+            "snapshot must contain new receipt path"
+        );
+        assert_eq!(
+            baseline.len(),
+            1,
+            "baseline must remain unchanged with only the old receipt"
+        );
+        assert!(
+            baseline.iter().any(|p| p.ends_with("receipt.md")),
+            "baseline must contain old receipt path"
+        );
+        assert!(
+            !baseline.iter().any(|p| p.ends_with("new-receipt.md")),
+            "baseline must NOT contain new receipt path"
+        );
+
+        let new_message = workspace.path().join("new-message.md");
+        fs::write(
+            &new_message,
+            "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/new-receipt.md\n",
+        )?;
+
+        let validated = validate_worker_evidence_receipt_with_baseline(
+            &WorkerResult {
+                status: WorkerStatus::Succeeded,
+                command: None,
+                exit_code: Some(0),
+                summary: "new attempt".to_string(),
+                packet_path: PathBuf::from("packet.json"),
+                prompt_path: PathBuf::from("prompt.md"),
+                stdout_path: None,
+                stderr_path: None,
+                last_message_path: Some(new_message),
+                result_path: PathBuf::from("result.json"),
+                outcome_path: PathBuf::from("outcome.json"),
+            },
+            workspace.path(),
+            &baseline,
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(
+            validated,
+            new_receipt.canonicalize()?,
+            "a new receipt with a different path must pass baseline check"
+        );
         Ok(())
     }
 
@@ -7999,6 +8211,57 @@ mod tests {
     }
 
     #[test]
+    fn review_task_does_not_inherit_executor_provider_session() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_review_session_isolation");
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task,
+            route_attempt: 1,
+            goal: "review test".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some("opencode run".to_string()),
+                worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                worker_routes: vec![WorkerRoute {
+                    worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some("opencode run".to_string()),
+                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                }],
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: false,
+                require_worker: true,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("review".to_string()),
+        };
+        let mut manager = TaskManager::new();
+        manager
+            .goal_provider_sessions
+            .insert("goal_test".to_string(), "executor-session".to_string());
+
+        manager.seed_goal_provider_session(&queued_task)?;
+
+        assert_eq!(
+            provider_session_id_for_task(&store, "task_review_session_isolation")?,
+            None,
+            "review must start a fresh provider session"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn goal_epoch_context_resets_route_state_when_session_changes() -> Result<()> {
         let mut manager = TaskManager::new();
         manager.set_goal_epoch_context("session-one", "goal-shared", "epoch-one")?;
@@ -8160,11 +8423,14 @@ mod tests {
     }
 
     #[test]
-    fn queue_next_attempt_upgrades_non_premium_failure_to_codex_route() -> Result<()> {
+    fn queue_next_attempt_does_not_implicitly_upgrade_to_codex() -> Result<()> {
+        // Without an explicit Codex `worker_routes` entry, a failed OpenCode
+        // attempt must produce `NoFallbackRoute` instead of an implicit Codex
+        // upgrade.  GBX-067: all fallback routes must be explicitly configured.
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
-        let task = test_task("task_upgrade_to_codex");
+        let task = test_task("task_no_implicit_codex");
         let config = WorkerConfig {
             worker_kind: WorkerKind::Opencode,
             worker_command: Some("sh -c 'exit 2'".to_string()),
@@ -8240,40 +8506,34 @@ mod tests {
             }],
         };
 
+        // Phase-locked task must not be affected by the upgrade gate.
         let mut phase_locked_task = queued_task.clone();
         phase_locked_task.task.inputs.phase_route_locked = true;
         maybe_append_failure_upgrade_route(&record, &mut phase_locked_task);
         assert!(phase_locked_task.config.worker_routes.is_empty());
         assert_eq!(phase_locked_task.route_hint.as_deref(), Some("repair"));
 
+        // Without an explicit Codex route, the attempt must produce
+        // NoFallbackRoute — no implicit Codex upgrade.
+        let attempt_count_before = record.attempts.len();
         let decision = queue_next_attempt(&mut record, &mut queued_task);
 
-        assert_eq!(decision, FallbackDecision::Queued);
-        assert_eq!(queued_task.route_hint.as_deref(), Some("deep"));
-        assert_eq!(record.attempts.len(), 2);
-        assert_eq!(record.attempts[1].worker_kind, "codex");
-        assert_eq!(record.attempts[1].worker_category, "deep");
+        // Must be Unavailable with NoFallbackRoute — no implicit Codex upgrade.
         assert!(
-            record.attempts[1]
-                .worker_command
-                .as_deref()
-                .is_some_and(|command| command.contains("codex exec"))
+            matches!(
+                &decision,
+                FallbackDecision::Unavailable {
+                    failure_kind: TaskFailureKind::NoFallbackRoute,
+                    ..
+                }
+            ),
+            "expected Unavailable(NoFallbackRoute), got {decision:?}"
         );
-        let previous_attempt = record.attempts[0].clone();
-        let next_attempt = record.attempts[1].clone();
-        let artifact_path = write_route_transform_artifact(
-            &queued_task.store,
-            &task.id,
-            &previous_attempt,
-            Some(&next_attempt),
-            "worker fallback queued",
-            None,
-        )?;
-        let artifact = fs::read_to_string(&artifact_path)?;
-        assert!(artifact.contains("Worker Route Transform"));
-        assert!(artifact.contains("Previous Attempt"));
-        assert!(artifact.contains("Next Attempt"));
-        assert!(artifact.contains("provider"));
+        // No new attempt should have been created.
+        assert_eq!(record.attempts.len(), attempt_count_before);
+        // The phase-locked task must still be unaffected.
+        assert!(phase_locked_task.config.worker_routes.is_empty());
+        assert_eq!(phase_locked_task.route_hint.as_deref(), Some("repair"));
         Ok(())
     }
 
@@ -8879,11 +9139,68 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_free_model_falls_back_to_the_next_free_model() -> Result<()> {
+    fn free_model_command_not_artificially_timed_out() -> Result<()> {
+        // GBX-063: free models must NOT be killed by artificial timeouts.
+        // A sleep command longer than stale_task_timeout_secs must still
+        // complete normally, not trigger a timeout fallback.
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
-        let task = test_task("task_timed_out_free_model_fallback");
+        let task = test_task("task_free_model_no_artificial_timeout");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                    worker_command: Some(
+                        "mkdir -p .gearbox-agent/evidence && echo ok > .gearbox-agent/evidence/receipt.md && sleep 2 && echo \"EVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\" >> \"$GEARBOX_WORKER_LAST_MESSAGE\"".to_string(),
+                    ),
+                    worker_model: Some("opencode/hy3-free".to_string()),
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 1,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("repair"),
+        })?;
+
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 1);
+        assert_eq!(
+            run.record.attempts[0].worker_model.as_deref(),
+            Some("opencode/hy3-free")
+        );
+        assert!(run.record.attempts[0].failure_kind.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn free_model_fallbacks_on_command_error_not_timeout() -> Result<()> {
+        // GBX-063: free models still fall back on explicit command errors
+        // (non-zero exit). Only artificial timeouts are removed.
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_free_model_fallback_on_error");
         let config = WorkerConfig {
             worker_kind: WorkerKind::OpencodeSession,
             worker_command: None,
@@ -8891,7 +9208,7 @@ mod tests {
             worker_routes: vec![
                 WorkerRoute {
                     worker_kind: WorkerKind::OpencodeSession,
-                    worker_command: Some("sleep 5".to_string()),
+                    worker_command: Some("exit 1".to_string()),
                     worker_model: Some("opencode/hy3-free".to_string()),
                 },
                 WorkerRoute {
@@ -8931,18 +9248,15 @@ mod tests {
         assert_eq!(run.record.status, ManagedTaskStatus::Completed);
         assert_eq!(run.record.attempts.len(), 2);
         assert_eq!(
-            run.record.attempts[0].failure_kind,
-            Some(TaskFailureKind::ProviderTemporarilyUnavailable)
-        );
-        assert_eq!(
             run.record.attempts[0].worker_model.as_deref(),
             Some("opencode/hy3-free")
         );
+        assert!(run.record.attempts[0].failure_kind.is_some());
         assert_eq!(
             run.record.attempts[1].worker_model.as_deref(),
             Some("opencode/mimo-v2.5-free")
         );
-        assert!(run.record.retry_reason.is_none());
+        assert!(run.record.attempts[1].failure_kind.is_none());
         Ok(())
     }
 
@@ -10667,6 +10981,130 @@ mod tests {
 
         assert_eq!(manager.sweep_stale_running_tasks()?, 0);
         assert!(manager.running_tasks.contains_key(&task.id));
+        Ok(())
+    }
+
+    #[test]
+    fn free_model_task_is_not_swept_as_stale() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_free_model_not_stale");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("printf noop".to_string()),
+            worker_model: Some("opencode/deepseek-v4-flash-free".to_string()),
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 1,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
+            event_hub: WorkerEventHub::default(),
+        });
+        let mut record = test_task_record(
+            &task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.worker_model = Some("opencode/deepseek-v4-flash-free".to_string());
+        record.session_id = handle.session_id();
+        write_task_record(&store, &record)?;
+        let mut manager = TaskManager::new();
+        manager.records.insert(task.id.clone(), record);
+        manager.running_tasks.insert(
+            task.id.clone(),
+            RunningTask {
+                store,
+                handle,
+                queued_task,
+                started_at: Instant::now() - Duration::from_secs(60),
+                _subscription: None,
+            },
+        );
+        // Free-model tasks must survive stale sweep even with no recent activity.
+        assert_eq!(manager.sweep_stale_running_tasks()?, 0);
+        assert!(manager.running_tasks.contains_key(&task.id));
+        Ok(())
+    }
+
+    #[test]
+    fn non_free_model_task_is_swept_as_stale() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_non_free_model_stale");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("printf noop".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 1,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
+            event_hub: WorkerEventHub::default(),
+        });
+        let mut record = test_task_record(
+            &task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.worker_model = None; // non-free model
+        record.session_id = handle.session_id();
+        write_task_record(&store, &record)?;
+        let mut manager = TaskManager::new();
+        manager.records.insert(task.id.clone(), record);
+        manager.running_tasks.insert(
+            task.id.clone(),
+            RunningTask {
+                store,
+                handle,
+                queued_task,
+                started_at: Instant::now() - Duration::from_secs(60),
+                _subscription: None,
+            },
+        );
+        // Non-free tasks with no activity should be swept as stale.
+        assert_eq!(manager.sweep_stale_running_tasks()?, 1);
+        assert!(!manager.running_tasks.contains_key(&task.id));
         Ok(())
     }
 

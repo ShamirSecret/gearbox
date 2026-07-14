@@ -3406,7 +3406,81 @@ impl ThreadView {
             .into_any()
             .into()
     }
+}
 
+/// Computes how many items from a bounded gear runtime list to display.
+///
+/// When `show_all` is true, returns `total.min(hard_cap)`.
+/// When `show_all` is false, returns `total.min(8)`.
+/// The result is always bounded by `total` so the caller never passes
+/// an out-of-range take count.
+const GEAR_RUNTIME_DEFAULT_LIMIT: usize = 8;
+fn gear_runtime_display_limit(show_all: bool, total: usize, hard_cap: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if show_all {
+        total.min(hard_cap)
+    } else {
+        total.min(GEAR_RUNTIME_DEFAULT_LIMIT)
+    }
+}
+
+#[cfg(test)]
+mod gear_runtime_display_limit_tests {
+    use super::*;
+
+    #[test]
+    fn empty_list_returns_zero() {
+        assert_eq!(gear_runtime_display_limit(false, 0, 32), 0);
+        assert_eq!(gear_runtime_display_limit(true, 0, 32), 0);
+        assert_eq!(gear_runtime_display_limit(false, 0, 500), 0);
+        assert_eq!(gear_runtime_display_limit(true, 0, 500), 0);
+    }
+
+    #[test]
+    fn fewer_than_default_limit_returns_actual_count() {
+        assert_eq!(gear_runtime_display_limit(false, 3, 32), 3);
+        assert_eq!(gear_runtime_display_limit(false, 3, 500), 3);
+        assert_eq!(gear_runtime_display_limit(false, 7, 32), 7);
+        assert_eq!(gear_runtime_display_limit(false, 7, 500), 7);
+    }
+
+    #[test]
+    fn exactly_default_limit_returns_default_limit() {
+        assert_eq!(gear_runtime_display_limit(false, 8, 32), 8);
+        assert_eq!(gear_runtime_display_limit(false, 8, 500), 8);
+    }
+
+    #[test]
+    fn show_all_returns_total_capped_at_hard_cap() {
+        assert_eq!(gear_runtime_display_limit(true, 15, 32), 15);
+        assert_eq!(gear_runtime_display_limit(true, 50, 32), 32);
+        assert_eq!(gear_runtime_display_limit(true, 100, 500), 100);
+        assert_eq!(gear_runtime_display_limit(true, 1000, 500), 500);
+    }
+
+    #[test]
+    fn default_mode_capped_at_default_limit_when_exceeding() {
+        assert_eq!(gear_runtime_display_limit(false, 15, 32), 8);
+        assert_eq!(gear_runtime_display_limit(false, 100, 500), 8);
+        assert_eq!(gear_runtime_display_limit(false, 9, 32), 8);
+    }
+
+    #[test]
+    fn hard_cap_is_independent_of_default_limit() {
+        assert_eq!(gear_runtime_display_limit(true, 20, 10), 10);
+        assert_eq!(gear_runtime_display_limit(true, 5, 0), 0);
+        assert_eq!(gear_runtime_display_limit(true, 0, 0), 0);
+    }
+
+    #[test]
+    fn default_limit_const_is_correct() {
+        assert_eq!(GEAR_RUNTIME_DEFAULT_LIMIT, 8);
+    }
+}
+
+impl ThreadView {
     fn render_gear_task_panel(
         &self,
         window: &mut Window,
@@ -3462,16 +3536,16 @@ impl ThreadView {
             continuation_status.to_ascii_lowercase().as_str(),
             "stopped" | "complete" | "completed" | "failed" | "limited"
         );
-        let feedback_limit = if self.gear_runtime_feedback_show_all {
-            runtime_snapshot.feedback_events.len().min(32)
-        } else {
-            8
-        };
-        let timeline_limit = if self.gear_runtime_timeline_show_all {
-            runtime_snapshot.timeline.len().min(500)
-        } else {
-            8
-        };
+        let feedback_limit = gear_runtime_display_limit(
+            self.gear_runtime_feedback_show_all,
+            runtime_snapshot.feedback_events.len(),
+            32,
+        );
+        let timeline_limit = gear_runtime_display_limit(
+            self.gear_runtime_timeline_show_all,
+            runtime_snapshot.timeline.len(),
+            500,
+        );
 
         let expanded = self.gear_task_manager_expanded;
         Some(
@@ -3730,7 +3804,7 @@ impl ThreadView {
                                                 }))
                                             }),
                                     )
-                                    .when(runtime_snapshot.feedback_events.len() > 8, |this| {
+                                    .when(runtime_snapshot.feedback_events.len() > GEAR_RUNTIME_DEFAULT_LIMIT, |this| {
                                         this.child(
                                             Button::new(
                                                 "gear-feedback-show-more",
@@ -3808,7 +3882,7 @@ impl ThreadView {
                                             }))
                                         },
                                     ))
-                                    .when(runtime_snapshot.timeline.len() > 8, |this| {
+                                    .when(runtime_snapshot.timeline.len() > GEAR_RUNTIME_DEFAULT_LIMIT, |this| {
                                         this.child(
                                             Button::new(
                                                 "gear-timeline-show-more",

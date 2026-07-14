@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio as StdStdio};
@@ -79,6 +79,115 @@ pub struct ScopeCheck {
     pub outside_allowed_paths: Vec<String>,
     pub max_files_exceeded: bool,
     pub changed_file_count: usize,
+}
+
+/// Structured scope drift information for reviewable soft-scope signals.
+///
+/// Unlike `ScopeCheck` (which aggregates all violations), `ScopeDrift`
+/// records only the worker-relative drift that the runtime should
+/// escalate to a review instead of immediately blocking.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScopeDrift {
+    /// Paths outside the allowed scope that are new (not in baseline diff).
+    pub drifted_paths: Vec<String>,
+    /// Human-readable explanation of the drift.
+    pub drift_reason: String,
+}
+
+/// Baseline-aware scope check.
+///
+/// Files already present in the baseline (`before_diff`) are excluded from
+/// scope drift computation so that pre-existing user dirty diffs are not
+/// mis-counted as worker scope violations.
+///
+/// Hard `forbidden_paths` are still enforced on **all** files (including
+/// baseline and worker additions) to preserve the hard safety boundary.
+pub fn compute_baseline_aware_scope(
+    before_diff: &DiffSnapshot,
+    after_diff: &DiffSnapshot,
+    scope: &Scope,
+) -> (ScopeCheck, ScopeDrift) {
+    // Build a set of files that were already changed before the worker started.
+    let baseline_set: HashSet<&str> =
+        before_diff.changed_files.iter().map(String::as_str).collect();
+
+    // Forbidden touches checked against ALL files (hard boundary).
+    let forbidden_touches: Vec<String> = after_diff
+        .changed_files
+        .iter()
+        .filter(|path| {
+            scope.forbidden_paths.iter().any(|forbidden_path| {
+                path == &forbidden_path || path.starts_with(&format!("{forbidden_path}/"))
+            })
+        })
+        .cloned()
+        .collect();
+
+    // New files: present in after_diff but not in baseline.
+    let new_files: Vec<&str> = after_diff
+        .changed_files
+        .iter()
+        .filter(|path| !baseline_set.contains(path.as_str()))
+        .map(String::as_str)
+        .collect();
+
+    // Outside-allowed check only on new files (soft drift).
+    // Files that already hit a forbidden path are excluded from drift
+    // because they are handled by the hard-boundary block.
+    let forbidden_set: HashSet<&str> = forbidden_touches.iter().map(String::as_str).collect();
+    let outside_allowed_paths: Vec<String> = if scope.allowed_paths.is_empty() {
+        Vec::new()
+    } else {
+        new_files
+            .iter()
+            .filter(|path| !forbidden_set.contains(*path))
+            .filter(|path| {
+                !scope.allowed_paths.iter().any(|allowed_path| {
+                    *path == &allowed_path || path.starts_with(&format!("{allowed_path}/"))
+                })
+            })
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    let new_file_count = new_files.len();
+    let max_files_exceeded = new_file_count > scope.max_files_changed;
+
+    let scope_check = ScopeCheck {
+        forbidden_touches,
+        outside_allowed_paths: outside_allowed_paths.clone(),
+        max_files_exceeded,
+        changed_file_count: new_file_count,
+    };
+
+    let drift_parts: Vec<String> = {
+        let mut parts = Vec::new();
+        if !outside_allowed_paths.is_empty() {
+            parts.push(format!(
+                "{} file(s) outside scope: [{}]",
+                outside_allowed_paths.len(),
+                outside_allowed_paths.join(", ")
+            ));
+        }
+        if max_files_exceeded {
+            parts.push(format!(
+                "new file count {} exceeds budget {}",
+                new_file_count, scope.max_files_changed
+            ));
+        }
+        parts
+    };
+
+    let drift = if drift_parts.is_empty() {
+        ScopeDrift::default()
+    } else {
+        ScopeDrift {
+            drifted_paths: outside_allowed_paths,
+            drift_reason: drift_parts.join("; "),
+        }
+    };
+
+    (scope_check, drift)
 }
 
 pub fn run_shell_command(workspace: &Path, command: &str) -> Result<ShellCommandResult> {
@@ -181,12 +290,21 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
     cleanup_command_output(&stdout_path);
     cleanup_command_output(&stderr_path);
 
+    let preserve_worker_tail = env.contains_key("GEARBOX_WORKER_SESSION_ID");
     Ok(ShellCommandResult {
         command: command.to_string(),
         exit_code: status.code(),
         success: status.success(),
-        stdout: truncate(&stdout, OUTPUT_LIMIT),
-        stderr: truncate(&stderr, OUTPUT_LIMIT),
+        stdout: if preserve_worker_tail {
+            truncate_with_tail(&stdout, OUTPUT_LIMIT)
+        } else {
+            truncate(&stdout, OUTPUT_LIMIT)
+        },
+        stderr: if preserve_worker_tail {
+            truncate_with_tail(&stderr, OUTPUT_LIMIT)
+        } else {
+            truncate(&stderr, OUTPUT_LIMIT)
+        },
         duration_ms: started_at.elapsed().as_millis(),
     })
 }
@@ -554,6 +672,36 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
     output
 }
 
+pub fn truncate_with_tail(input: &str, max_chars: usize) -> String {
+    let character_count = input.chars().count();
+    if character_count <= max_chars {
+        return input.to_string();
+    }
+
+    const MARKER: &str = "\n[gearbox-agent output truncated]\n";
+    let marker_length = MARKER.chars().count();
+    if max_chars <= marker_length {
+        return input.chars().take(max_chars).collect();
+    }
+
+    let retained = max_chars - marker_length;
+    // Worker protocols put the final assistant receipt at the end of stdout.
+    // Keep a small head for diagnostics and most of the bounded budget for
+    // that final event so a JSON line is less likely to be cut in half.
+    let prefix_length = (retained / 4).max(6).min(retained);
+    let suffix_length = retained - prefix_length;
+    let prefix = input.chars().take(prefix_length).collect::<String>();
+    let suffix = input
+        .chars()
+        .rev()
+        .take(suffix_length)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}{MARKER}{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +713,18 @@ mod tests {
         );
 
         assert_eq!(paths, vec!["src/main.rs".to_string(), "new.rs".to_string()]);
+    }
+
+    #[test]
+    fn truncate_with_tail_preserves_bounded_head_and_tail() {
+        let output = truncate_with_tail(
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            50,
+        );
+        assert!(output.contains("012345"), "head should remain available");
+        assert!(output.contains("UVWXYZ"), "tail should remain available");
+        assert!(output.contains("[gearbox-agent output truncated]"));
+        assert!(output.chars().count() <= 50);
     }
 
     #[test]
@@ -599,6 +759,161 @@ mod tests {
         let check = check_scope(&snapshot, &scope);
 
         assert_eq!(check.outside_allowed_paths, vec!["README.md".to_string()]);
+    }
+
+    #[test]
+    fn baseline_aware_scope_ignores_dirty_baseline_files() {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![
+                "Cargo.lock".to_string(),
+                "README.md".to_string(),
+            ],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![
+                "Cargo.lock".to_string(),
+                "README.md".to_string(),
+                "src/main.rs".to_string(),
+            ],
+            diff_hash: None,
+        };
+        let scope = Scope::new(vec!["src".to_string()], vec![".omo".to_string()], 10);
+        let (check, drift) = compute_baseline_aware_scope(&before, &after, &scope);
+
+        // Baseline files (Cargo.lock, README.md) should not count as drift.
+        assert!(
+            check.outside_allowed_paths.is_empty(),
+            "baseline files should not appear in outside_allowed_paths: {:?}",
+            check.outside_allowed_paths
+        );
+        // Only new file (src/main.rs) is counted.
+        assert_eq!(check.changed_file_count, 1);
+        // No forbidden touches.
+        assert!(check.forbidden_touches.is_empty());
+        // No drift because new file is inside allowed paths.
+        assert!(drift.drifted_paths.is_empty());
+        assert!(drift.drift_reason.is_empty());
+    }
+
+    #[test]
+    fn baseline_aware_scope_detects_drift_on_new_outside_files() {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["README.md".to_string()],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![
+                "README.md".to_string(),
+                "new_file.py".to_string(),
+                "Cargo.toml".to_string(),
+            ],
+            diff_hash: None,
+        };
+        let scope = Scope::new(
+            vec!["src".to_string(), "Cargo.toml".to_string()],
+            vec![".omo".to_string()],
+            10,
+        );
+        let (check, drift) = compute_baseline_aware_scope(&before, &after, &scope);
+
+        // new_file.py is new and outside allowed paths.
+        assert_eq!(check.outside_allowed_paths, vec!["new_file.py".to_string()]);
+        assert_eq!(check.changed_file_count, 2);
+        assert!(!check.max_files_exceeded);
+        // Drift should have the outside path.
+        assert_eq!(drift.drifted_paths, vec!["new_file.py".to_string()]);
+        assert!(!drift.drift_reason.is_empty());
+    }
+
+    #[test]
+    fn baseline_aware_scope_hard_boundary_still_blocks() {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["src/lib.rs".to_string()],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![
+                "src/lib.rs".to_string(),
+                ".omo/config.json".to_string(),
+            ],
+            diff_hash: None,
+        };
+        let scope = Scope::new(
+            vec!["src".to_string()],
+            vec![".omo".to_string()],
+            10,
+        );
+        let (check, _) = compute_baseline_aware_scope(&before, &after, &scope);
+
+        // .omo/config.json is a forbidden path touch (hard boundary).
+        assert_eq!(check.forbidden_touches, vec![".omo/config.json".to_string()]);
+        // outside_allowed_paths should NOT include baseline file src/lib.rs.
+        assert!(check.outside_allowed_paths.is_empty());
+    }
+
+    #[test]
+    fn baseline_aware_scope_exceeded_file_budget() {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["existing.rs".to_string()],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![
+                "existing.rs".to_string(),
+                "a.rs".to_string(),
+                "b.rs".to_string(),
+                "c.rs".to_string(),
+            ],
+            diff_hash: None,
+        };
+        // max_files_changed = 2, but only 3 new files from baseline.
+        let scope = Scope::new(Vec::new(), Vec::new(), 2);
+        let (check, drift) = compute_baseline_aware_scope(&before, &after, &scope);
+
+        assert!(check.max_files_exceeded);
+        assert_eq!(check.changed_file_count, 3);
+        assert!(drift.drift_reason.contains("exceeds budget"));
+    }
+
+    #[test]
+    fn baseline_aware_scope_no_baseline_no_change() {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["src/main.rs".to_string()],
+            diff_hash: None,
+        };
+        let scope = Scope::new(vec!["src".to_string()], vec![".omo".to_string()], 10);
+        let (check, drift) = compute_baseline_aware_scope(&before, &after, &scope);
+
+        assert!(check.forbidden_touches.is_empty());
+        assert!(check.outside_allowed_paths.is_empty());
+        assert!(!check.max_files_exceeded);
+        assert_eq!(check.changed_file_count, 1);
+        assert!(drift.drifted_paths.is_empty());
     }
 
     #[test]

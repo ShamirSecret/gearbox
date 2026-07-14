@@ -686,7 +686,7 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
     gear_finished.store(true, Ordering::SeqCst);
     assert_eq!(
         worker_responder.join().unwrap(),
-        3,
+        4,
         "Gear should approve the plan, execute one native implementation worker, and run one independent final reviewer"
     );
     cx.run_until_parked();

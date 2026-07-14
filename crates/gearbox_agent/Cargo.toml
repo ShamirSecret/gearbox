@@ -25,6 +25,6 @@ serde_json.workspace = true
 serde_path_to_error.workspace = true
 sha2.workspace = true
 smol.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

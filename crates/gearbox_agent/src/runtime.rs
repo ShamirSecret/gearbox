@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs as std_fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -44,8 +45,8 @@ use crate::task_manager::{
     TaskManagerControl, TaskManagerTickLoop, TaskRecord,
 };
 use crate::tools::{
-    CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_head_commit,
-    git_snapshot, run_shell_command_with_env_and_cancellation,
+    CancellationToken, DiffSnapshot, ShellCommandResult, compute_baseline_aware_scope,
+    git_head_commit, git_snapshot, run_shell_command_with_env_and_cancellation,
 };
 use crate::worker_broker::{
     BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest, BrokerUsage, LifecycleState,
@@ -1798,9 +1799,16 @@ impl Orchestrator {
             ),
         )?;
 
-        let mut before_diff = git_snapshot(&workspace)?;
+        // GBX-071: Save an immutable worker_baseline_diff at worker start.
+        // All subsequent scope comparisons use this fixed baseline so that
+        // pre-existing (user dirty) files are excluded and cumulative new-file
+        // budgets are preserved across iterations.
+        let initial_snapshot = git_snapshot(&workspace)?;
+        let worker_baseline_diff = initial_snapshot.clone();
+        let mut before_diff = initial_snapshot;
         let mut after_diff = before_diff.clone();
-        let mut scope_check = check_scope(&after_diff, &scope);
+        let (mut scope_check, _first_drift) =
+            compute_baseline_aware_scope(&worker_baseline_diff, &after_diff, &scope);
         let mut worker_result = None;
         let mut final_worker_outcome = None;
         let mut verification_results = Vec::new();
@@ -2917,7 +2925,7 @@ impl Orchestrator {
                 phase_route_ordinal,
                 &goal_id,
                 &plan_graph,
-                &worker_task_id,
+                &managed_worker_task_id,
                 worker_session_id.as_deref(),
                 &worker_task_record,
                 &store,
@@ -3022,7 +3030,7 @@ impl Orchestrator {
                         "packet_path": iteration_worker_result.packet_path.to_string_lossy(),
                         "prompt_path": iteration_worker_result.prompt_path.to_string_lossy(),
                         "outcome_path": iteration_worker_result.outcome_path.to_string_lossy(),
-                        "task_record_path": store.worker_dir(&worker_task_id).join("task-record.json").to_string_lossy(),
+                        "task_record_path": store.worker_dir(&managed_worker_task_id).join("task-record.json").to_string_lossy(),
                         "managed_status": format!("{:?}", worker_task_record.status),
                         "failure_kind": worker_task_record.failure_kind.as_ref().map(|kind| format!("{kind:?}")),
                         "retry_reason": &worker_task_record.retry_reason,
@@ -3116,7 +3124,9 @@ impl Orchestrator {
             let reviewer_changed_workspace =
                 review_changed_workspace(worker_route_hint, &before_diff, &after_diff);
             diff_history.push(after_diff.clone());
-            scope_check = check_scope(&after_diff, &scope);
+            let (scope_check_new, scope_drift) =
+                compute_baseline_aware_scope(&worker_baseline_diff, &after_diff, &scope);
+            scope_check = scope_check_new;
             let comment_violations = comment_check(&workspace, &after_diff.changed_files)?;
             check_run_cancelled(options.cancellation_token.as_ref())?;
             append_event(
@@ -3133,6 +3143,7 @@ impl Orchestrator {
                         "before": &before_diff,
                         "after": &after_diff,
                         "scope_check": &scope_check,
+                        "scope_drift": &scope_drift,
                     }),
                 ),
             )?;
@@ -3569,6 +3580,11 @@ impl Orchestrator {
                 break;
             }
 
+            // Update iteration-start snapshot for iteration-level change tracking
+            // (review_changed_workspace, DiffDetected event). The immutable
+            // worker_baseline_diff (captured before the loop) is used for all
+            // scope-drift comparisons, so cumulative new-file budgets persist
+            // correctly across iterations regardless of this update.
             before_diff = after_diff.clone();
         }
 
@@ -9367,11 +9383,32 @@ fn load_review_receipt(path: &std::path::Path) -> Option<(PathBuf, ReviewReceipt
         return Some((path.to_path_buf(), receipt));
     }
     let worker_result: WorkerResult = serde_json::from_str(&artifact).ok()?;
-    let receipt_path = worker_result
-        .last_message_path
-        .or(worker_result.stdout_path)?;
-    let receipt = parse_review_receipt(&std_fs::read_to_string(&receipt_path).ok()?)?;
-    Some((receipt_path, receipt))
+    for receipt_path in [worker_result.last_message_path, worker_result.stdout_path]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(receipt) = std_fs::read_to_string(&receipt_path)
+            .ok()
+            .and_then(|output| parse_review_receipt(&output))
+        {
+            return Some((receipt_path, receipt));
+        }
+    }
+
+    let transcript_path = worker_result
+        .result_path
+        .parent()
+        .map(|parent| parent.join("transcript.jsonl"))?;
+    let receipt = parse_review_receipt_file(&transcript_path)?;
+    Some((transcript_path, receipt))
+}
+
+fn parse_review_receipt_file(path: &std::path::Path) -> Option<ReviewReceiptPayload> {
+    let file = std_fs::File::open(path).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| parse_review_receipt(&line))
 }
 
 fn parse_review_receipt(output: &str) -> Option<ReviewReceiptPayload> {
@@ -9383,7 +9420,43 @@ fn parse_review_receipt(output: &str) -> Option<ReviewReceiptPayload> {
     } else {
         trimmed
     };
-    serde_json::from_str(json).ok()
+    if let Ok(receipt) = serde_json::from_str(json) {
+        return Some(receipt);
+    }
+
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(receipt) = parse_review_receipt_value(&event) {
+            return Some(receipt);
+        }
+    }
+    None
+}
+
+fn parse_review_receipt_value(value: &serde_json::Value) -> Option<ReviewReceiptPayload> {
+    match value {
+        serde_json::Value::String(text) => parse_review_receipt(text),
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if (matches!(
+                    key.as_str(),
+                    "content" | "delta" | "message" | "output" | "text"
+                ) || value.is_object()
+                    || value.is_array())
+                    && let Some(receipt) = parse_review_receipt_value(value)
+                {
+                    return Some(receipt);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(parse_review_receipt_value),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_) => None,
+    }
 }
 
 fn reviewer_evidence_passed(receipt: Option<&ReviewerEvidence>) -> bool {
@@ -9702,25 +9775,73 @@ impl<'a> GoalDecisionPolicy<'a> {
             review.route_hint.as_deref().and_then(WorkerCategory::parse)
                 == Some(WorkerCategory::Review)
         });
-        if !within_scope_limits(
-            self.scope_check.changed_file_count,
-            self.budget.max_files_changed,
-        ) {
-            return GoalEvaluation {
-                status: GoalStatus::Limited,
-                should_continue: false,
-                summary: "Goal reached the file change limit.".to_string(),
-                route_hint_override: None,
-            };
-        }
-        if self.scope_check.max_files_exceeded
-            || !self.scope_check.forbidden_touches.is_empty()
-            || !self.scope_check.outside_allowed_paths.is_empty()
-        {
+        // Hard boundary: forbidden paths touch always blocks immediately.
+        if !self.scope_check.forbidden_touches.is_empty() {
             return GoalEvaluation {
                 status: GoalStatus::Blocked,
                 should_continue: false,
-                summary: "Goal blocked by scope checks.".to_string(),
+                summary: format!(
+                    "Goal blocked by hard scope boundary: {}",
+                    self.scope_check.forbidden_touches.join(", ")
+                ),
+                route_hint_override: None,
+            };
+        }
+        // GBX-071: After a review worker ran and scope drift still exists,
+        // check whether the coordinator review explicitly accepted the drift.
+        // GBX-072: Keep the accepted state when entering the general drift
+        // branch below; otherwise an accepted review would be requested again
+        // forever instead of reaching the normal goal checks.
+        let scope_drift_present = self.scope_check.max_files_exceeded
+            || !self.scope_check.outside_allowed_paths.is_empty();
+        let scope_drift_accepted = scope_drift_present
+            && self.worker_category == WorkerCategory::Review
+            && self
+                .coordinator_review
+                .and_then(|review| review.goal_satisfied)
+                == Some(true);
+        if scope_drift_present && !scope_drift_accepted && self.worker_category == WorkerCategory::Review
+        {
+            return GoalEvaluation {
+                status: GoalStatus::Limited,
+                should_continue: false,
+                summary: format!(
+                    "Scope drift unresolved after review: outside_allowed={} file_count={} max={}. Review did not explicitly accept the drift.",
+                    self.scope_check.outside_allowed_paths.len(),
+                    self.scope_check.changed_file_count,
+                    self.budget.max_files_changed,
+                ),
+                route_hint_override: None,
+            };
+        }
+
+        // Soft scope drift: outside allowed paths or exceeded file budget
+        // is a reviewable signal, not an automatic block.
+        // When baseline-aware computation is active, these counts already
+        // exclude pre-existing (user dirty) files.
+        if scope_drift_present && !scope_drift_accepted {
+            if self.iteration < self.budget.max_iterations {
+                return GoalEvaluation {
+                    status: GoalStatus::Running,
+                    should_continue: true,
+                    summary: format!(
+                        "Scope drift detected: {} file(s) outside scope, {} new file(s) exceeds budget {}. Requesting review.",
+                        self.scope_check.outside_allowed_paths.len(),
+                        self.scope_check.changed_file_count,
+                        self.budget.max_files_changed,
+                    ),
+                    route_hint_override: Some("review".to_string()),
+                };
+            }
+            return GoalEvaluation {
+                status: GoalStatus::Limited,
+                should_continue: false,
+                summary: format!(
+                    "Scope drift unresolved at iteration limit: outside_allowed={} file_count={} max={}",
+                    self.scope_check.outside_allowed_paths.len(),
+                    self.scope_check.changed_file_count,
+                    self.budget.max_files_changed,
+                ),
                 route_hint_override: None,
             };
         }
@@ -10517,7 +10638,7 @@ where
 
     let normalized_texts: Vec<String> = texts
         .into_iter()
-        .map(|text| text.as_ref().to_ascii_lowercase())
+        .map(|text| normalize_context_risk_text(text.as_ref()).to_ascii_lowercase())
         .collect();
 
     PATTERNS
@@ -10530,6 +10651,20 @@ where
             }
         })
         .collect()
+}
+
+fn normalize_context_risk_text(text: &str) -> String {
+    [
+        "[gearbox-agent output truncated]",
+        "\"truncated\":false",
+        "\"truncated\": false",
+        r#"\"truncated\":false"#,
+        r#"\"truncated\": false"#,
+    ]
+    .into_iter()
+    .fold(text.to_string(), |normalized, marker| {
+        normalized.replace(marker, "")
+    })
 }
 
 #[cfg(test)]
@@ -10806,7 +10941,7 @@ fn review_worker_request(base_request: &str, reviewed_execution_id: &str) -> Str
         ]
     });
     format!(
-        "{base_request}\n\nThis is a read-only final-review phase. Return exactly one JSON object, without Markdown fences or prose. Bind it to reviewed_execution_id `{reviewed_execution_id}`. Include all four dimensions, use only `pass` or `fail`, replace every placeholder with concrete findings, and fail any dimension whose evidence is incomplete. Required shape:\n{}",
+        "{base_request}\n\nThis is a read-only final-review phase. Return exactly one JSON object, without Markdown fences or prose. Bind it to reviewed_execution_id `{reviewed_execution_id}`. Include all four dimensions, use only `pass` or `fail`, replace every placeholder with concrete findings, and fail any dimension whose evidence is incomplete. Use targeted file ranges and focused searches instead of requesting whole large files; if a tool reports truncated output, continue with smaller ranges. Keep findings concise so the final JSON remains intact. Required shape:\n{}",
         required_receipt
     )
 }
@@ -11318,6 +11453,8 @@ mod tests {
     };
     use crate::test_support::test_support as ts;
     use crate::tools::ScopeCheck;
+    use crate::phase_routing::{PhaseRouteCandidate, PhaseRouteSource};
+    use crate::task_manager::ResidencyState;
     use crate::workers::{WorkerKind, WorkerStatus};
 
     #[test]
@@ -15018,6 +15155,124 @@ mod tests {
     }
 
     #[test]
+    fn review_receipt_parser_reads_opencode_text_events() {
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "reviewed_execution_id": "executor-1",
+            "dimensions": [
+                {
+                    "dimension": "goal_verification",
+                    "verdict": "pass",
+                    "findings": ["verification artifact inspected"]
+                },
+                {
+                    "dimension": "code_quality",
+                    "verdict": "pass",
+                    "findings": ["scope inspected"]
+                },
+                {
+                    "dimension": "security",
+                    "verdict": "pass",
+                    "findings": ["forbidden paths clean"]
+                },
+                {
+                    "dimension": "qa_execution",
+                    "verdict": "pass",
+                    "findings": ["task_manager tests passed"]
+                }
+            ]
+        })
+        .to_string();
+        let event = serde_json::json!({
+            "type": "text",
+            "part": {"type": "text", "text": receipt}
+        })
+        .to_string();
+
+        let parsed = parse_review_receipt(&event).expect("receipt should be found in text event");
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.reviewed_execution_id, "executor-1");
+        assert_eq!(parsed.dimensions.len(), 4);
+    }
+
+    #[test]
+    fn review_receipt_parser_reads_full_worker_transcript_lines() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let transcript_path = temp_dir.path().join("transcript.jsonl");
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "reviewed_execution_id": "executor-transcript",
+            "dimensions": [
+                {"dimension": "goal_verification", "verdict": "pass", "findings": ["ok"]},
+                {"dimension": "code_quality", "verdict": "pass", "findings": ["ok"]},
+                {"dimension": "security", "verdict": "pass", "findings": ["ok"]},
+                {"dimension": "qa_execution", "verdict": "pass", "findings": ["ok"]}
+            ]
+        });
+        let text_event = serde_json::json!({
+            "type": "text",
+            "part": {"type": "text", "text": format!("```json\n{receipt}\n```")}
+        });
+        let transcript_event = serde_json::json!({
+            "assistant_text_delta": {"kind": "run", "delta": text_event.to_string()}
+        });
+        fs::write(&transcript_path, format!("{}\n", transcript_event))?;
+
+        let parsed = parse_review_receipt_file(&transcript_path)
+            .context("full worker transcript should contain the typed receipt")?;
+        assert_eq!(parsed.reviewed_execution_id, "executor-transcript");
+        assert_eq!(parsed.dimensions.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn context_risk_ignores_gearbox_internal_output_truncation_marker() {
+        let signals = detect_context_risk_signals([
+            "worker completed\n[gearbox-agent output truncated]".to_string(),
+            r#"{"worker_stdout":"worker completed\n[gearbox-agent output truncated]"}"#
+                .to_string(),
+        ]);
+        assert!(
+            !signals
+                .iter()
+                .any(|signal| signal.contains("output truncation reported")),
+            "Gear's own bounded artifact marker must not pause a successful worker"
+        );
+    }
+
+    #[test]
+    fn context_risk_still_detects_explicit_provider_truncation() {
+        let signals = detect_context_risk_signals(["provider output was truncated".to_string()]);
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.contains("output truncation reported"))
+        );
+    }
+
+    #[test]
+    fn context_risk_ignores_false_truncation_metadata_but_keeps_true_metadata() {
+        let false_metadata = detect_context_risk_signals([
+            r#"{"metadata":{"truncated":false}}"#.to_string(),
+            r#"{\"metadata\":{\"truncated\":false}}"#.to_string(),
+        ]);
+        assert!(
+            !false_metadata
+                .iter()
+                .any(|signal| signal.contains("output truncation reported")),
+            "normal tool metadata must not pause the worker"
+        );
+
+        let true_metadata = detect_context_risk_signals([r#"{"truncated":true}"#.to_string()]);
+        assert!(
+            true_metadata
+                .iter()
+                .any(|signal| signal.contains("output truncation reported")),
+            "a true truncation flag must remain a context-risk signal"
+        );
+    }
+
+    #[test]
     fn notification_delivery_failure_records_failed_epoch() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -16282,6 +16537,7 @@ mod tests {
     fn evaluate_goal_routes_limited_when_context_unsafe() {
         let scope_check = crate::tools::ScopeCheck {
             changed_file_count: 15,
+            max_files_exceeded: true,
             ..crate::tools::ScopeCheck::default()
         };
         let budget = BudgetController {
@@ -16311,8 +16567,75 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(evaluation.status, GoalStatus::Limited);
-        assert!(evaluation.summary.contains("file change limit"));
+        // With soft-scope drift, exceeded file budget triggers review instead of immediate limit.
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Running,
+            "expected Running (drift review), got {:?}: {}",
+            evaluation.status,
+            evaluation.summary
+        );
+        assert!(
+            evaluation.summary.contains("Scope drift"),
+            "summary: {}",
+            evaluation.summary
+        );
+        assert!(
+            evaluation.summary.contains("exceeds budget"),
+            "summary should mention budget: {}",
+            evaluation.summary
+        );
+        assert_eq!(
+            evaluation.route_hint_override,
+            Some("review".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_goal_limits_when_scope_drift_unresolved_at_iteration_limit() {
+        let scope_check = crate::tools::ScopeCheck {
+            changed_file_count: 15,
+            max_files_exceeded: true,
+            ..crate::tools::ScopeCheck::default()
+        };
+        let budget = BudgetController {
+            max_iterations: 5,
+            max_files_changed: 10,
+            max_provider_unknown_streak: 2,
+            ..BudgetController::default()
+        };
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Quick,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            5,  // iteration == max_iterations -> should return Limited
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Limited,
+            "scope drift unresolved at iteration limit should return Limited: {}",
+            evaluation.summary
+        );
+        assert!(
+            evaluation.summary.contains("iteration limit"),
+            "summary: {}",
+            evaluation.summary
+        );
     }
 
     #[test]
@@ -17723,5 +18046,438 @@ mod tests {
             hash_text(&second),
             "normalized blocker signatures must be stable across provider wording noise"
         );
+    }
+
+    // ── GBX-071: baseline lifecycle, review acceptance, evidence retry ──
+
+    #[test]
+    fn gbx071_drift_evaluated_against_immutable_baseline_across_iterations() {
+        // When scope drift exists and iteration < max_iterations with a
+        // non-review worker category, the evaluation must request review
+        // regardless of iteration number (baseline-relative, not reset).
+        let scope_check = ScopeCheck {
+            changed_file_count: 3,
+            max_files_exceeded: true,
+            outside_allowed_paths: vec!["outside.rs".to_string()],
+            ..ScopeCheck::default()
+        };
+        let budget = BudgetController {
+            max_iterations: 5,
+            max_files_changed: 2,
+            ..BudgetController::default()
+        };
+        // Non-review worker: drift triggers review request at iteration < max.
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Quick,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            2,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Running,
+            "non-review category with drift should request review: {}",
+            evaluation.summary
+        );
+        assert_eq!(
+            evaluation.route_hint_override.as_deref(),
+            Some("review"),
+            "should request review route"
+        );
+        // At iteration == max_iterations, should be Limited.
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Quick,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            5,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Limited,
+            "drift at iteration limit should be Limited: {}",
+            evaluation.summary
+        );
+    }
+
+    #[test]
+    fn gbx071_review_accepted_drift_allows_continue() {
+        // After a Review worker runs and drift persists, if the coordinator
+        // review says goal_satisfied=true, the drift is accepted and we
+        // should NOT return Limited.
+        let scope_check = ScopeCheck {
+            changed_file_count: 5,
+            max_files_exceeded: true,
+            outside_allowed_paths: vec!["new.rs".to_string()],
+            ..ScopeCheck::default()
+        };
+        let budget = BudgetController {
+            max_iterations: 5,
+            max_files_changed: 3,
+            ..BudgetController::default()
+        };
+        let coordinator_review = CoordinatorReview {
+            goal_satisfied: Some(true),
+            summary: "Drift is acceptable.".to_string(),
+            repair_request: None,
+            route_hint: None,
+            stop_reason: None,
+            raw_response: "goal_satisfied: yes".to_string(),
+        };
+        // WorkerCategory::Review + drift + coordinator accepted = not Limited
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Review,
+            false,
+            None,
+            None,
+            &scope_check,
+            Some(&coordinator_review),
+            0,
+            0,
+            3,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            true,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Running,
+            "accepted drift should continue through normal checks: {:?}",
+            evaluation.status,
+        );
+        assert_ne!(
+            evaluation.route_hint_override.as_deref(),
+            Some("review"),
+            "accepted drift must not request the same review again: {}",
+            evaluation.summary
+        );
+        assert!(!evaluation.summary.contains("Scope drift detected"));
+    }
+
+    #[test]
+    fn gbx071_review_rejected_drift_stops_with_limited() {
+        // After a Review worker runs and drift persists, if the coordinator
+        // review does NOT explicitly accept (goal_satisfied != Some(true)),
+        // the evaluation must return Limited.
+        let scope_check = ScopeCheck {
+            changed_file_count: 5,
+            max_files_exceeded: true,
+            outside_allowed_paths: vec!["new.rs".to_string()],
+            ..ScopeCheck::default()
+        };
+        let budget = BudgetController {
+            max_iterations: 5,
+            max_files_changed: 3,
+            ..BudgetController::default()
+        };
+        // Case 1: coordinator review does not set goal_satisfied (None)
+        let coordinator_review = CoordinatorReview {
+            goal_satisfied: None,
+            summary: "Drift not evaluated.".to_string(),
+            repair_request: None,
+            route_hint: None,
+            stop_reason: None,
+            raw_response: "summary: not evaluated".to_string(),
+        };
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Review,
+            false,
+            None,
+            None,
+            &scope_check,
+            Some(&coordinator_review),
+            0,
+            0,
+            3,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Limited,
+            "unaccepted drift after review should be Limited: {}",
+            evaluation.summary
+        );
+        assert!(
+            evaluation.summary.contains("Scope drift unresolved after review"),
+            "summary should mention review rejection: {}",
+            evaluation.summary
+        );
+
+        // Case 2: coordinator review says goal_satisfied = false
+        let coordinator_review = CoordinatorReview {
+            goal_satisfied: Some(false),
+            summary: "Drift rejected.".to_string(),
+            repair_request: None,
+            route_hint: None,
+            stop_reason: None,
+            raw_response: "goal_satisfied: no".to_string(),
+        };
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Review,
+            false,
+            None,
+            None,
+            &scope_check,
+            Some(&coordinator_review),
+            0,
+            0,
+            3,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Limited,
+            "explicitly rejected drift after review should be Limited: {}",
+            evaluation.summary
+        );
+    }
+
+    #[test]
+    fn gbx071_hard_forbidden_paths_still_block_immediately() {
+        // Forbidden path touches must return Blocked regardless of category.
+        let scope_check = ScopeCheck {
+            forbidden_touches: vec![".omo/config.json".to_string()],
+            ..ScopeCheck::default()
+        };
+        let budget = BudgetController {
+            max_iterations: 5,
+            ..BudgetController::default()
+        };
+        // Even Review category with drift and coordinator acceptance
+        // must NOT override hard forbidden boundary.
+        let coordinator_review = CoordinatorReview {
+            goal_satisfied: Some(true),
+            summary: "All good.".to_string(),
+            repair_request: None,
+            route_hint: None,
+            stop_reason: None,
+            raw_response: "goal_satisfied: yes".to_string(),
+        };
+        let evaluation = evaluate_goal_with_source(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Review,
+            false,
+            None,
+            None,
+            &scope_check,
+            Some(&coordinator_review),
+            0,
+            0,
+            3,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            evaluation.status,
+            GoalStatus::Blocked,
+            "forbidden touches must block immediately: {}",
+            evaluation.summary
+        );
+    }
+
+    #[test]
+    fn gbx071_worker_evidence_attempts_reduced_to_two() {
+        // MAX_WORKER_EVIDENCE_ATTEMPTS must be 2 (initial + one repair).
+        // Verify the constant value.
+        assert_eq!(
+            crate::task_manager::MAX_WORKER_EVIDENCE_ATTEMPTS,
+            2,
+            "GBX-071: MAX_WORKER_EVIDENCE_ATTEMPTS must be 2 (initial + one repair)"
+        );
+    }
+
+    #[test]
+    fn gbx073_phase_route_receipt_binds_managed_task_id() -> Result<()> {
+        let managed_task_id = "managed-task-003";
+        let _logical_repair_id = "repair-task-003";
+
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        let goal_id = "goal-073";
+
+        let decision = PhaseRouteDecision {
+            phase: PhaseProfile::ExecutorDeep,
+            category: WorkerCategory::Deep,
+            selected_candidate: 0,
+            candidate: PhaseRouteCandidate {
+                backend: PhaseBackend::LegacyCategory,
+                model: PhaseModelBinding::None,
+                command: None,
+            },
+            rejected_candidates: vec![],
+            requested_model: None,
+            worker_kind: None,
+            profile_hash: "a".repeat(64),
+            source: PhaseRouteSource::LegacyDefault,
+        };
+
+        let plan = PlanGraph {
+            schema_version: 1,
+            plan_id: "plan-073".to_string(),
+            goal_id: goal_id.to_string(),
+            revision: 1,
+            generated_at: String::new(),
+            source: PlanSource::PlannerModel,
+            planner: None,
+            plan_hash: "b".repeat(64),
+            draft: PlanGraphDraft {
+                objective: String::new(),
+                must_have: vec![],
+                must_not_have: vec![],
+                topology_lock: vec![],
+                tasks: vec![],
+                final_acceptance: vec![],
+            },
+        };
+
+        let task_record = TaskRecord {
+            task_id: managed_task_id.to_string(),
+            worker_kind: "opencode-session".to_string(),
+            worker_command: None,
+            worker_model: None,
+            worker_category: "deep".to_string(),
+            route_hint: None,
+            route_reason: "phase-route".to_string(),
+            status: ManagedTaskStatus::Completed,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            finished_at: Some("2024-01-01T00:01:00Z".to_string()),
+            residency_state: ResidencyState::Resident,
+            run_epoch: 0,
+            notified_epoch: 0,
+            notification_failed_epoch: None,
+            killed: false,
+            session_id: Some("worker-session-073".to_string()),
+            parent_session_id: None,
+            root_session_id: None,
+            parent_task_id: None,
+            result_path: None,
+            outcome_path: None,
+            summary: "test managed task".to_string(),
+            failure_kind: None,
+            retry_reason: None,
+            error: None,
+            attempts: vec![TaskAttempt {
+                attempt: 1,
+                worker_kind: "opencode-session".to_string(),
+                worker_command: None,
+                worker_model: None,
+                worker_category: "deep".to_string(),
+                route_hint: None,
+                route_reason: "phase-route".to_string(),
+                status: TaskAttemptStatus::Completed,
+                started_at: "2024-01-01T00:00:00Z".to_string(),
+                finished_at: Some("2024-01-01T00:01:00Z".to_string()),
+                session_id: Some("worker-session-073".to_string()),
+                result_path: None,
+                outcome_path: None,
+                summary: "attempt 1".to_string(),
+                failure_kind: None,
+                retry_reason: None,
+                error: None,
+            }],
+        };
+
+        let receipt = phase_route_receipt_for_worker(
+            &decision,
+            1,
+            goal_id,
+            &plan,
+            managed_task_id,
+            Some("worker-session-073"),
+            &task_record,
+            &store,
+        )?;
+
+        assert_eq!(
+            receipt.task_id.as_deref(),
+            Some(managed_task_id),
+            "receipt must bind the managed worker task_id, not a logical repair id"
+        );
+
+        let expected_path_suffix = format!("{managed_task_id}-task-record.json");
+        let path = receipt
+            .task_record_path
+            .as_ref()
+            .expect("task_record_path must be set");
+        assert!(
+            path.ends_with(&expected_path_suffix),
+            "evidence path must end with {expected_path_suffix}, got {path}"
+        );
+
+        assert!(Path::new(path).exists(), "evidence file must exist at {path}");
+        let stored_record: TaskRecord =
+            serde_json::from_str(&std_fs::read_to_string(path)?)?;
+        assert_eq!(stored_record.task_id, managed_task_id);
+
+        let file_bytes = std_fs::read(path)?;
+        let expected_sha = format!("{:x}", Sha256::digest(&file_bytes));
+        assert_eq!(
+            receipt.task_record_sha256.as_deref(),
+            Some(expected_sha.as_str()),
+            "receipt sha256 must match on-disk evidence"
+        );
+
+        Ok(())
     }
 }

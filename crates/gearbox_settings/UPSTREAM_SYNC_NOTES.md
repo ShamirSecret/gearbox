@@ -432,3 +432,4 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - 2026-07-14：Gear GUI bounded snapshot 测试二进制串行重复 200 次，全部通过，最大 RSS 66,156 KiB，未见随轮次线性增长；仍不替代长时真实 runtime soak。
 - 2026-07-14：Gear runtime 面板为 Worker Feedback/Runtime Timeline 增加有界 Show More/Show Less，分别可查看最多 32/500 条保留记录；Gear UI-only。
 - 2026-07-14：完整 `agent_ui` library 串行回归 402 passed、0 failed，确认 Gear runtime UI 改动未破坏普通 Agent UI；验证使用单 Cargo/单测试线程。
+- 2026-07-14：GBX-059 operator preflight 将 production Gear phase-broker fixture 的 stale completion expectation 从 3 修正为 4；该测试边界修复只恢复当前 runtime review 拓扑的一致性，不计入 GBX-058 GUI subject work。
