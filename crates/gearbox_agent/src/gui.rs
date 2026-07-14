@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    state::{Event, EventKind, Goal, GoalBudgetLedger, ObjectiveGraph, StateStore},
+    plan_graph::PlanGraph,
+    state::{
+        Event, EventKind, Goal, GoalBudgetLedger, ObjectiveGraph, PlanNodeRunStatus, StateStore,
+    },
     task_manager::{TaskManager, TaskManagerSnapshot},
 };
 
@@ -87,6 +90,12 @@ pub struct GearRuntimeLifecycle {
     pub phase: Option<String>,
     pub stop_reason: Option<String>,
     pub recovery_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +116,8 @@ pub struct GearRuntimeGoalSummary {
     pub status: String,
     pub current_task_id: Option<String>,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +162,16 @@ pub struct GearRuntimeFeedbackEvent {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GearRuntimePlanTaskSummary {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub dependencies: Vec<String>,
+    pub parallel_wave: usize,
+    pub current: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GearRuntimeSnapshot {
     pub schema_version: u32,
@@ -169,6 +190,8 @@ pub struct GearRuntimeSnapshot {
     pub recovery: GearRuntimeRecoverySummary,
     pub feedback: GearRuntimeFeedbackSummary,
     pub feedback_events: Vec<GearRuntimeFeedbackEvent>,
+    #[serde(default)]
+    pub plan_tasks: Vec<GearRuntimePlanTaskSummary>,
     pub task_manager: Option<TaskManagerSnapshot>,
     pub timeline: Vec<GearRuntimeEventEnvelope>,
     pub health: GearRuntimeHealth,
@@ -210,6 +233,10 @@ impl GearRuntimeSnapshot {
         let objective_id = objective.as_ref().map(|(id, _, _)| id.clone());
         let objective_summary = objective.as_ref().map(|(_, summary, _)| summary.clone());
         let graph = objective.as_ref().map(|(_, _, graph)| graph);
+        let plan = goal
+            .as_ref()
+            .and_then(|goal| store.read_plan_graph(&goal.id).ok().flatten());
+        let plan_tasks = plan_task_summaries(store, goal.as_ref(), plan.as_ref());
         let epoch_id = graph
             .and_then(|graph| {
                 graph
@@ -252,6 +279,15 @@ impl GearRuntimeSnapshot {
             .as_ref()
             .map(|goal| goal.request.clone())
             .unwrap_or_default();
+        let lifecycle_worker_kind = task_manager
+            .as_ref()
+            .and_then(|tm| tm.tasks.first())
+            .map(|task| task.worker_kind.clone())
+            .or_else(|| goal_summary.as_ref().map(|_| "gearbox".to_string()));
+        let lifecycle_worker_model = task_manager
+            .as_ref()
+            .and_then(|tm| tm.tasks.first())
+            .and_then(|task| task.worker_model.clone());
         let lifecycle = GearRuntimeLifecycle {
             objective_status: objective_summary
                 .as_ref()
@@ -263,6 +299,15 @@ impl GearRuntimeSnapshot {
                 .as_ref()
                 .and_then(|summary| summary.stop_reason.clone()),
             recovery_state: recovery.stuck_reason.clone(),
+            intensity: std::env::var("GEARBOX_GEAR_WORKER_INTENSITY")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            worker_kind: lifecycle_worker_kind,
+            worker_model: lifecycle_worker_model.or_else(|| {
+                std::env::var("GEARBOX_GEAR_WORKER_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            }),
         };
         let mut health = runtime_health(task_manager.as_ref());
         health.last_activity_at = last_event_timestamp(store, &session_id);
@@ -284,6 +329,7 @@ impl GearRuntimeSnapshot {
             recovery,
             feedback,
             feedback_events,
+            plan_tasks,
             task_manager,
             timeline,
             health,
@@ -410,6 +456,9 @@ fn goal_summary(goal: &Goal) -> GearRuntimeGoalSummary {
             goal.summary.clone(),
             GEAR_GUI_TERMINAL_SUMMARY_BYTES,
         ),
+        intensity: std::env::var("GEARBOX_GEAR_WORKER_INTENSITY")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
     }
 }
 
@@ -469,6 +518,43 @@ fn goal_budget_summary(ledger: Option<&GoalBudgetLedger>) -> GearRuntimeBudgetSu
         })
         .count() as u64;
     summary
+}
+
+fn plan_task_summaries(
+    store: &StateStore,
+    goal: Option<&Goal>,
+    plan: Option<&PlanGraph>,
+) -> Vec<GearRuntimePlanTaskSummary> {
+    let Some(plan) = plan else {
+        return Vec::new();
+    };
+    let ledger = goal.and_then(|goal| store.read_plan_node_runs(&goal.id).ok().flatten());
+    plan.draft
+        .tasks
+        .iter()
+        .take(128)
+        .map(|task| {
+            let status = ledger
+                .as_ref()
+                .and_then(|ledger| {
+                    ledger
+                        .nodes
+                        .iter()
+                        .find(|node| node.task_id == task.task_id)
+                })
+                .map(|node| format!("{:?}", node.status))
+                .unwrap_or_else(|| format!("{:?}", PlanNodeRunStatus::Pending));
+            GearRuntimePlanTaskSummary {
+                task_id: task.task_id.clone(),
+                title: task.title.clone(),
+                status,
+                dependencies: task.dependencies.iter().take(32).cloned().collect(),
+                parallel_wave: task.parallel_wave,
+                current: goal.and_then(|goal| goal.current_task_id.as_deref())
+                    == Some(task.task_id.as_str()),
+            }
+        })
+        .collect()
 }
 
 fn find_objective_graph(objectives_dir: &Path, goal_id: &str) -> Option<ObjectiveGraph> {
@@ -639,7 +725,9 @@ fn bounded_line_count(path: &Path) -> usize {
 
 fn read_timeline(store: &StateStore, session_id: &str) -> Vec<GearRuntimeEventEnvelope> {
     let path = store.events_path(session_id);
-    let sequence_base = fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+    let sequence_base = fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let tail = bounded_file_tail(&path);
     tail.lines()
         .enumerate()
@@ -864,6 +952,7 @@ mod tests {
             recovery: GearRuntimeRecoverySummary::default(),
             feedback: GearRuntimeFeedbackSummary::default(),
             feedback_events: Vec::new(),
+            plan_tasks: Vec::new(),
             task_manager: None,
             timeline: Vec::new(),
             health: GearRuntimeHealth::default(),
@@ -920,6 +1009,7 @@ mod tests {
                     message: "bounded worker output".to_string(),
                 })
                 .collect(),
+            plan_tasks: Vec::new(),
             task_manager: None,
             timeline: (0..100_000)
                 .map(|sequence| event(GearRuntimeEventClass::Telemetry, "worker/output", sequence))

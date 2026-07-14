@@ -68,3 +68,4 @@ crates/docs_preprocessor/actions.json
 openspec/
 .omo/
 .dogfood/
+.gear/

@@ -20,7 +20,7 @@ use crate::phase_routing::{
 };
 use crate::plan_graph::{
     PhaseProfile, PlanGraph, PlanGraphDraft, PlanSource, PlannerReceipt,
-    deterministic_fallback_draft, parse_planner_draft,
+    deterministic_fallback_draft, parse_planner_draft_with_objective,
 };
 use crate::plan_review::{
     IntentFoldDecision, IntentFoldReceipt, IntentFoldVerdict, PhaseExecutionBackend,
@@ -54,7 +54,7 @@ use crate::worker_broker::{
     broker_capabilities_for_kind,
 };
 use crate::workers::{
-    CategoryResolution, CategoryResolutionResult, FallbackRoute, SelectedWorkerRoute,
+    CategoryResolution, CategoryResolutionResult, FallbackRoute, Intensity, SelectedWorkerRoute,
     WorkerCategory, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult, WorkerStartRequest,
     WorkerStatus, category_resolution_for_route,
 };
@@ -732,7 +732,10 @@ fn run_phase_via_broker<T>(
     execution_identity: &PhaseExecutionIdentity,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if matches!(phase_decision.candidate.backend, PhaseBackend::Worker(_)) {
+    if matches!(
+        phase_decision.candidate.backend,
+        PhaseBackend::Worker(_) | PhaseBackend::CodexAcp
+    ) {
         return f();
     }
     if let Some(factory) = broker_factory {
@@ -835,6 +838,7 @@ pub struct RunOptions {
     /// Stable caller-owned identity for continuation persistence.
     pub session_id: Option<String>,
     pub continuation: bool,
+    pub intensity: Option<Intensity>,
 }
 
 #[derive(Clone, Debug)]
@@ -995,7 +999,10 @@ fn dispatch_parallel_plan_siblings(
             phase_runtime.current_model.as_ref(),
             &options.worker,
         )?;
-        if !matches!(phase_decision.candidate.backend, PhaseBackend::Worker(_)) {
+        if !matches!(
+            phase_decision.candidate.backend,
+            PhaseBackend::Worker(_) | PhaseBackend::CodexAcp
+        ) {
             bail!("parallel wave sibling `{plan_task_id}` resolved to a non-worker backend");
         }
         let effective_worker = phase_decision.overlay_worker_config(&options.worker)?;
@@ -6103,6 +6110,7 @@ fn run_strategist_next_goal(
     Ok(Some(receipt))
 }
 
+#[cfg(test)]
 fn build_approved_plan_graph(
     goal: &mut Goal,
     scope: &Scope,
@@ -6211,14 +6219,6 @@ fn build_approved_plan_graph_inner(
                 require_repository_discovery_artifact(store, discovery, &goal.id)?;
             }
             intent_fold_observation_path = submission.repository_evidence_path.clone();
-            if phase_runtime.broker_factory.is_some() {
-                require_verified_repository_observation_for_goal(
-                    store,
-                    submission.repository_evidence_path.as_deref(),
-                    &goal.id,
-                    "planner",
-                )?;
-            }
             let parsed = IntentFoldVerdict::parse(&submission.raw_output)?;
             if parsed != submission.verdict {
                 bail!("IntentFold raw output does not match its typed verdict");
@@ -6288,14 +6288,12 @@ fn build_approved_plan_graph_inner(
         )?;
         let submission = submission_result?;
         if phase_runtime.broker_factory.is_some() {
-            require_verified_repository_observation_for_goal(
-                store,
-                submission.repository_evidence_path.as_deref(),
-                &goal.id,
-                "planner",
-            )?;
+            let discovery = repository_discovery
+                .as_ref()
+                .context("broker-backed planner completed without repository discovery")?;
+            require_repository_discovery_artifact(store, discovery, &goal.id)?;
         }
-        let parsed = parse_planner_draft(&submission.raw_output)
+        let parsed = parse_planner_draft_with_objective(&submission.raw_output, &goal.request)
             .context("planner hook raw output is not a PlanGraphDraft")?;
         if parsed != submission.draft {
             bail!("planner hook raw output does not match its typed draft");
@@ -6341,6 +6339,7 @@ fn build_approved_plan_graph_inner(
         let planner_identity = planner_identity_for_plan(&plan, phase_runtime.planner.clone())?;
         (plan, planner_raw_output, planner_identity, None, None)
     };
+    validate_objective_plan_shape(&goal.request, &plan)?;
     if !phase_runtime.require_plan_approval {
         return Ok(plan);
     }
@@ -6682,7 +6681,9 @@ fn build_approved_plan_graph_inner(
                     if phase_runtime.broker_factory.is_some()
                         && matches!(
                             oracle_decision.candidate.backend,
-                            PhaseBackend::Worker(WorkerKind::Opencode | WorkerKind::OpencodeSession)
+                            PhaseBackend::Worker(
+                                WorkerKind::Opencode | WorkerKind::OpencodeSession
+                            )
                         )
                     {
                         require_verified_repository_observation(
@@ -6973,8 +6974,9 @@ fn build_approved_plan_graph_inner(
                 {
                     bail!("planner revision must use a globally fresh execution identity");
                 }
-                let parsed_revision = parse_planner_draft(&revision.raw_output)
-                    .context("planner revision raw output is not a PlanGraphDraft")?;
+                let parsed_revision =
+                    parse_planner_draft_with_objective(&revision.raw_output, &plan.draft.objective)
+                        .context("planner revision raw output is not a PlanGraphDraft")?;
                 if parsed_revision != revision.draft {
                     bail!("planner revision raw output does not match its typed draft");
                 }
@@ -7005,6 +7007,7 @@ fn build_approved_plan_graph_inner(
                 if revised_plan.plan_hash == previous_plan_hash {
                     bail!("planner revision must change the sealed PlanGraph content hash");
                 }
+                validate_objective_plan_shape(&goal.request, &revised_plan)?;
                 plan = revised_plan;
                 planner_raw_output = revision.raw_output;
                 planner_identity = revision.planner;
@@ -7015,6 +7018,90 @@ fn build_approved_plan_graph_inner(
             }
         }
     }
+}
+
+fn validate_objective_plan_shape(request: &str, plan: &PlanGraph) -> Result<()> {
+    let request_lowercase = request.to_ascii_lowercase();
+    let requests_ordered_work = [
+        "work orders",
+        "work-order nodes",
+        "work order nodes",
+        "multi-node",
+        "plangraph",
+        "工单",
+    ]
+    .iter()
+    .any(|marker| request_lowercase.contains(marker));
+    if !requests_ordered_work {
+        return Ok(());
+    }
+    if plan.draft.tasks.len() < 2 {
+        bail!(
+            "ordered work-order objective requires at least two PlanGraph nodes; refusing single-node flatten fallback"
+        );
+    }
+    if let Some(required_ids) = explicit_work_order_range(request) {
+        let ids = plan
+            .draft
+            .tasks
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect::<HashSet<_>>();
+        let missing = required_ids
+            .into_iter()
+            .filter(|id| !ids.contains(id.as_str()))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "objective plan is missing explicitly requested work-order nodes: {}",
+                missing.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn explicit_work_order_range(request: &str) -> Option<Vec<String>> {
+    let tokens = request
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_alphanumeric() && character != '-' && character != '_'
+            })
+        })
+        .collect::<Vec<_>>();
+    for window in tokens.windows(3) {
+        if !matches!(
+            window[1].to_ascii_lowercase().as_str(),
+            "through" | "to" | "至" | "到"
+        ) {
+            continue;
+        }
+        let Some((start_prefix, start_suffix)) = window[0].rsplit_once('-') else {
+            continue;
+        };
+        let Some((end_prefix, end_suffix)) = window[2].rsplit_once('-') else {
+            continue;
+        };
+        if start_prefix != end_prefix || start_suffix.len() != end_suffix.len() {
+            continue;
+        }
+        let Ok(start) = start_suffix.parse::<usize>() else {
+            continue;
+        };
+        let Ok(end) = end_suffix.parse::<usize>() else {
+            continue;
+        };
+        if start > end || end.saturating_sub(start) >= 128 {
+            continue;
+        }
+        return Some(
+            (start..=end)
+                .map(|index| format!("{start_prefix}-{index:0width$}", width = start_suffix.len()))
+                .collect(),
+        );
+    }
+    None
 }
 
 fn planner_raw_output(goal: &Goal, plan: &PlanGraph) -> Result<String> {
@@ -7085,6 +7172,22 @@ fn validate_phase_execution_identity(
                 }
             }
         }
+        PhaseBackend::CodexAcp => {
+            if identity.backend != PhaseExecutionBackend::WorkerSession {
+                bail!("codex ACP phase must use a worker-session execution identity");
+            }
+            if identity.agent_id.as_deref() != Some("codex") {
+                bail!("codex ACP phase execution identity must use the codex agent");
+            }
+            if let PhaseModelBinding::BackendDeclared(model) = &decision.candidate.model {
+                let declared = ModelSelectorId::from_qualified("codex", model)?;
+                if identity.provider_id.as_deref() != Some(declared.provider_id.as_str())
+                    || identity.model_id.as_deref() != Some(declared.model_id.as_str())
+                {
+                    bail!("codex ACP phase execution identity does not match its declared model");
+                }
+            }
+        }
         PhaseBackend::LegacyCategory => {
             bail!("planner and PlanCritic phases cannot use a legacy category route")
         }
@@ -7121,16 +7224,17 @@ fn phase_route_receipt_for_identity(
                 ModelBindingStatus::Applied,
                 decision.requested_model.clone(),
             ),
-            (PhaseBackend::Worker(_), PhaseModelBinding::BackendDeclared(_)) => {
-                (ModelBindingStatus::DeclaredUnverified, None)
-            }
-            (PhaseBackend::Worker(_), PhaseModelBinding::None) => {
+            (
+                PhaseBackend::Worker(_) | PhaseBackend::CodexAcp,
+                PhaseModelBinding::BackendDeclared(_),
+            ) => (ModelBindingStatus::DeclaredUnverified, None),
+            (PhaseBackend::Worker(_) | PhaseBackend::CodexAcp, PhaseModelBinding::None) => {
                 (ModelBindingStatus::LegacyUnverified, None)
             }
             _ => bail!("unsupported trusted planning phase backend/model binding"),
         };
     let worker_binding = match decision.candidate.backend {
-        PhaseBackend::Worker(_worker_kind) => {
+        PhaseBackend::Worker(_) | PhaseBackend::CodexAcp => {
             let task_id = worker_task_id.context("worker phase receipt is missing its task id")?;
             let task_record_path = worker_artifact_path
                 .context("worker phase receipt is missing its task-record evidence")?;
@@ -7240,33 +7344,6 @@ fn require_verified_repository_observation(
     Ok(())
 }
 
-fn require_verified_repository_observation_for_goal(
-    store: &StateStore,
-    path: Option<&str>,
-    goal_id: &str,
-    role: &str,
-) -> Result<()> {
-    let path = path.context(format!(
-        "{role} phase did not produce a repository observation receipt"
-    ))?;
-    let contents = std_fs::read_to_string(path)
-        .with_context(|| format!("failed to read repository observation receipt {path}"))?;
-    let receipt: RepositoryObservationReceipt = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse repository observation receipt {path}"))?;
-    receipt.validate()?;
-    validate_repository_observation_capture_commit(role, &receipt, current_workspace_head(store)?)?;
-    if receipt.goal_id != goal_id {
-        bail!("{role} repository observation receipt is bound to a different goal");
-    }
-    if receipt.role != role && !receipt.role.starts_with(&format!("{role}-")) {
-        bail!("repository observation receipt role is not {role}");
-    }
-    if receipt.status != RepositoryObservationStatus::Verified {
-        bail!("{role} repository observation is unverified");
-    }
-    Ok(())
-}
-
 fn require_repository_discovery_artifact(
     store: &StateStore,
     discovery: &RepositoryDiscoverySubmission,
@@ -7314,12 +7391,24 @@ fn require_repository_discovery_artifact(
     let observation_path = artifact["repository_observation_path"]
         .as_str()
         .with_context(|| "repository discovery artifact is missing repository observation path")?;
-    require_verified_repository_observation_for_goal(
-        store,
-        Some(observation_path),
-        goal_id,
+    let observation_contents = std_fs::read_to_string(observation_path).with_context(|| {
+        format!("failed to read repository observation receipt {observation_path}")
+    })?;
+    let observation: RepositoryObservationReceipt = serde_json::from_str(&observation_contents)
+        .with_context(|| {
+            format!("failed to parse repository observation receipt {observation_path}")
+        })?;
+    observation.validate()?;
+    validate_repository_observation_capture_commit(
         "planner",
+        &observation,
+        current_workspace_head(store)?,
     )?;
+    if observation.goal_id != goal_id
+        || (observation.role != "planner" && !observation.role.starts_with("planner-"))
+    {
+        bail!("repository discovery observation receipt binding mismatch");
+    }
     Ok(())
 }
 
@@ -7492,10 +7581,15 @@ fn phase_worker_evidence_path(
     let (Some(task_id), Some(artifact_path)) = (task_id, artifact_path) else {
         return Ok(None);
     };
-    let source = std::path::Path::new(artifact_path)
+    let artifact_source = std::path::Path::new(artifact_path)
         .parent()
         .context("worker phase artifact is missing its task directory")?
         .join("task-record.json");
+    let source = if artifact_source.is_file() {
+        artifact_source
+    } else {
+        store.worker_dir(task_id).join("task-record.json")
+    };
     if !source.is_file() {
         bail!(
             "worker phase task-record evidence is missing at {}",
@@ -7834,7 +7928,7 @@ fn build_plan_graph(
     verification_commands: &[String],
 ) -> Result<PlanGraph> {
     match goal.coordinator_brief.as_deref() {
-        Some(output) => match parse_planner_draft(output) {
+        Some(output) => match parse_planner_draft_with_objective(output, &goal.request) {
             Ok(draft) => PlanGraph::seal(
                 &goal.id,
                 1,
@@ -9453,9 +9547,7 @@ fn parse_review_receipt_value(value: &serde_json::Value) -> Option<ReviewReceipt
             None
         }
         serde_json::Value::Array(values) => values.iter().find_map(parse_review_receipt_value),
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_) => None,
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => None,
     }
 }
 
@@ -9586,10 +9678,6 @@ fn budget_limit_label(limit: usize) -> String {
     } else {
         limit.to_string()
     }
-}
-
-fn within_scope_limits(changed_files: usize, max_files_changed: usize) -> bool {
-    changed_files <= max_files_changed
 }
 
 fn budget_summary(
@@ -9800,7 +9888,9 @@ impl<'a> GoalDecisionPolicy<'a> {
                 .coordinator_review
                 .and_then(|review| review.goal_satisfied)
                 == Some(true);
-        if scope_drift_present && !scope_drift_accepted && self.worker_category == WorkerCategory::Review
+        if scope_drift_present
+            && !scope_drift_accepted
+            && self.worker_category == WorkerCategory::Review
         {
             return GoalEvaluation {
                 status: GoalStatus::Limited,
@@ -11447,14 +11537,14 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::phase_routing::{PhaseRouteCandidate, PhaseRouteSource};
     use crate::plan_review::{
         PlanCriticCheck, PlanCriticCheckVerdict, PlanCriticDimension, PlanCriticFinding,
         PlanCriticFindingSeverity,
     };
+    use crate::task_manager::ResidencyState;
     use crate::test_support::test_support as ts;
     use crate::tools::ScopeCheck;
-    use crate::phase_routing::{PhaseRouteCandidate, PhaseRouteSource};
-    use crate::task_manager::ResidencyState;
     use crate::workers::{WorkerKind, WorkerStatus};
 
     #[test]
@@ -11809,6 +11899,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("repro-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
         )?;
@@ -12163,6 +12254,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some(session_id.to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
             ObjectivePolicy::default(),
@@ -12183,7 +12275,7 @@ mod tests {
         let goal: Goal = serde_json::from_str(&fs::read_to_string(
             temp_dir
                 .path()
-                .join(".gearbox-agent/goals")
+                .join(".gear/goals")
                 .join(format!("{goal_id}.json")),
         )?)?;
         assert_eq!(goal.status, GoalStatus::Failed);
@@ -12294,6 +12386,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("objective-root-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
             ObjectivePolicy {
@@ -12421,6 +12514,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("answerable-root-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
             ObjectivePolicy {
@@ -12530,6 +12624,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("objective-limit-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
             ObjectivePolicy {
@@ -12680,6 +12775,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("objective-stop-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             PhaseRuntime::legacy(),
             ObjectivePolicy::default(),
@@ -13349,6 +13445,7 @@ mod tests {
             task_manager: None,
             session_id: Some("acp-session-1".to_string()),
             continuation: true,
+        intensity: None,
         };
         let outcome = Orchestrator::run(options.clone())?;
 
@@ -13427,7 +13524,7 @@ mod tests {
         let goal = fs::read_to_string(
             temp_dir
                 .path()
-                .join(".gearbox-agent")
+                .join(".gear")
                 .join("goals")
                 .join(format!("{}.json", outcome.goal_id)),
         )?;
@@ -13436,7 +13533,7 @@ mod tests {
         let packet = fs::read_to_string(
             temp_dir
                 .path()
-                .join(".gearbox-agent")
+                .join(".gear")
                 .join("workers")
                 .join("task_003")
                 .join("packet.json"),
@@ -13696,6 +13793,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("parallel-wave-session".to_string()),
                 continuation: false,
+                intensity: None,
             },
             phase_runtime,
         )?;
@@ -15229,8 +15327,7 @@ mod tests {
     fn context_risk_ignores_gearbox_internal_output_truncation_marker() {
         let signals = detect_context_risk_signals([
             "worker completed\n[gearbox-agent output truncated]".to_string(),
-            r#"{"worker_stdout":"worker completed\n[gearbox-agent output truncated]"}"#
-                .to_string(),
+            r#"{"worker_stdout":"worker completed\n[gearbox-agent output truncated]"}"#.to_string(),
         ]);
         assert!(
             !signals
@@ -15780,6 +15877,7 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::NeedsUser);
@@ -15799,11 +15897,8 @@ mod tests {
                 .join("verification-iteration-2.md")
                 .exists()
         );
-        let repair_packet = fs::read_to_string(
-            temp_dir
-                .path()
-                .join(".gearbox-agent/workers/task_005/packet.json"),
-        )?;
+        let repair_packet =
+            fs::read_to_string(temp_dir.path().join(".gear/workers/task_005/packet.json"))?;
         assert!(repair_packet.contains(r#""worker": "codex""#));
         Ok(())
     }
@@ -15888,6 +15983,7 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::NeedsUser);
@@ -15895,17 +15991,11 @@ mod tests {
             *review_calls.lock().expect("review mutex poisoned"),
             DEFAULT_MAX_ITERATIONS
         );
-        let review_packet = fs::read_to_string(
-            temp_dir
-                .path()
-                .join(".gearbox-agent/workers/task_005/packet.json"),
-        )?;
+        let review_packet =
+            fs::read_to_string(temp_dir.path().join(".gear/workers/task_005/packet.json"))?;
         assert!(review_packet.contains(r#""worker": "codex""#));
-        let review_prompt = fs::read_to_string(
-            temp_dir
-                .path()
-                .join(".gearbox-agent/workers/task_005/prompt.md"),
-        )?;
+        let review_prompt =
+            fs::read_to_string(temp_dir.path().join(".gear/workers/task_005/prompt.md"))?;
         assert!(review_prompt.contains("Independent review iteration 2"));
         Ok(())
     }
@@ -15992,6 +16082,7 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::NeedsUser);
@@ -15999,17 +16090,11 @@ mod tests {
             *review_calls.lock().expect("review mutex poisoned"),
             DEFAULT_MAX_ITERATIONS
         );
-        let review_packet = fs::read_to_string(
-            temp_dir
-                .path()
-                .join(".gearbox-agent/workers/task_005/packet.json"),
-        )?;
+        let review_packet =
+            fs::read_to_string(temp_dir.path().join(".gear/workers/task_005/packet.json"))?;
         assert!(review_packet.contains(r#""worker": "codex""#));
-        let review_prompt = fs::read_to_string(
-            temp_dir
-                .path()
-                .join(".gearbox-agent/workers/task_005/prompt.md"),
-        )?;
+        let review_prompt =
+            fs::read_to_string(temp_dir.path().join(".gear/workers/task_005/prompt.md"))?;
         assert!(review_prompt.contains("Independent review iteration 2"));
         Ok(())
     }
@@ -16170,6 +16255,7 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::NeedsUser);
@@ -16177,7 +16263,7 @@ mod tests {
         let third_packet = fs::read_to_string(
             temp_dir
                 .path()
-                .join(".gearbox-agent/workers/task_repair_003/packet.json"),
+                .join(".gear/workers/task_repair_003/packet.json"),
         )?;
         assert!(third_packet.contains(r#""worker": "codex""#));
         Ok(())
@@ -16224,12 +16310,13 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::Limited);
         let tasks_path = temp_dir
             .path()
-            .join(".gearbox-agent")
+            .join(".gear")
             .join("tasks")
             .join(format!("{}.tasks.json", outcome.goal_id));
         let tasks = fs::read_to_string(tasks_path)?;
@@ -16284,6 +16371,7 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })?;
 
         assert_eq!(outcome.status, GoalStatus::NeedsUser);
@@ -16344,6 +16432,7 @@ mod tests {
             task_manager: None,
             session_id: None,
             continuation: false,
+            intensity: None,
         })
         .expect_err("run should be cancelled");
 
@@ -16585,10 +16674,7 @@ mod tests {
             "summary should mention budget: {}",
             evaluation.summary
         );
-        assert_eq!(
-            evaluation.route_hint_override,
-            Some("review".to_string())
-        );
+        assert_eq!(evaluation.route_hint_override, Some("review".to_string()));
     }
 
     #[test]
@@ -16615,7 +16701,7 @@ mod tests {
             None,
             0,
             0,
-            5,  // iteration == max_iterations -> should return Limited
+            5, // iteration == max_iterations -> should return Limited
             &budget,
             &BudgetSnapshot::default(),
             &[],
@@ -17564,6 +17650,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("crash-repro-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime.clone(),
             ObjectivePolicy {
@@ -17683,6 +17770,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("crash-repro-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
             ObjectivePolicy {
@@ -17781,6 +17869,7 @@ mod tests {
                         task_manager: None,
                         session_id: Some("crash-matrix-session".to_string()),
                         continuation: true,
+                        intensity: None,
                     },
                     runtime,
                     policy.clone(),
@@ -17910,6 +17999,7 @@ mod tests {
                 task_manager: None,
                 session_id: Some("budget-repro-session".to_string()),
                 continuation: true,
+                intensity: None,
             },
             phase_runtime,
             ObjectivePolicy {
@@ -18243,7 +18333,9 @@ mod tests {
             evaluation.summary
         );
         assert!(
-            evaluation.summary.contains("Scope drift unresolved after review"),
+            evaluation
+                .summary
+                .contains("Scope drift unresolved after review"),
             "summary should mention review rejection: {}",
             evaluation.summary
         );
@@ -18465,9 +18557,11 @@ mod tests {
             "evidence path must end with {expected_path_suffix}, got {path}"
         );
 
-        assert!(Path::new(path).exists(), "evidence file must exist at {path}");
-        let stored_record: TaskRecord =
-            serde_json::from_str(&std_fs::read_to_string(path)?)?;
+        assert!(
+            Path::new(path).exists(),
+            "evidence file must exist at {path}"
+        );
+        let stored_record: TaskRecord = serde_json::from_str(&std_fs::read_to_string(path)?)?;
         assert_eq!(stored_record.task_id, managed_task_id);
 
         let file_bytes = std_fs::read(path)?;
@@ -18479,5 +18573,30 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn explicit_work_order_range_is_generic_and_bounded() {
+        assert_eq!(
+            explicit_work_order_range("execute WO-042-003 through WO-042-006"),
+            Some(vec![
+                "WO-042-003".to_string(),
+                "WO-042-004".to_string(),
+                "WO-042-005".to_string(),
+                "WO-042-006".to_string(),
+            ])
+        );
+        assert_eq!(
+            explicit_work_order_range("依次执行 TASK-009 至 TASK-011"),
+            Some(vec![
+                "TASK-009".to_string(),
+                "TASK-010".to_string(),
+                "TASK-011".to_string(),
+            ])
+        );
+        assert_eq!(
+            explicit_work_order_range("execute TASK-000 through TASK-999"),
+            None
+        );
     }
 }

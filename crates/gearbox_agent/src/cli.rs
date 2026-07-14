@@ -8,7 +8,7 @@ use crate::open_code_phase_runtime::{
     OpenCodePhaseRuntimeFactory, open_code_model_profiles_from_env,
     open_code_model_profiles_from_values,
 };
-use crate::phase_routing::PhaseRouteTable;
+use crate::phase_routing::{CodexAcpModelProfiles, PhaseRouteTable};
 use crate::runtime::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
     Orchestrator, PhaseRuntime, RunOptions,
@@ -16,7 +16,7 @@ use crate::runtime::{
 use crate::state::ObjectivePolicy;
 use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
-use crate::workers::{WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
+use crate::workers::{Intensity, WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
 
 const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'if [ "$GEARBOX_WORKER_RESUME" = "true" ]; then opencode run --pure --format json --session "$GEARBOX_WORKER_SESSION_ID" --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; else opencode run --pure --format json --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; fi'"#;
 
@@ -97,6 +97,9 @@ struct RunCommand {
     #[arg(long)]
     worker_model: Option<String>,
 
+    #[arg(long)]
+    intensity: Option<String>,
+
     #[arg(long = "worker-sequence")]
     worker_sequence: Option<String>,
 
@@ -159,6 +162,18 @@ struct RunCommand {
 
     #[arg(long)]
     opencode_reviewer_model: Option<String>,
+
+    #[arg(long)]
+    codex_acp: bool,
+
+    #[arg(long)]
+    codex_acp_planner_model: Option<String>,
+
+    #[arg(long)]
+    codex_acp_executor_model: Option<String>,
+
+    #[arg(long)]
+    codex_acp_reviewer_model: Option<String>,
 }
 
 pub fn run() -> Result<()> {
@@ -168,7 +183,45 @@ pub fn run() -> Result<()> {
         Command::Run(command) => {
             let worker = worker_config_from_command(&command)?;
             let workspace = command.workspace.clone();
-            let phase_runtime = if command.objective && command.opencode_phases {
+            let phase_runtime = if command.objective && command.codex_acp {
+                let planner = command
+                    .codex_acp_planner_model
+                    .clone()
+                    .or_else(|| trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_PLANNER_MODEL"))
+                    .context(
+                        "--codex-acp requires --codex-acp-planner-model or GEARBOX_GEAR_CODEX_ACP_PLANNER_MODEL",
+                    )?;
+                let executor = command
+                    .codex_acp_executor_model
+                    .clone()
+                    .or_else(|| trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_EXECUTOR_MODEL"))
+                    .unwrap_or_else(|| planner.clone());
+                let reviewer = command
+                    .codex_acp_reviewer_model
+                    .clone()
+                    .or_else(|| trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_REVIEWER_MODEL"))
+                    .unwrap_or_else(|| planner.clone());
+                let profiles = CodexAcpModelProfiles {
+                    codex_planner: planner,
+                    opencode_executor: executor,
+                    codex_reviewer: reviewer,
+                };
+                let routes = PhaseRouteTable::codex_acp_opencode(profiles)?;
+                let broker_registry = Arc::new(WorkerRegistry::default());
+                let broker_factory = Arc::new(PhaseBrokerFactory::new(
+                    broker_registry,
+                    workspace.join(".gear"),
+                ));
+                OpenCodePhaseRuntimeFactory::new(
+                    workspace,
+                    worker.clone(),
+                    broker_factory,
+                    CancellationToken::new(),
+                    routes,
+                    crate::phase_routing::LiveModelInventory::default(),
+                )
+                .build()?
+            } else if command.objective && command.opencode_phases {
                 let profiles = open_code_model_profiles_from_values(
                     true,
                     command.opencode_planner_model.clone(),
@@ -184,7 +237,7 @@ pub fn run() -> Result<()> {
                 let broker_registry = Arc::new(WorkerRegistry::default());
                 let broker_factory = Arc::new(PhaseBrokerFactory::new(
                     broker_registry,
-                    workspace.join(".gearbox-agent"),
+                    workspace.join(".gear"),
                 ));
                 OpenCodePhaseRuntimeFactory::new(
                     workspace,
@@ -221,6 +274,24 @@ pub fn run() -> Result<()> {
                 task_manager: None,
                 session_id: None,
                 continuation: false,
+                intensity: {
+                    let parsed = match command.intensity.as_deref() {
+                        Some(value) => Some(
+                            Intensity::parse_or_fail(value)
+                                .map_err(|error| anyhow!("--intensity: {error}"))?,
+                        ),
+                        None => std::env::var("GEARBOX_GEAR_WORKER_INTENSITY")
+                            .ok()
+                            .and_then(|value| {
+                                Intensity::parse_or_fail(&value)
+                                    .map_err(|error| {
+                                        eprintln!("warning: GEARBOX_GEAR_WORKER_INTENSITY: {error}")
+                                    })
+                                    .ok()
+                            }),
+                    };
+                    parsed.flatten()
+                },
             };
             let outcome = if command.objective {
                 Orchestrator::run_objective_with_phase_runtime(
@@ -252,6 +323,13 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn trimmed_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
@@ -440,6 +518,11 @@ mod tests {
             opencode_planner_model: None,
             opencode_executor_model: None,
             opencode_reviewer_model: None,
+            codex_acp: false,
+            codex_acp_planner_model: None,
+            codex_acp_executor_model: None,
+            codex_acp_reviewer_model: None,
+            intensity: None,
         }
     }
 
@@ -475,8 +558,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_worker_config_enables_verified_opencode_free_fallbacks_without_overriding_sequence(
-    ) -> Result<()> {
+    fn cli_worker_config_enables_verified_opencode_free_fallbacks_without_overriding_sequence()
+    -> Result<()> {
         let mut command = run_command();
         command.opencode_free_fallbacks = true;
 
@@ -496,13 +579,10 @@ mod tests {
         );
         assert!(config.worker_routes.iter().all(|route| {
             route.worker_kind == WorkerKind::OpencodeSession
-                && route
-                    .worker_command
-                    .as_deref()
-                    .is_some_and(|command| {
-                        command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
-                            && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
-                    })
+                && route.worker_command.as_deref().is_some_and(|command| {
+                    command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
+                        && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
+                })
         }));
 
         command.worker_sequence = Some("opencode:opencode/custom-free".to_string());

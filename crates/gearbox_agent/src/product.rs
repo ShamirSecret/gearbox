@@ -432,7 +432,7 @@ pub fn final_report(
     };
 
     let changed_files = if diff.changed_files.is_empty() {
-        "- No code file changes detected outside `.gearbox-agent/`.".to_string()
+        "- No code file changes detected outside `.gear/`.".to_string()
     } else {
         diff.changed_files
             .iter()

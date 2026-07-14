@@ -71,8 +71,8 @@ use gearbox_agent::gui::{
     GEAR_GUI_WORKER_DISPATCH_CAPACITY,
 };
 use gearbox_agent::phase_routing::{
-    LiveModelInventory, ModelSelectorId, OpenCodeModelProfiles, PhaseBackend, PhaseRouteCandidate,
-    PhaseRouteSource, PhaseRouteTable,
+    CodexAcpModelProfiles, LiveModelInventory, ModelSelectorId, OpenCodeModelProfiles,
+    PhaseBackend, PhaseRouteCandidate, PhaseRouteSource, PhaseRouteTable,
 };
 use gearbox_agent::plan_graph::PhaseProfile;
 use gearbox_agent::plan_review::{
@@ -97,9 +97,9 @@ use gearbox_agent::task_manager::{
 };
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{
-    NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig, WorkerEvent,
-    WorkerEventHub, WorkerKind, WorkerOutcome, WorkerPacket, WorkerRegistry, WorkerResult,
-    WorkerRoute, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
+    Intensity, NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig,
+    WorkerEvent, WorkerEventHub, WorkerKind, WorkerOutcome, WorkerPacket, WorkerRegistry,
+    WorkerResult, WorkerRoute, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
     category_resolution_for_route, sanitize_model_fields, worker_outcome_from_result,
     worker_prompt, write_result_and_outcome,
 };
@@ -3018,7 +3018,9 @@ impl NativeAgentConnection {
             .unwrap_or_else(|| gear_worker_config_from_env(cx));
         #[cfg(not(test))]
         let phase_worker_config = gear_worker_config_from_env(cx);
-        let phase_worker_config = if gear_phase_table_uses_opencode(&phase_models.routes) {
+        let phase_worker_config = if gear_phase_table_uses_codex_acp(&phase_models.routes) {
+            gear_codex_acp_phase_worker_config(phase_worker_config)
+        } else if gear_phase_table_uses_opencode(&phase_models.routes) {
             gear_open_code_phase_worker_config(phase_worker_config)
         } else {
             phase_worker_config
@@ -3055,11 +3057,11 @@ impl NativeAgentConnection {
         let broker_registry = Arc::new(WorkerRegistry::with_native_backend(native_backend.clone()));
         let broker = Arc::new(WorkerBroker::new(
             broker_registry.clone(),
-            workspace.join(".gearbox-agent").join("artifacts"),
+            workspace.join(".gear").join("artifacts"),
         ));
         let broker_factory = Arc::new(PhaseBrokerFactory::new(
             broker_registry,
-            workspace.join(".gearbox-agent"),
+            workspace.join(".gear"),
         ));
         let task_registry =
             WorkerRegistry::with_native_backend(native_backend).with_broker(broker.clone());
@@ -3111,10 +3113,8 @@ impl NativeAgentConnection {
                                 session.gear_runtime_snapshot_error = None;
                             }
                             Err(error) => {
-                                session.gear_runtime_snapshot_error = Some(gear_truncate_text(
-                                    &format!("{error:#}"),
-                                    1200,
-                                ));
+                                session.gear_runtime_snapshot_error =
+                                    Some(gear_truncate_text(&format!("{error:#}"), 1200));
                             }
                         }
                     }
@@ -3360,6 +3360,9 @@ impl NativeAgentConnection {
                     task_manager: Some(run_task_manager),
                     session_id: Some(continuation_session_id),
                     continuation: true,
+                    intensity: trimmed_env_value("GEARBOX_GEAR_WORKER_INTENSITY")
+                        .as_deref()
+                        .and_then(Intensity::parse),
                 };
                 let outcome = if let Some(policy) = objective_policy {
                     Orchestrator::run_objective_with_phase_runtime(
@@ -3635,10 +3638,13 @@ fn resolve_phase_host_language_model(
     current_language_model: Option<&Arc<dyn LanguageModel>>,
     models: &LanguageModels,
 ) -> Result<Arc<dyn LanguageModel>> {
-    if matches!(decision.candidate.backend, PhaseBackend::Worker(_)) {
-        return current_language_model
-            .cloned()
-            .context("Gear requires a host model while an OpenCode phase session is active");
+    if matches!(
+        decision.candidate.backend,
+        PhaseBackend::Worker(_) | PhaseBackend::CodexAcp
+    ) {
+        return current_language_model.cloned().context(
+            "Gear requires a host model while an OpenCode/Codex Acp phase session is active",
+        );
     }
     resolve_phase_language_model(decision, current_language_model, models)
 }
@@ -3667,6 +3673,21 @@ fn resolve_phase_language_model(
     })
 }
 
+fn gear_codex_acp_model_profiles_from_env() -> Option<CodexAcpModelProfiles> {
+    let planner = trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_PLANNER_MODEL")?;
+    let executor = trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_EXECUTOR_MODEL")
+        .unwrap_or_else(|| planner.clone());
+    let reviewer = trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_REVIEWER_MODEL")
+        .unwrap_or_else(|| planner.clone());
+    let profiles = CodexAcpModelProfiles {
+        codex_planner: planner,
+        opencode_executor: executor,
+        codex_reviewer: reviewer,
+    };
+    profiles.validate().ok()?;
+    Some(profiles)
+}
+
 fn gear_phase_route_table_from_env() -> Result<PhaseRouteTable> {
     if let Some(raw) = trimmed_env_value("GEARBOX_GEAR_PHASE_ROUTES") {
         let table: PhaseRouteTable = serde_json::from_str(&raw)
@@ -3675,9 +3696,12 @@ fn gear_phase_route_table_from_env() -> Result<PhaseRouteTable> {
         return Ok(table);
     }
 
-    let mut table = match gear_opencode_model_profiles_from_env()? {
-        Some(models) => PhaseRouteTable::opencode_only(models)?,
-        None => PhaseRouteTable::legacy_defaults(),
+    let mut table = match gear_codex_acp_model_profiles_from_env() {
+        Some(profiles) => PhaseRouteTable::codex_acp_opencode(profiles)?,
+        None => match gear_opencode_model_profiles_from_env()? {
+            Some(models) => PhaseRouteTable::opencode_only(models)?,
+            None => PhaseRouteTable::legacy_defaults(),
+        },
     };
     for (phase, environment_name) in [
         (PhaseProfile::Planner, "GEARBOX_GEAR_PHASE_PLANNER"),
@@ -3736,6 +3760,15 @@ fn gear_phase_table_uses_opencode(table: &PhaseRouteTable) -> bool {
                 PhaseBackend::Worker(WorkerKind::OpencodeSession)
             )
         })
+    })
+}
+
+fn gear_phase_table_uses_codex_acp(table: &PhaseRouteTable) -> bool {
+    table.profiles.iter().any(|profile| {
+        profile
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate.backend, PhaseBackend::CodexAcp))
     })
 }
 
@@ -3820,7 +3853,7 @@ fn gear_phase_uses_opencode_worker(models: &GearPhaseModels, phase: PhaseProfile
             .resolve(&phase, &models.inventory, models.current_model.as_ref())?;
     Ok(matches!(
         decision.candidate.backend,
-        PhaseBackend::Worker(WorkerKind::OpencodeSession)
+        PhaseBackend::Worker(WorkerKind::OpencodeSession) | PhaseBackend::CodexAcp
     ))
 }
 
@@ -4566,6 +4599,57 @@ fn gear_open_code_phase_worker_config(mut config: WorkerConfig) -> WorkerConfig 
             worker_model: None,
         });
         config.require_worker = true;
+    }
+    config
+}
+
+fn gear_codex_acp_phase_worker_config(mut config: WorkerConfig) -> WorkerConfig {
+    let has_codex = config
+        .worker_routes
+        .iter()
+        .any(|route| route.worker_kind == WorkerKind::Codex);
+    let has_opencode_session = config
+        .worker_routes
+        .iter()
+        .any(|route| route.worker_kind == WorkerKind::OpencodeSession);
+    if has_codex && has_opencode_session {
+        return config;
+    }
+    if !has_codex {
+        let codex_command = gear_worker_command_for_kind(WorkerKind::Codex)
+            .or_else(|| {
+                matches!(config.worker_kind, WorkerKind::Codex)
+                    .then(|| config.worker_command.clone())
+                    .flatten()
+            })
+            .or_else(|| WorkerKind::Codex.default_command(config.worker_model.as_deref()));
+        if let Some(command) = codex_command {
+            config.worker_routes.push(WorkerRoute {
+                worker_kind: WorkerKind::Codex,
+                worker_command: Some(command),
+                worker_model: config.worker_model.clone(),
+            });
+            config.require_worker = true;
+        }
+    }
+    if !has_opencode_session {
+        let opencode_command =
+            gear_worker_command_for_kind(WorkerKind::OpencodeSession).or_else(|| {
+                matches!(
+                    config.worker_kind,
+                    WorkerKind::Opencode | WorkerKind::OpencodeSession
+                )
+                .then(|| config.worker_command.clone())
+                .flatten()
+            });
+        if let Some(command) = opencode_command {
+            config.worker_routes.push(WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(command),
+                worker_model: None,
+            });
+            config.require_worker = true;
+        }
     }
     config
 }

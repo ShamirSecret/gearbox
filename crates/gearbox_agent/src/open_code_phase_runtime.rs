@@ -12,8 +12,8 @@ use crate::phase_routing::{
 #[cfg(test)]
 use crate::plan_graph::PhaseProfile;
 use crate::plan_graph::{
-    PLAN_GRAPH_SCHEMA_EXEMPLAR, PlannerParseDiagnostic, parse_planner_draft,
-    parse_planner_draft_diagnostic, validate_planner_draft,
+    PLAN_GRAPH_SCHEMA_EXEMPLAR, PlannerParseDiagnostic, parse_planner_draft_diagnostic,
+    parse_planner_draft_with_objective, validate_planner_draft,
 };
 use crate::plan_review::{IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVerdict};
 use crate::runtime::{
@@ -31,7 +31,10 @@ use crate::task_manager::{
 };
 use crate::tools::{CancellationToken, git_head_commit};
 use crate::worker_broker::PhaseBrokerFactory;
-use crate::workers::{WorkerConfig, WorkerKind, WorkerResult, WorkerStartRequest, WorkerStatus};
+use crate::workers::{
+    WorkerConfig, WorkerKind, WorkerResult, WorkerStartRequest, WorkerStatus,
+    worker_evidence_marker_path,
+};
 
 /// Builder for a production `PhaseRuntime` that routes all planning and review
 /// phases through independent OpenCode session workers.
@@ -208,9 +211,45 @@ fn read_phase_output(result: &WorkerResult) -> Result<(String, Option<String>)> 
         bail!("OpenCode phase returned an empty response");
     }
     Ok((
-        raw_output,
+        extract_worker_text_events(&raw_output),
         output_path.map(|path| path.to_string_lossy().to_string()),
     ))
+}
+
+/// OpenCode's JSON formatter emits one event per line and puts the model's
+/// response in a nested `part.text` field.  Phase parsers consume the model
+/// object, not the transport envelope, so unwrap those events before schema
+/// validation.  Plain model JSON remains unchanged.
+fn extract_worker_text_events(raw_output: &str) -> String {
+    let mut text = String::new();
+    let mut found_event = false;
+    for line in raw_output.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(part_text) = value
+            .get("part")
+            .and_then(|part| part.get("text"))
+            .and_then(serde_json::Value::as_str)
+        {
+            found_event = true;
+            text.push_str(part_text);
+            continue;
+        }
+        if let Some(output) = value
+            .get("worker_stdout")
+            .and_then(|event| event.get("output"))
+            .and_then(serde_json::Value::as_str)
+        {
+            found_event = true;
+            text.push_str(output);
+        }
+    }
+    if found_event {
+        text.trim().to_string()
+    } else {
+        raw_output.to_string()
+    }
 }
 
 impl OpenCodePhaseRunner {
@@ -274,9 +313,9 @@ impl OpenCodePhaseRunner {
         let call_ordinal = self.call_budget.reserve(goal_id)?;
         if !matches!(
             decision.candidate.backend,
-            PhaseBackend::Worker(WorkerKind::OpencodeSession)
+            PhaseBackend::Worker(WorkerKind::OpencodeSession) | PhaseBackend::CodexAcp
         ) {
-            bail!("Gear OpenCode phase runner received a non-OpenCode route");
+            bail!("Gear phase runner received a non-OpenCode/Codex route");
         }
         let config = decision.overlay_worker_config(&self.worker_config)?;
         // Spec phases are read-only discovery/interpretation turns. Keep the
@@ -375,10 +414,12 @@ impl OpenCodePhaseRunner {
                 decision.phase
             )
         })?;
+        let artifact_path = worker_evidence_marker_path(&execution.result)
+            .unwrap_or_else(|| execution.result.result_path.to_string_lossy().to_string());
         Ok(OpenCodePhaseOutput {
             raw_output,
             execution_identity: execution.execution_identity,
-            artifact_path: execution.result.result_path.to_string_lossy().to_string(),
+            artifact_path,
             repository_observation_path: Some(observation_path.to_string_lossy().to_string()),
         })
     }
@@ -629,6 +670,25 @@ impl OpenCodePhaseRunner {
                     });
                 }
                 Err(diagnostic) if repair_attempt < MAX_PLANNER_SCHEMA_REPAIRS => {
+                    if let Some(submission) =
+                        self.load_verified_planner_artifact(&input, &output, &diagnostic)?
+                    {
+                        return Ok(submission);
+                    }
+                    if diagnostic.message.contains("missing field `objective`") {
+                        if let Ok(draft) =
+                            parse_planner_draft_with_objective(&output.raw_output, &input.request)
+                        {
+                            validate_planner_draft(&input.goal_id, &draft)?;
+                            return Ok(PlannerSubmission {
+                                draft,
+                                planner: output.execution_identity,
+                                raw_output: output.raw_output,
+                                artifact_path: Some(output.artifact_path),
+                                repository_evidence_path: output.repository_observation_path,
+                            });
+                        }
+                    }
                     let store = StateStore::new(&self.workspace);
                     store.initialize()?;
                     store.write_artifact(
@@ -662,6 +722,25 @@ impl OpenCodePhaseRunner {
                     )?;
                 }
                 Err(diagnostic) => {
+                    if let Some(submission) =
+                        self.load_verified_planner_artifact(&input, &output, &diagnostic)?
+                    {
+                        return Ok(submission);
+                    }
+                    if diagnostic.message.contains("missing field `objective`") {
+                        if let Ok(draft) =
+                            parse_planner_draft_with_objective(&output.raw_output, &input.request)
+                        {
+                            validate_planner_draft(&input.goal_id, &draft)?;
+                            return Ok(PlannerSubmission {
+                                draft,
+                                planner: output.execution_identity,
+                                raw_output: output.raw_output,
+                                artifact_path: Some(output.artifact_path),
+                                repository_evidence_path: output.repository_observation_path,
+                            });
+                        }
+                    }
                     bail!(
                         "planner schema repair exhausted after {} attempts: {}",
                         MAX_PLANNER_SCHEMA_REPAIRS,
@@ -671,6 +750,56 @@ impl OpenCodePhaseRunner {
             }
         }
         bail!("planner schema repair loop terminated unexpectedly")
+    }
+
+    fn load_verified_planner_artifact(
+        &self,
+        input: &PlannerInput,
+        output: &OpenCodePhaseOutput,
+        diagnostic: &PlannerParseDiagnostic,
+    ) -> Result<Option<PlannerSubmission>> {
+        let conventional_artifact_path = self
+            .workspace
+            .join(".gear")
+            .join("evidence")
+            .join(format!("planner_{}", input.goal_id))
+            .join("plan-graph-draft.json");
+        let reported_artifact_path = PathBuf::from(&output.artifact_path);
+        let reported_artifact_path = if reported_artifact_path.is_absolute() {
+            reported_artifact_path
+        } else {
+            self.workspace.join(reported_artifact_path)
+        };
+        let candidates = [reported_artifact_path, conventional_artifact_path];
+        let Some((artifact_path, contents, draft)) = candidates.into_iter().find_map(|path| {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let draft = parse_planner_draft_with_objective(&contents, &input.request).ok()?;
+            validate_planner_draft(&input.goal_id, &draft).ok()?;
+            Some((path, contents, draft))
+        }) else {
+            return Ok(None);
+        };
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        store.write_artifact(
+            &input.goal_id,
+            &format!(
+                "planner-artifact-recovery-r{}.json",
+                MAX_PLANNER_SCHEMA_REPAIRS
+            ),
+            &format!(
+                "{{\"source\":{},\"diagnostic\":{}}}\n",
+                serde_json::to_string(&artifact_path.to_string_lossy())?,
+                serde_json::to_string(diagnostic)?
+            ),
+        )?;
+        Ok(Some(PlannerSubmission {
+            draft,
+            planner: output.execution_identity.clone(),
+            raw_output: contents,
+            artifact_path: Some(artifact_path.to_string_lossy().to_string()),
+            repository_evidence_path: output.repository_observation_path.clone(),
+        }))
     }
 
     pub fn critique(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
@@ -763,7 +892,8 @@ impl OpenCodePhaseRunner {
             Scope::new(Vec::new(), Vec::new(), 1),
             prompt,
         )?;
-        let draft = parse_planner_draft(&output.raw_output)?;
+        let draft =
+            parse_planner_draft_with_objective(&output.raw_output, &input.plan.draft.objective)?;
         Ok(PlanRevisionSubmission {
             draft,
             planner: output.execution_identity,
@@ -1201,7 +1331,7 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
         })
         .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         PLAN_GRAPH_SCHEMA_EXEMPLAR,
         input.request,
         repository_discovery,
@@ -1258,7 +1388,7 @@ fn gear_opencode_intent_fold_prompt(
     repository_discovery: &RepositoryDiscoverySubmission,
 ) -> Result<String> {
     Ok(format!(
-        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready when the user has specified the behavior, scope, and acceptance. Gear owns runtime mechanics: evidence is stored under `.gearbox-agent/artifacts/<goal_id>`, verification commands are supplied by Gear, and workspace scope is enforced before dispatch. Do not ask where these artifacts live, how to run commands, or how phases are sequenced. Use needs_user only for a real product or safety decision that repository inspection and the runtime contract cannot resolve. Treat the prior discovery findings as evidence, preserve concrete paths and constraints, and do not silently replace an inconclusive observation with an assumption.\n\nGoal id: {}\nRequest:\n{}\n\nRepository discovery findings (completed before this turn):\nartifact_path={}\n{}\n\nScope:\n{}",
+        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready when the user has specified the behavior, scope, and acceptance. Gear owns runtime mechanics: evidence is stored under `.gear/runs/<run_id>/`, verification commands are supplied by Gear, and workspace scope is enforced before dispatch. Do not ask where these artifacts live, how to run commands, or how phases are sequenced. The caller has already approved the referenced frozen plan and its hash: never ask the user to reveal, relocate, or approve a plan merely because `.omo` or `.dogfood` is forbidden to this worker; record that access restriction as an assumption/risk and continue with ready. Use needs_user only for a real product or safety decision that repository inspection and the runtime contract cannot resolve. Treat the prior discovery findings as evidence, preserve concrete paths and constraints, and do not silently replace an inconclusive observation with an assumption.\n\nGoal id: {}\nRequest:\n{}\n\nRepository discovery findings (completed before this turn):\nartifact_path={}\n{}\n\nScope:\n{}",
         input.goal_id,
         input.request,
         repository_discovery.artifact_path,
@@ -1273,7 +1403,7 @@ fn gear_opencode_intent_repair_prompt(
     attempt: usize,
 ) -> Result<String> {
     Ok(format!(
-        "You are Gear's Metis-style intent analyst on fresh repair turn {attempt}. Return one complete IntentFoldVerdict JSON object only. Re-evaluate the request, preserving real product ambiguities, but do not ask the user about runtime-owned mechanics: Gear stores generated evidence under `.gearbox-agent/artifacts/<goal_id>`, runs verification commands supplied below, and enforces the workspace scope. Ask a question only when the user must choose behavior, scope, destructive action, or acceptance semantics. If those are explicit, return `ready` with empty required_questions. Do not write files.\n\nOriginal request:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}\n\nPrevious verdict:\n{}",
+        "You are Gear's Metis-style intent analyst on fresh repair turn {attempt}. Return one complete IntentFoldVerdict JSON object only. Re-evaluate the request, preserving real product ambiguities, but do not ask the user about runtime-owned mechanics: Gear stores generated evidence under `.gear/runs/<run_id>/`, runs verification commands supplied below, and enforces the workspace scope. The caller has already approved the referenced frozen plan and its hash; never ask the user to reveal, relocate, or approve a plan merely because `.omo` or `.dogfood` is forbidden to this worker. Record that restriction as an assumption/risk and return `ready` when the requested behavior and scope are explicit. Ask a question only when the user must choose behavior, scope, destructive action, or acceptance semantics. If those are explicit, return `ready` with empty required_questions. Do not write files.\n\nOriginal request:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}\n\nPrevious verdict:\n{}",
         input.request,
         serde_json::to_string_pretty(&input.scope)?,
         serde_json::to_string_pretty(&Vec::<String>::new())?,
@@ -1932,6 +2062,62 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
         })?;
         assert_eq!(submission.draft.tasks.len(), 1);
         assert_eq!(std::fs::read_to_string(counter_path)?, "2");
+        Ok(())
+    }
+
+    #[test]
+    fn planner_recovers_only_the_current_worker_artifact() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let valid_plan_path = temp_dir.path().join("valid-plan.json");
+        std::fs::write(&valid_plan_path, PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
+        let evidence_dir = temp_dir.path().join(".gear").join("evidence");
+        std::fs::create_dir_all(&evidence_dir)?;
+        let artifact_relative_path = PathBuf::from(".gear/evidence/planner-current-call.json");
+        let artifact_path = temp_dir.path().join(&artifact_relative_path);
+        let stale_path = evidence_dir.join("unrelated-stale-plan.json");
+        std::fs::write(&stale_path, PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
+        let script_path = temp_dir.path().join("planner-artifact-worker.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncp '{valid_plan}' '{artifact}'\nprintf '%s' 'EVIDENCE_RECORDED: {artifact_relative}' > \"$GEARBOX_WORKER_LAST_MESSAGE\"\n",
+                valid_plan = valid_plan_path.to_string_lossy(),
+                artifact = artifact_path.to_string_lossy(),
+                artifact_relative = artifact_relative_path.to_string_lossy(),
+            ),
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.plan(PlannerInput {
+            goal_id: "artifact_recovery_goal".to_string(),
+            request: "recover the current planner artifact".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            verification_commands: Vec::new(),
+            route_decision: decision,
+            intent_fold: None,
+            repository_discovery: None,
+        })?;
+
+        assert_eq!(submission.draft.tasks.len(), 1);
+        assert_eq!(submission.artifact_path.as_deref(), artifact_path.to_str());
         Ok(())
     }
 

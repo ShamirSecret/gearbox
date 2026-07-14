@@ -51,8 +51,7 @@ pub(crate) fn setup_omo_plugin_config_dir() -> Result<tempfile::TempDir> {
     let config_path = opencode_dir.join("oh-my-openagent.json");
     fs::write(
         &config_path,
-        serde_json::to_string_pretty(&config)
-            .context("failed to serialize OMO plugin config")?,
+        serde_json::to_string_pretty(&config).context("failed to serialize OMO plugin config")?,
     )
     .with_context(|| {
         format!(
@@ -66,6 +65,83 @@ use crate::worker_broker::{
     BrokerCapability, BrokerSessionIdentity, BrokerUsage, LifecycleStateName, WorkerBroker,
     broker_capabilities_for_kind,
 };
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Intensity {
+    #[default]
+    Low,
+    Medium,
+    High,
+    ExtraHigh,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl Intensity {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "extra_high" | "extra-high" | "extrahigh" | "xhigh" => Some(Self::ExtraHigh),
+            _ => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(Self::Custom(trimmed.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Parse intensity, failing closed for unknown non-empty values.
+    /// Returns `None` for empty/missing values (caller may apply default).
+    /// Returns `Err` for unrecognized strings that are not a known keyword
+    /// and do not start with `custom:`.
+    pub fn parse_or_fail(value: &str) -> Result<Option<Self>, String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        match lowered.as_str() {
+            "low" => Ok(Some(Self::Low)),
+            "medium" | "med" => Ok(Some(Self::Medium)),
+            "high" => Ok(Some(Self::High)),
+            "extra_high" | "extra-high" | "extrahigh" | "xhigh" => Ok(Some(Self::ExtraHigh)),
+            _ => {
+                if lowered.starts_with("custom:") || lowered.starts_with("custom_") {
+                    let inner = if lowered.starts_with("custom:") {
+                        trimmed[7..].trim()
+                    } else {
+                        trimmed[7..].trim()
+                    };
+                    if inner.is_empty() {
+                        return Err("custom intensity value cannot be empty".to_string());
+                    }
+                    Ok(Some(Self::Custom(inner.to_string())))
+                } else if lowered.starts_with("custom") {
+                    // bare "custom" without a value
+                    Ok(Some(Self::Custom("default".to_string())))
+                } else {
+                    Err(format!("unknown intensity value `{trimmed}`"))
+                }
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Low => "low".to_string(),
+            Self::Medium => "medium".to_string(),
+            Self::High => "high".to_string(),
+            Self::ExtraHigh => "extra_high".to_string(),
+            Self::Custom(value) => format!("custom:{value}"),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -336,7 +412,7 @@ impl WorkerCategory {
     fn prompt_append(self) -> Option<&'static str> {
         match self {
             Self::Quick | Self::Repair | Self::Deep | Self::Visual | Self::Custom => Some(
-                "Focus on implementation, keep changes minimal, and do not ask the user questions. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gearbox-agent/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
+                "Focus on implementation, keep changes minimal, and do not ask the user questions. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gear/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
             ),
             Self::Review => Some(
                 "This is an independent review turn. Do not edit files; inspect the evidence and return concrete findings.",
@@ -345,7 +421,7 @@ impl WorkerCategory {
                 "This is a read-only exploration turn. Do not edit files; trace the code and summarize the evidence.",
             ),
             Self::ZedNative => Some(
-                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gearbox-agent/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
+                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gear/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
             ),
         }
     }
@@ -1349,7 +1425,17 @@ pub struct WorkerResult {
 }
 
 const WORKER_EVIDENCE_MARKER: &str = "EVIDENCE_RECORDED:";
-const WORKER_EVIDENCE_ROOT: &str = ".gearbox-agent/evidence";
+const WORKER_EVIDENCE_ROOT: &str = ".gear/evidence";
+const LEGACY_WORKER_EVIDENCE_ROOT: &str = ".gearbox-agent/evidence";
+
+fn evidence_root_for_workspace(workspace: &Path) -> PathBuf {
+    let current = workspace.join(WORKER_EVIDENCE_ROOT);
+    if current.exists() {
+        current
+    } else {
+        workspace.join(LEGACY_WORKER_EVIDENCE_ROOT)
+    }
+}
 
 pub fn category_requires_worker_evidence(category: &str) -> bool {
     WorkerCategory::parse(category).is_some_and(WorkerCategory::requires_evidence_receipt)
@@ -1391,7 +1477,7 @@ fn validate_worker_evidence_receipt_inner(
     let workspace = workspace
         .canonicalize()
         .map_err(|error| format!("failed to resolve workspace: {error}"))?;
-    let evidence_root = workspace.join(WORKER_EVIDENCE_ROOT);
+    let evidence_root = evidence_root_for_workspace(&workspace);
     let real_evidence_root = evidence_root
         .canonicalize()
         .map_err(|error| format!("evidence root is unavailable: {error}"))?;
@@ -1406,16 +1492,13 @@ fn validate_worker_evidence_receipt_inner(
         } else {
             workspace.join(marker_path)
         };
-        return validate_evidence_candidate(
-            &candidate,
-            &real_evidence_root,
-            baseline_paths,
-            true,
-        );
+        return validate_evidence_candidate(&candidate, &real_evidence_root, baseline_paths, true);
     }
 
     if !allow_discovery {
-        return Err(format!("missing {WORKER_EVIDENCE_MARKER} marker in worker output"));
+        return Err(format!(
+            "missing {WORKER_EVIDENCE_MARKER} marker in worker output"
+        ));
     }
 
     let current_paths = snapshot_worker_evidence_paths(&workspace)?;
@@ -1448,12 +1531,7 @@ fn validate_worker_evidence_receipt_inner(
         ));
     }
 
-    validate_evidence_candidate(
-        &new_files[0],
-        &real_evidence_root,
-        baseline_paths,
-        true,
-    )
+    validate_evidence_candidate(&new_files[0], &real_evidence_root, baseline_paths, true)
 }
 
 pub(crate) fn snapshot_worker_evidence_paths(
@@ -1462,7 +1540,7 @@ pub(crate) fn snapshot_worker_evidence_paths(
     let workspace = workspace
         .canonicalize()
         .map_err(|error| format!("failed to resolve workspace: {error}"))?;
-    let evidence_root = workspace.join(WORKER_EVIDENCE_ROOT);
+    let evidence_root = evidence_root_for_workspace(&workspace);
     let metadata = match fs::symlink_metadata(&evidence_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1550,7 +1628,7 @@ fn baseline_contains_path(path: &Path, baseline_paths: &[PathBuf]) -> bool {
     })
 }
 
-fn worker_evidence_marker_path(result: &WorkerResult) -> Option<String> {
+pub(crate) fn worker_evidence_marker_path(result: &WorkerResult) -> Option<String> {
     let last_message_path = result.last_message_path.as_ref()?;
     let output = fs::read_to_string(last_message_path).ok()?;
     extract_worker_evidence_marker(&output)
@@ -2962,7 +3040,9 @@ fn start_command_backed_worker(
         command_timeout: if is_free_model(packet.worker_model.as_deref()) {
             None
         } else {
-            Some(Duration::from_secs(config.stale_task_timeout_secs.max(1) as u64))
+            Some(Duration::from_secs(
+                config.stale_task_timeout_secs.max(1) as u64
+            ))
         },
         worker_model: packet.worker_model.clone(),
         model_variant: packet.variant_applied.clone(),
@@ -3214,10 +3294,7 @@ impl CommandWorkerSessionHandle {
                 env.insert("GEARBOX_PRESERVED_XDG_CONFIG_HOME".to_string(), original);
             }
             env.insert("XDG_CONFIG_HOME".to_string(), omo_dir_path.clone());
-            env.insert(
-                "GEARBOX_WORKER_OMO_CONFIG_DIR".to_string(),
-                omo_dir_path,
-            );
+            env.insert("GEARBOX_WORKER_OMO_CONFIG_DIR".to_string(), omo_dir_path);
         }
         env.insert(
             "GEARBOX_WORKER_TOOL_POLICY".to_string(),
@@ -4300,7 +4377,8 @@ mod tests {
         let evidence_root = workspace.path().join(".gearbox-agent/evidence");
         fs::create_dir_all(&evidence_root)?;
         fs::write(evidence_root.join("old-receipt.md"), "previous\n")?;
-        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
 
         let receipt = evidence_root.join("new-receipt.md");
         fs::write(&receipt, "verified without marker\n")?;
@@ -4322,18 +4400,16 @@ mod tests {
         let workspace = tempfile::tempdir()?;
         let evidence_root = workspace.path().join(".gearbox-agent/evidence");
         fs::create_dir_all(&evidence_root)?;
-        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         let receipt = evidence_root.join("resident-receipt.md");
         fs::write(&receipt, "resident worker completed\n")?;
 
         let mut result = evidence_test_result(workspace.path().join("missing-message.md"));
         result.last_message_path = None;
-        let validated = validate_worker_evidence_receipt_with_baseline(
-            &result,
-            workspace.path(),
-            &baseline,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let validated =
+            validate_worker_evidence_receipt_with_baseline(&result, workspace.path(), &baseline)
+                .map_err(anyhow::Error::msg)?;
         assert_eq!(validated, receipt.canonicalize()?);
         Ok(())
     }
@@ -4345,7 +4421,8 @@ mod tests {
         fs::create_dir_all(&evidence_root)?;
         let receipt = evidence_root.join("old-receipt.md");
         fs::write(&receipt, "previous\n")?;
-        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         let message = workspace.path().join("last-message.md");
         fs::write(&message, "completed without an evidence marker\n")?;
 
@@ -4365,7 +4442,8 @@ mod tests {
         let workspace = tempfile::tempdir()?;
         let evidence_root = workspace.path().join(".gearbox-agent/evidence");
         fs::create_dir_all(&evidence_root)?;
-        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         fs::write(evidence_root.join("first.md"), "one\n")?;
         fs::write(evidence_root.join("second.md"), "two\n")?;
         let message = workspace.path().join("last-message.md");
@@ -4390,7 +4468,8 @@ mod tests {
         let workspace = tempfile::tempdir()?;
         let evidence_root = workspace.path().join(".gearbox-agent/evidence");
         fs::create_dir_all(&evidence_root)?;
-        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         let outside = workspace.path().join("outside.md");
         fs::write(&outside, "outside\n")?;
         symlink(&outside, evidence_root.join("link.md"))?;
@@ -4414,7 +4493,8 @@ mod tests {
         fs::create_dir_all(&evidence_root)?;
         let receipt = evidence_root.join("old-receipt.md");
         fs::write(&receipt, "previous\n")?;
-        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         let message = workspace.path().join("last-message.md");
         fs::write(
             &message,
@@ -8156,12 +8236,18 @@ esac
             obj.contains_key("team_mode"),
             "expected 'team_mode' in OMO plugin config"
         );
-        let team_mode = obj["team_mode"].as_object().expect("team_mode should be an object");
+        let team_mode = obj["team_mode"]
+            .as_object()
+            .expect("team_mode should be an object");
         assert_eq!(team_mode["enabled"], false);
         assert_eq!(team_mode["max_parallel_members"], 2);
-        let bg_task = obj["background_task"].as_object().expect("background_task should be an object");
+        let bg_task = obj["background_task"]
+            .as_object()
+            .expect("background_task should be an object");
         assert_eq!(bg_task["defaultConcurrency"], 2);
-        let disabled = obj["disabled_mcps"].as_array().expect("disabled_mcps should be an array");
+        let disabled = obj["disabled_mcps"]
+            .as_array()
+            .expect("disabled_mcps should be an array");
         assert!(disabled.is_empty(), "expected empty disabled_mcps");
         Ok(())
     }

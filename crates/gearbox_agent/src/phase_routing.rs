@@ -62,6 +62,7 @@ pub enum PhaseBackend {
     DirectModel,
     NativeZed,
     Worker(WorkerKind),
+    CodexAcp,
     LegacyCategory,
 }
 
@@ -152,6 +153,25 @@ impl OpenCodeModelProfiles {
             ModelSelectorId::from_qualified("opencode_session", model)
                 .map_err(|error| anyhow::anyhow!("OpenCode {role} model is invalid: {error}"))?;
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexAcpModelProfiles {
+    pub codex_planner: String,
+    pub opencode_executor: String,
+    pub codex_reviewer: String,
+}
+
+impl CodexAcpModelProfiles {
+    pub fn validate(&self) -> Result<()> {
+        ModelSelectorId::from_qualified("codex", &self.codex_planner)
+            .map_err(|error| anyhow::anyhow!("Codex ACP planner model is invalid: {error}"))?;
+        ModelSelectorId::from_qualified("opencode_session", &self.opencode_executor)
+            .map_err(|error| anyhow::anyhow!("Codex ACP executor model is invalid: {error}"))?;
+        ModelSelectorId::from_qualified("codex", &self.codex_reviewer)
+            .map_err(|error| anyhow::anyhow!("Codex ACP reviewer model is invalid: {error}"))?;
         Ok(())
     }
 }
@@ -309,6 +329,46 @@ impl PhaseRouteTable {
         Ok(table)
     }
 
+    /// Build a mixed route table where Codex ACP handles planning and review
+    /// phases while OpenCode session workers handle execution phases.
+    pub fn codex_acp_opencode(profiles: CodexAcpModelProfiles) -> Result<Self> {
+        profiles.validate()?;
+        let mut table = Self::legacy_defaults();
+        for profile in &mut table.profiles {
+            let (backend, model) = match profile.phase {
+                PhaseProfile::Planner | PhaseProfile::StrategistNextGoal => (
+                    PhaseBackend::CodexAcp,
+                    Some(profiles.codex_planner.as_str()),
+                ),
+                PhaseProfile::ExecutorQuick
+                | PhaseProfile::ExecutorDeep
+                | PhaseProfile::Summarizer => (
+                    PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                    Some(profiles.opencode_executor.as_str()),
+                ),
+                PhaseProfile::PlanCritic
+                | PhaseProfile::ReviewerTask
+                | PhaseProfile::ReviewerFinal => (
+                    PhaseBackend::CodexAcp,
+                    Some(profiles.codex_reviewer.as_str()),
+                ),
+                PhaseProfile::Orchestrator => (PhaseBackend::Deterministic, None),
+            };
+            let Some(model) = model else {
+                profile.source = PhaseRouteSource::BuiltIn;
+                continue;
+            };
+            profile.candidates = vec![PhaseRouteCandidate {
+                backend,
+                model: PhaseModelBinding::BackendDeclared(model.to_string()),
+                command: None,
+            }];
+            profile.source = PhaseRouteSource::BuiltIn;
+        }
+        table.validate()?;
+        Ok(table)
+    }
+
     pub fn legacy_defaults() -> Self {
         let profile = |phase,
                        category,
@@ -324,6 +384,7 @@ impl PhaseRouteTable {
                 }
                 PhaseBackend::Deterministic
                 | PhaseBackend::Worker(_)
+                | PhaseBackend::CodexAcp
                 | PhaseBackend::LegacyCategory => PhaseModelBinding::None,
             };
             PhaseRouteProfile {
@@ -527,6 +588,7 @@ impl PhaseRouteTable {
                     let worker_kind = match candidate.backend {
                         PhaseBackend::NativeZed => Some(WorkerKind::ZedAgent),
                         PhaseBackend::Worker(worker_kind) => Some(worker_kind),
+                        PhaseBackend::CodexAcp => Some(WorkerKind::Codex),
                         PhaseBackend::Deterministic
                         | PhaseBackend::DirectModel
                         | PhaseBackend::LegacyCategory => None,
@@ -652,6 +714,8 @@ impl PhaseRouteCandidate {
             {
                 Ok(())
             }
+            (PhaseBackend::CodexAcp, PhaseModelBinding::BackendDeclared(_))
+            | (PhaseBackend::CodexAcp, PhaseModelBinding::None) => Ok(()),
             _ => bail!(
                 "phase backend {:?} cannot use model binding {:?}",
                 self.backend,
@@ -715,6 +779,7 @@ impl PhaseRouteDecision {
         let expected_worker_kind = match self.candidate.backend {
             PhaseBackend::NativeZed => Some(WorkerKind::ZedAgent),
             PhaseBackend::Worker(worker_kind) => Some(worker_kind),
+            PhaseBackend::CodexAcp => Some(WorkerKind::Codex),
             PhaseBackend::Deterministic
             | PhaseBackend::DirectModel
             | PhaseBackend::LegacyCategory => None,
@@ -843,6 +908,59 @@ impl PhaseRouteDecision {
                 }];
                 overlay.require_worker = true;
                 overlay.default_worker_for_small_tasks = worker_kind;
+            }
+            PhaseBackend::CodexAcp => {
+                let declared_model = match &self.candidate.model {
+                    PhaseModelBinding::BackendDeclared(model) => Some(model.trim().to_string()),
+                    PhaseModelBinding::None => None,
+                    _ => bail!("codex ACP phase cannot apply a live model binding"),
+                };
+                let codex_kind = WorkerKind::Codex;
+                let configured_route = base
+                    .worker_routes
+                    .iter()
+                    .find(|route| route.worker_kind == codex_kind);
+                let worker_command = self
+                    .candidate
+                    .command
+                    .clone()
+                    .or_else(|| configured_route.and_then(|route| route.worker_command.clone()))
+                    .or_else(|| {
+                        (base.worker_kind == codex_kind)
+                            .then(|| base.worker_command.clone())
+                            .flatten()
+                    })
+                    .or_else(|| codex_kind.default_command(declared_model.as_deref()));
+                let worker_command = worker_command
+                    .map(|command| command.trim().to_string())
+                    .filter(|command| !command.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "phase {:?} codex ACP has no configured command",
+                            self.phase,
+                        )
+                    })?;
+                if worker_model_is_unavailable(
+                    codex_kind,
+                    declared_model.as_deref(),
+                    &base.unavailable_worker_models,
+                ) {
+                    bail!(
+                        "phase {:?} codex ACP declared model `{}` is unavailable",
+                        self.phase,
+                        declared_model.as_deref().unwrap_or("none")
+                    );
+                }
+                overlay.worker_kind = codex_kind;
+                overlay.worker_command = Some(worker_command.clone());
+                overlay.worker_model = declared_model.clone();
+                overlay.worker_routes = vec![WorkerRoute {
+                    worker_kind: codex_kind,
+                    worker_command: Some(worker_command),
+                    worker_model: declared_model,
+                }];
+                overlay.require_worker = true;
+                overlay.default_worker_for_small_tasks = codex_kind;
             }
             PhaseBackend::Deterministic | PhaseBackend::DirectModel => {
                 bail!(
@@ -1005,14 +1123,17 @@ impl PhaseRouteReceipt {
                     bail!("native Zed phase receipt actual model does not match its route");
                 }
             }
-            (PhaseBackend::Worker(_), PhaseModelBinding::BackendDeclared(model)) => {
+            (
+                PhaseBackend::Worker(_) | PhaseBackend::CodexAcp,
+                PhaseModelBinding::BackendDeclared(model),
+            ) => {
                 self.require_status(ModelBindingStatus::DeclaredUnverified)?;
                 self.require_no_applied_model()?;
                 if self.actual_worker_model.as_deref() != Some(model.as_str()) {
                     bail!("command phase receipt actual model does not match its declaration");
                 }
             }
-            (PhaseBackend::Worker(_), PhaseModelBinding::None) => {
+            (PhaseBackend::Worker(_) | PhaseBackend::CodexAcp, PhaseModelBinding::None) => {
                 self.require_status(ModelBindingStatus::LegacyUnverified)?;
                 self.require_no_applied_model()?;
                 if self.actual_worker_model.is_some() {
@@ -1558,5 +1679,286 @@ mod tests {
         })
         .expect_err("an unqualified OpenCode model must be rejected");
         assert!(error.to_string().contains("planner"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex ACP phase backend tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn codex_acp_table_defines_every_phase_with_mixed_backends() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-planner".to_string(),
+            opencode_executor: "deepseek/flash".to_string(),
+            codex_reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+
+        table.validate()?;
+        assert_eq!(table.profiles.len(), ALL_PHASE_PROFILES.len());
+
+        for phase in [
+            PhaseProfile::Planner,
+            PhaseProfile::PlanCritic,
+            PhaseProfile::ReviewerTask,
+            PhaseProfile::ReviewerFinal,
+            PhaseProfile::StrategistNextGoal,
+        ] {
+            let profile = table.profile(&phase)?;
+            assert_eq!(
+                profile.candidates[0].backend,
+                PhaseBackend::CodexAcp,
+                "{:?} must use CodexAcp backend",
+                phase
+            );
+        }
+
+        for phase in [
+            PhaseProfile::ExecutorQuick,
+            PhaseProfile::ExecutorDeep,
+            PhaseProfile::Summarizer,
+        ] {
+            let profile = table.profile(&phase)?;
+            assert_eq!(
+                profile.candidates[0].backend,
+                PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                "{:?} must use OpencodeSession backend",
+                phase
+            );
+        }
+
+        assert_eq!(
+            table.profile(&PhaseProfile::Orchestrator)?.candidates[0].backend,
+            PhaseBackend::Deterministic
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_route_resolves_planner_to_codex_backend() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        assert_eq!(decision.worker_kind, Some(WorkerKind::Codex));
+        assert_eq!(decision.candidate.backend, PhaseBackend::CodexAcp);
+        assert_eq!(
+            decision.candidate.model,
+            PhaseModelBinding::BackendDeclared("openai/gpt-4".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_route_resolves_executor_to_opencode_session() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+
+        let decision = table.resolve(
+            &PhaseProfile::ExecutorQuick,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(decision.worker_kind, Some(WorkerKind::OpencodeSession));
+        assert_eq!(
+            decision.candidate.backend,
+            PhaseBackend::Worker(WorkerKind::OpencodeSession)
+        );
+        assert_eq!(
+            decision.candidate.model,
+            PhaseModelBinding::BackendDeclared("deepseek/v3".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_route_resolves_reviewer_to_codex_backend() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+
+        let decision = table.resolve(
+            &PhaseProfile::PlanCritic,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(decision.worker_kind, Some(WorkerKind::Codex));
+        assert_eq!(decision.candidate.backend, PhaseBackend::CodexAcp);
+        assert_eq!(
+            decision.candidate.model,
+            PhaseModelBinding::BackendDeclared("openai/gpt-4-turbo".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_receipt_validates_with_declared_unverified_binding() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let decision_hash = decision.hash()?;
+        let receipt = PhaseRouteReceipt {
+            decision,
+            ordinal: 101,
+            plan_revision: 0,
+            decision_hash,
+            goal_id: Some("goal_codex".to_string()),
+            plan_id: None,
+            plan_hash: None,
+            task_id: Some("task_plan".to_string()),
+            worker_session_id: None,
+            applied_model: None,
+            actual_worker_kind: Some(WorkerKind::Codex),
+            actual_category: Some(WorkerCategory::Deep),
+            actual_worker_model: Some("openai/gpt-4".to_string()),
+            actual_route_reason: Some("codex acp planner".to_string()),
+            task_record_path: Some("task-record.json".to_string()),
+            task_record_sha256: Some("0".repeat(64)),
+            binding_status: ModelBindingStatus::DeclaredUnverified,
+            receipt_hash: String::new(),
+        }
+        .seal()?;
+        receipt.validate()?;
+        assert_eq!(
+            receipt.binding_status,
+            ModelBindingStatus::DeclaredUnverified
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_receipt_rejects_applied_model() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let decision_hash = decision.hash()?;
+        let mut receipt = PhaseRouteReceipt {
+            decision,
+            ordinal: 201,
+            plan_revision: 0,
+            decision_hash,
+            goal_id: Some("goal_codex".to_string()),
+            plan_id: None,
+            plan_hash: None,
+            task_id: Some("task_plan".to_string()),
+            worker_session_id: None,
+            applied_model: Some(live_model("openai/gpt-4")?),
+            actual_worker_kind: Some(WorkerKind::Codex),
+            actual_category: Some(WorkerCategory::Deep),
+            actual_worker_model: Some("openai/gpt-4".to_string()),
+            actual_route_reason: Some("codex acp planner".to_string()),
+            task_record_path: Some("task-record.json".to_string()),
+            task_record_sha256: Some("0".repeat(64)),
+            binding_status: ModelBindingStatus::DeclaredUnverified,
+            receipt_hash: String::new(),
+        };
+        assert!(receipt.clone().seal().is_err());
+        receipt.binding_status = ModelBindingStatus::Applied;
+        assert!(receipt.seal().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_overlay_produces_codex_worker_config() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let base = WorkerConfig::default();
+        let overlay = decision.overlay_worker_config(&base)?;
+        assert_eq!(overlay.worker_kind, WorkerKind::Codex);
+        assert_eq!(overlay.worker_model.as_deref(), Some("openai/gpt-4"));
+        assert_eq!(base.worker_kind, WorkerKind::Opencode);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_requires_qualified_codex_models() {
+        let error = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "unqualified".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })
+        .expect_err("unqualified Codex model must be rejected");
+        assert!(error.to_string().contains("planner"));
+    }
+
+    #[test]
+    fn codex_acp_router_independent_backends_per_phase() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "anthropic/claude-opus".to_string(),
+        })?;
+
+        let planner =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let executor = table.resolve(
+            &PhaseProfile::ExecutorQuick,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        let reviewer = table.resolve(
+            &PhaseProfile::ReviewerFinal,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+
+        // Verify three different phase backends
+        assert_eq!(planner.worker_kind, Some(WorkerKind::Codex));
+        assert_eq!(executor.worker_kind, Some(WorkerKind::OpencodeSession));
+        assert_eq!(reviewer.worker_kind, Some(WorkerKind::Codex));
+
+        // Verify different models
+        assert_eq!(
+            planner.candidate.model,
+            PhaseModelBinding::BackendDeclared("openai/gpt-4".to_string())
+        );
+        assert_eq!(
+            executor.candidate.model,
+            PhaseModelBinding::BackendDeclared("deepseek/v3".to_string())
+        );
+        assert_eq!(
+            reviewer.candidate.model,
+            PhaseModelBinding::BackendDeclared("anthropic/claude-opus".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_fails_closed_when_model_in_unavailable_list() -> Result<()> {
+        let table = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-4".to_string(),
+            opencode_executor: "deepseek/v3".to_string(),
+            codex_reviewer: "openai/gpt-4-turbo".to_string(),
+        })?;
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let mut base = WorkerConfig::default();
+        base.unavailable_worker_models = vec!["openai/gpt-4".to_string()];
+        let error = decision
+            .overlay_worker_config(&base)
+            .expect_err("unavailable model must fail closed");
+        assert!(error.to_string().contains("unavailable"));
+        Ok(())
     }
 }

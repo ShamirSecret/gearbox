@@ -19,10 +19,9 @@ use crate::state::{
 use crate::tools::CancellationToken;
 use crate::worker_broker::WorkerBroker;
 use crate::workers::{
-    is_free_model, WorkerCategory, WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome,
-    WorkerRegistry,
+    WorkerCategory, WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome, WorkerRegistry,
     WorkerResult, WorkerSessionHandle, WorkerStartRequest, WorkerStatus, WorkerSubscription,
-    category_requires_worker_evidence, discard_resident_session_for_model_switch,
+    category_requires_worker_evidence, discard_resident_session_for_model_switch, is_free_model,
     provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
     snapshot_worker_evidence_paths, validate_worker_evidence_receipt_with_baseline,
     worker_kind_supports_evidence_contract, worker_model_is_unavailable,
@@ -266,7 +265,7 @@ pub enum TaskFailureKind {
 
 const WORKER_EVIDENCE_RETRY_PREFIX: &str = "worker evidence gate:";
 pub(crate) const MAX_WORKER_EVIDENCE_ATTEMPTS: usize = 2;
-const WORKER_EVIDENCE_REPAIR_PROMPT: &str = "Gear evidence gate repair: inspect the work you just performed, run the relevant verification, write a non-empty regular receipt file under .gearbox-agent/evidence/, and end the worker response with EVIDENCE_RECORDED: <path>. Do not claim completion until that receipt exists.";
+const WORKER_EVIDENCE_REPAIR_PROMPT: &str = "Gear evidence gate repair: inspect the work you just performed, run the relevant verification, write a non-empty regular receipt file under .gear/evidence/, and end the worker response with EVIDENCE_RECORDED: <path>. Do not claim completion until that receipt exists.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskAttempt {
@@ -2738,8 +2737,7 @@ impl TaskManager {
                 // may not be populated when the sweep runs.
                 let task_id = task_id.as_str();
                 if is_free_model(
-                    self
-                        .records
+                    self.records
                         .get(task_id)
                         .and_then(|record| record.worker_model.as_deref())
                         .or_else(|| running_task.queued_task.config.worker_model.as_deref())
@@ -5849,7 +5847,7 @@ fn write_worker_evidence_gate_artifact(
         "task_id": task_id,
         "attempt": attempt,
         "status": status,
-        "evidence_root": ".gearbox-agent/evidence",
+        "evidence_root": ".gear/evidence",
         "receipt_path": receipt_path.map(|path| path.to_string_lossy().into_owned()),
         "reason": reason,
     });
@@ -7577,8 +7575,8 @@ mod tests {
         let old_receipt = evidence_root.join("receipt.md");
         fs::write(&old_receipt, "verified by prior attempt\n")?;
 
-        let baseline = snapshot_worker_evidence_paths(workspace.path())
-            .map_err(anyhow::Error::msg)?;
+        let baseline =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         assert_eq!(baseline.len(), 1, "baseline must contain the prior receipt");
 
         let message = workspace.path().join("last-message.md");
@@ -7604,9 +7602,7 @@ mod tests {
             workspace.path(),
             &baseline,
         )
-        .expect_err(
-            "a receipt from a prior attempt must not satisfy a later evidence gate",
-        );
+        .expect_err("a receipt from a prior attempt must not satisfy a later evidence gate");
 
         assert!(
             error.contains("present before this worker attempt"),
@@ -7618,8 +7614,8 @@ mod tests {
         let new_receipt = evidence_root.join("new-receipt.md");
         fs::write(&new_receipt, "verified by new attempt\n")?;
 
-        let snapshot_after = snapshot_worker_evidence_paths(workspace.path())
-            .map_err(anyhow::Error::msg)?;
+        let snapshot_after =
+            snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
         assert_eq!(
             snapshot_after.len(),
             2,

@@ -2,6 +2,7 @@ use crate::state::{Scope, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, t
 use crate::workers::WorkerKind;
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 
@@ -35,14 +36,14 @@ pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
     "test": {
       "strategy": "tests_after",
       "red": null,
-      "green": [{"command": "cargo test", "expected_observation": "tests pass", "evidence_path": ".gearbox-agent/artifacts/green.log"}],
+      "green": [{"command": "cargo test", "expected_observation": "tests pass", "evidence_path": ".gear/artifacts/green.log"}],
       "no_test_reason": null
     },
     "qa": {
-      "happy_path": [{"name": "happy", "steps": ["run the verification"], "expected_result": "behavior is present", "evidence_path": ".gearbox-agent/artifacts/qa.log"}],
-      "failure_path": [{"name": "failure", "steps": ["capture the failure"], "expected_result": "failure is diagnosable", "evidence_path": ".gearbox-agent/artifacts/qa.log"}]
+      "happy_path": [{"name": "happy", "steps": ["run the verification"], "expected_result": "behavior is present", "evidence_path": ".gear/artifacts/qa.log"}],
+      "failure_path": [{"name": "failure", "steps": ["capture the failure"], "expected_result": "failure is diagnosable", "evidence_path": ".gear/artifacts/qa.log"}]
     },
-    "artifacts": [{"path": ".gearbox-agent/artifacts/final-report.md", "description": "verification report", "required": true}],
+    "artifacts": [{"path": ".gear/artifacts/final-report.md", "description": "verification report", "required": true}],
     "commit_boundary": "no_commit",
     "completion_predicates": ["verification evidence exists"]
   }],
@@ -731,7 +732,7 @@ pub fn deterministic_fallback_draft(
                 .map(|command| CommandExpectation {
                     command: command.clone(),
                     expected_observation: "command exits successfully".to_string(),
-                    evidence_path: ".gearbox-agent/artifacts/verification.md".to_string(),
+                    evidence_path: ".gear/artifacts/verification.md".to_string(),
                 })
                 .collect(),
             no_test_reason: None,
@@ -775,18 +776,18 @@ pub fn deterministic_fallback_draft(
                     ],
                     expected_result: "The requested behavior is present and inspectable."
                         .to_string(),
-                    evidence_path: ".gearbox-agent/artifacts/verification.md".to_string(),
+                    evidence_path: ".gear/artifacts/verification.md".to_string(),
                 }],
                 failure_path: vec![QaScenario {
                     name: "verification failure".to_string(),
                     steps: vec!["Capture the failing command and root-cause evidence.".to_string()],
                     expected_result: "The task remains incomplete with an explicit repair request."
                         .to_string(),
-                    evidence_path: ".gearbox-agent/artifacts/verification.md".to_string(),
+                    evidence_path: ".gear/artifacts/verification.md".to_string(),
                 }],
             },
             artifacts: vec![PlanArtifactContract {
-                path: ".gearbox-agent/artifacts/final-report.md".to_string(),
+                path: ".gear/artifacts/final-report.md".to_string(),
                 description: "Final implementation and verification report.".to_string(),
                 required: true,
             }],
@@ -810,6 +811,40 @@ pub fn parse_planner_draft(output: &str) -> Result<PlanGraphDraft> {
             serde_json::to_string(&diagnostic).unwrap_or_else(|_| diagnostic.message.clone())
         )
     })
+}
+
+/// Accept a planner response that omitted only the top-level objective.
+/// Models often preserve every task contract but drop this redundant field;
+/// the runtime already owns the canonical objective, so restoring it here
+/// keeps strict nested-schema validation without flattening the task graph.
+pub fn parse_planner_draft_with_objective(output: &str, objective: &str) -> Result<PlanGraphDraft> {
+    match parse_planner_draft(output) {
+        Ok(draft) => Ok(draft),
+        Err(original) => {
+            let trimmed = output.trim();
+            let json = if let Some(rest) = trimmed.strip_prefix("```json") {
+                rest.strip_suffix("```").unwrap_or(rest).trim()
+            } else if let Some(rest) = trimmed.strip_prefix("```") {
+                rest.strip_suffix("```").unwrap_or(rest).trim()
+            } else {
+                trimmed
+            };
+            let json = json.find('{').map(|index| &json[index..]).unwrap_or(json);
+            let mut value: Value =
+                serde_json::from_str(json).with_context(|| original.to_string())?;
+            let object = value
+                .as_object_mut()
+                .context("planner response is not a JSON object")?;
+            if object.contains_key("objective") {
+                return Err(original);
+            }
+            object.insert(
+                "objective".to_string(),
+                Value::String(objective.to_string()),
+            );
+            serde_json::from_value(value).with_context(|| original.to_string())
+        }
+    }
 }
 
 pub fn parse_planner_draft_diagnostic(
@@ -933,6 +968,18 @@ fn validate_wave_write_scopes(tasks: &[PlanTaskContract]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_parser_restores_missing_objective_without_flattening_tasks() {
+        let mut value: Value = serde_json::from_str(PLAN_GRAPH_SCHEMA_EXEMPLAR).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("objective");
+        let raw = serde_json::to_string(&value).unwrap();
+        let draft = parse_planner_draft_with_objective(&raw, "canonical objective").unwrap();
+        assert_eq!(draft.objective, "canonical objective");
+        assert_eq!(draft.tasks.len(), 1);
+        assert_eq!(draft.tasks[0].task_id, "task_a");
+    }
 
     fn valid_draft() -> PlanGraphDraft {
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);

@@ -108,8 +108,11 @@ pub fn compute_baseline_aware_scope(
     scope: &Scope,
 ) -> (ScopeCheck, ScopeDrift) {
     // Build a set of files that were already changed before the worker started.
-    let baseline_set: HashSet<&str> =
-        before_diff.changed_files.iter().map(String::as_str).collect();
+    let baseline_set: HashSet<&str> = before_diff
+        .changed_files
+        .iter()
+        .map(String::as_str)
+        .collect();
 
     // Forbidden touches checked against ALL files (hard boundary).
     let forbidden_touches: Vec<String> = after_diff
@@ -315,7 +318,7 @@ fn acquire_rust_command_lease(
     timeout: Option<Duration>,
     started_at: Instant,
 ) -> Result<RustCommandLease> {
-    let lock_directory = workspace.join(".gearbox-agent").join("locks");
+    let lock_directory = workspace.join(".gear").join("locks");
     fs::create_dir_all(&lock_directory).with_context(|| {
         format!(
             "failed to create Rust command lock directory {}",
@@ -558,7 +561,8 @@ fn parse_status_paths(status: &str) -> Vec<String> {
                 .map(str::trim)
                 .unwrap_or(path)
                 .trim_matches('"');
-            if path.is_empty() || path.starts_with(".gearbox-agent/") {
+            if path.is_empty() || path.starts_with(".gear/") || path.starts_with(".gearbox-agent/")
+            {
                 None
             } else {
                 Some(path.to_string())
@@ -636,7 +640,7 @@ fn signal_command_process_group(process_group: libc::pid_t, signal: libc::c_int)
 }
 
 fn command_output_path(workspace: &Path, stream: &str) -> Result<PathBuf> {
-    let output_dir = workspace.join(".gearbox-agent").join("tmp");
+    let output_dir = workspace.join(".gear").join("tmp");
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let sequence = COMMAND_OUTPUT_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -766,10 +770,7 @@ mod tests {
         let before = DiffSnapshot {
             is_git_repo: true,
             status: String::new(),
-            changed_files: vec![
-                "Cargo.lock".to_string(),
-                "README.md".to_string(),
-            ],
+            changed_files: vec!["Cargo.lock".to_string(), "README.md".to_string()],
             diff_hash: None,
         };
         let after = DiffSnapshot {
@@ -845,21 +846,17 @@ mod tests {
         let after = DiffSnapshot {
             is_git_repo: true,
             status: String::new(),
-            changed_files: vec![
-                "src/lib.rs".to_string(),
-                ".omo/config.json".to_string(),
-            ],
+            changed_files: vec!["src/lib.rs".to_string(), ".omo/config.json".to_string()],
             diff_hash: None,
         };
-        let scope = Scope::new(
-            vec!["src".to_string()],
-            vec![".omo".to_string()],
-            10,
-        );
+        let scope = Scope::new(vec!["src".to_string()], vec![".omo".to_string()], 10);
         let (check, _) = compute_baseline_aware_scope(&before, &after, &scope);
 
         // .omo/config.json is a forbidden path touch (hard boundary).
-        assert_eq!(check.forbidden_touches, vec![".omo/config.json".to_string()]);
+        assert_eq!(
+            check.forbidden_touches,
+            vec![".omo/config.json".to_string()]
+        );
         // outside_allowed_paths should NOT include baseline file src/lib.rs.
         assert!(check.outside_allowed_paths.is_empty());
     }
@@ -1002,7 +999,7 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
-        let lock_directory = temp_dir.path().join(".gearbox-agent").join("locks");
+        let lock_directory = temp_dir.path().join(".gear").join("locks");
         fs::create_dir_all(&lock_directory).expect("failed to create lock directory");
         let lock_file = fs::OpenOptions::new()
             .create(true)

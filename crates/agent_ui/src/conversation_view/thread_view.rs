@@ -3730,6 +3730,45 @@ impl ThreadView {
                                     .color(Color::Muted),
                             )
                         })
+                        .when(!runtime_snapshot.plan_tasks.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .p_2()
+                                    .gap_0p5()
+                                    .border_b_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .child(
+                                        Label::new(format!(
+                                            "Work Orders · {} · runtime dependency order",
+                                            runtime_snapshot.plan_tasks.len()
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                    .children(runtime_snapshot.plan_tasks.iter().map(|task| {
+                                        let marker = if task.current { "▶" } else { "·" };
+                                        let dependencies = if task.dependencies.is_empty() {
+                                            "none".to_string()
+                                        } else {
+                                            task.dependencies.join(", ")
+                                        };
+                                        Label::new(format!(
+                                            "{marker} [{}] {} · wave {} · deps {} · {}",
+                                            task.status,
+                                            task.task_id,
+                                            task.parallel_wave,
+                                            dependencies,
+                                            task.title
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        .color(if task.current {
+                                            Color::Accent
+                                        } else {
+                                            Color::Muted
+                                        })
+                                    })),
+                            )
+                        })
                         .child(
                             Label::new(format!(
                                 "Health activity {} · children {} · rust {} · telemetry dropped/coalesced {}/{}{}",

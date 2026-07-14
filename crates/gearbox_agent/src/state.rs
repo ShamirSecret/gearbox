@@ -273,7 +273,7 @@ pub struct ContinuationResumeDecision {
 }
 
 /// Gear-owned work lineage that tracks the hierarchy of related sessions.
-/// Written to `.gearbox-agent/continuation/<root-session>/lineage.json`.
+/// Written to `.gear/continuation/<root-session>/lineage.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkLineage {
     /// Root orchestrator session that started this work tree.
@@ -3645,12 +3645,25 @@ pub struct StateStore {
 impl StateStore {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
-            root: workspace.into().join(".gearbox-agent"),
+            root: workspace.into().join(".gear"),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The pre-`.gear` runtime root remains available for explicit migration
+    /// and forensic inspection. New state is always written under `.gear`.
+    pub fn legacy_root(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".gearbox-agent")
+    }
+
+    pub fn has_legacy_root(&self) -> bool {
+        self.legacy_root().exists()
     }
 
     pub fn initialize(&self) -> Result<()> {
@@ -4296,7 +4309,7 @@ impl StateStore {
         )?))
     }
 
-    /// Per-session continuation state path: `.gearbox-agent/continuation/{session_id}/state.json`
+    /// Per-session continuation state path: `.gear/continuation/{session_id}/state.json`
     pub fn continuation_state_path_for_session(&self, session_id: &str) -> PathBuf {
         self.continuation_dir().join(session_id).join("state.json")
     }

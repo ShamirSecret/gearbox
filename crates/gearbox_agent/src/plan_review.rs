@@ -1,4 +1,4 @@
-use crate::plan_graph::{PlanGraph, PlanSource, TestStrategy, parse_planner_draft};
+use crate::plan_graph::{PlanGraph, PlanSource, TestStrategy, parse_planner_draft_with_objective};
 use anyhow::{Context as _, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -447,7 +447,7 @@ impl PlannerExecutionReceipt {
             }
         }
 
-        let parsed = parse_planner_draft(raw_output)
+        let parsed = parse_planner_draft_with_objective(raw_output, &plan.draft.objective)
             .context("planner receipt raw output is not a PlanGraphDraft")?;
         if parsed != plan.draft {
             bail!("planner receipt raw output does not match the sealed PlanGraph draft");
