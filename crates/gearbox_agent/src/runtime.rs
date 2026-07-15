@@ -6953,6 +6953,8 @@ fn build_approved_plan_graph_inner(
             .model_id
             .clone()
             .context("planner hook is missing model identity")?;
+        let original_planner_raw_output = submission.raw_output.clone();
+        let mut planner_raw_output = submission.raw_output;
         let mut draft = submission.draft;
         let normalized_step_evidence = draft
             .tasks
@@ -6980,6 +6982,17 @@ fn build_approved_plan_graph_inner(
                     }))?
                 ),
             )?;
+            store.write_plan_review_text(
+                &goal.id,
+                1,
+                "planner-model-raw-output",
+                &original_planner_raw_output,
+            )?;
+            // PlannerReceipt is bound to the sealed PlanGraph. Once a soft
+            // schema omission has been normalized, seal the canonical draft
+            // while retaining the model's original response as a separate
+            // audit artifact above.
+            planner_raw_output = serde_json::to_string(&draft)?;
         }
         validate_planner_draft(&goal.id, &draft)?;
         let plan = PlanGraph::seal(
@@ -6993,10 +7006,10 @@ fn build_approved_plan_graph_inner(
             }),
             draft,
         )?;
-        goal.coordinator_brief = Some(submission.raw_output.clone());
+        goal.coordinator_brief = Some(original_planner_raw_output);
         (
             plan,
-            submission.raw_output,
+            planner_raw_output,
             submission.planner,
             submission.artifact_path,
             submission.repository_evidence_path,
