@@ -2630,8 +2630,119 @@ fn review_summary(
         oracle_revision_instructions,
         critic_decision,
         oracle_decision,
-        blockers: repository_observation_review_blockers(bundle.as_ref()),
+        blockers: {
+            let mut blockers = repository_observation_review_blockers_for_plan(
+                store,
+                &goal.id,
+                plan,
+                bundle.as_ref(),
+            );
+            blockers.extend(phase_degraded_review_blockers(store, &goal.id));
+            blockers.truncate(8);
+            blockers
+        },
     })
+}
+
+fn phase_degraded_review_blockers(store: &StateStore, goal_id: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(store.artifact_dir(goal_id)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if (!name.contains("degraded") && !name.contains("normalized"))
+                || !name.ends_with(".json")
+            {
+                return None;
+            }
+            let contents = fs::read_to_string(&path).ok()?;
+            let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+            let status = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("degraded");
+            let reason = value
+                .get("reason")
+                .or_else(|| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("model output was normalized or deferred");
+            Some(format!(
+                "phase degraded · {} · {} · {}",
+                name,
+                status,
+                reason.chars().take(240).collect::<String>()
+            ))
+        })
+        .take(8)
+        .collect()
+}
+
+fn repository_observation_review_blockers_for_plan(
+    store: &StateStore,
+    goal_id: &str,
+    plan: Option<&PlanGraph>,
+    bundle: Option<&ReviewEpochBundle>,
+) -> Vec<String> {
+    let mut blockers = repository_observation_review_blockers(bundle);
+    if bundle.is_some() {
+        return blockers;
+    }
+    let Some(plan) = plan else {
+        return blockers;
+    };
+    let prefix = format!("revision-{:03}-", plan.revision);
+    let Ok(entries) = fs::read_dir(store.plan_review_dir(goal_id)) else {
+        return blockers;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with("-repository-observation.json") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            blockers.push(format!(
+                "repository observation unavailable · {}",
+                path.display()
+            ));
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_str::<RepositoryObservationReceipt>(&contents) else {
+            blockers.push(format!("repository observation invalid · {}", path.display()));
+            continue;
+        };
+        if receipt.goal_id != goal_id
+            || receipt.plan_id != plan.plan_id
+            || receipt.plan_revision != plan.revision
+            || receipt.plan_hash != plan.plan_hash
+        {
+            continue;
+        }
+        if let Err(error) = receipt.validate() {
+            blockers.push(format!(
+                "{} repository observation invalid · {} · {}",
+                receipt.role,
+                path.display(),
+                error
+            ));
+        } else if receipt.status == RepositoryObservationStatus::Unverified {
+            blockers.push(format!(
+                "{} repository observation unverified · {}",
+                receipt.role,
+                path.display()
+            ));
+        }
+        if blockers.len() >= 8 {
+            break;
+        }
+    }
+    blockers.truncate(8);
+    blockers
 }
 
 fn repository_observation_review_blockers(bundle: Option<&ReviewEpochBundle>) -> Vec<String> {
@@ -3367,6 +3478,45 @@ mod tests {
         assert!(blockers
             .iter()
             .all(|blocker| blocker.contains("repository observation unverified")));
+        Ok(())
+    }
+
+    #[test]
+    fn review_projection_exposes_unverified_observation_before_bundle() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = StateStore::new(root.path());
+        store.initialize()?;
+        let scope = crate::state::Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let plan = crate::plan_graph::PlanGraph::seal(
+            "goal-review-before-bundle",
+            1,
+            crate::plan_graph::PlanSource::DeterministicFallback,
+            None,
+            crate::plan_graph::deterministic_fallback_draft("blocker", &scope, &[]),
+        )?;
+        let observation = RepositoryObservationReceipt::seal(
+            "plan_critic",
+            "goal-review-before-bundle",
+            &plan.plan_id,
+            plan.revision,
+            &plan.plan_hash,
+            "critic-task",
+            "critic-session",
+            None,
+            1,
+            vec![".".to_string()],
+            Vec::new(),
+        )?;
+        store.write_repository_observation_receipt(&observation)?;
+
+        let blockers = repository_observation_review_blockers_for_plan(
+            &store,
+            "goal-review-before-bundle",
+            Some(&plan),
+            None,
+        );
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("repository observation unverified"));
         Ok(())
     }
 

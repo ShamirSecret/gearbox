@@ -145,9 +145,10 @@ pub fn compute_baseline_aware_scope(
             .iter()
             .filter(|path| !forbidden_set.contains(*path))
             .filter(|path| {
-                !scope.allowed_paths.iter().any(|allowed_path| {
-                    *path == &allowed_path || path.starts_with(&format!("{allowed_path}/"))
-                })
+                !scope
+                    .allowed_paths
+                    .iter()
+                    .any(|allowed_path| path_is_within_allowed_scope(path, allowed_path))
             })
             .map(ToString::to_string)
             .collect()
@@ -191,6 +192,14 @@ pub fn compute_baseline_aware_scope(
     };
 
     (scope_check, drift)
+}
+
+fn path_is_within_allowed_scope(path: &str, allowed_path: &str) -> bool {
+    let normalized_allowed_path = allowed_path.trim_end_matches('/');
+    normalized_allowed_path.is_empty()
+        || normalized_allowed_path == "."
+        || path == normalized_allowed_path
+        || path.starts_with(&format!("{normalized_allowed_path}/"))
 }
 
 pub fn run_shell_command(workspace: &Path, command: &str) -> Result<ShellCommandResult> {
@@ -513,9 +522,10 @@ pub fn check_scope(snapshot: &DiffSnapshot, scope: &Scope) -> ScopeCheck {
             .changed_files
             .iter()
             .filter(|path| {
-                !scope.allowed_paths.iter().any(|allowed_path| {
-                    path == &allowed_path || path.starts_with(&format!("{allowed_path}/"))
-                })
+                !scope
+                    .allowed_paths
+                    .iter()
+                    .any(|allowed_path| path_is_within_allowed_scope(path, allowed_path))
             })
             .cloned()
             .collect()
@@ -763,6 +773,22 @@ mod tests {
         let check = check_scope(&snapshot, &scope);
 
         assert_eq!(check.outside_allowed_paths, vec!["README.md".to_string()]);
+    }
+
+    #[test]
+    fn allowed_dot_scope_includes_workspace_root_and_runtime_artifacts() {
+        let snapshot = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["LIVE_MARKER.txt".to_string(), ".gear/events/run.json".to_string()],
+            diff_hash: None,
+        };
+        let scope = Scope::new(vec![".".to_string()], vec![".omo".to_string()], 10);
+
+        let check = check_scope(&snapshot, &scope);
+
+        assert!(check.outside_allowed_paths.is_empty());
+        assert!(check.forbidden_touches.is_empty());
     }
 
     #[test]

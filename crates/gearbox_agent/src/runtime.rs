@@ -20,7 +20,8 @@ use crate::phase_routing::{
 };
 use crate::plan_graph::{
     CommitBoundary, PhaseProfile, PlanGraph, PlanGraphDraft, PlanSource, PlannerReceipt,
-    deterministic_fallback_draft, parse_planner_draft_with_objective, validate_planner_draft,
+    TaskRiskTier, TaskSizeTier, deterministic_fallback_draft, parse_planner_draft_with_objective,
+    validate_planner_draft,
 };
 use crate::plan_review::{
     IntentFoldDecision, IntentFoldReceipt, IntentFoldVerdict, PhaseExecutionBackend,
@@ -6627,14 +6628,78 @@ fn run_strategist_next_goal(
         budget_reservation.as_deref(),
         phase_key,
     )?;
-    let submission = submission_result?;
-    let parsed = StrategistNextGoalVerdict::parse(&submission.raw_output)?;
+    let submission = match submission_result {
+        Ok(submission) => submission,
+        Err(error) => {
+            // A malformed or drifting strategist response must not turn an
+            // otherwise settled epoch into a failed objective. Persist the
+            // diagnostic and let the next resume/epoch retry with a fresh
+            // strategist identity. Identity, scope and evidence checks below
+            // remain hard gates when a verdict is available.
+            let artifact = json!({
+                "schema_version": 1,
+                "phase": "strategist_next_goal",
+                "goal_id": goal.id,
+                "epoch_id": epoch_id,
+                "status": "schema_degraded",
+                "error": error.to_string(),
+                "retryable": true,
+                "issued_at": timestamp(),
+            });
+            store.write_artifact(
+                &goal.id,
+                "strategist-next-goal-degraded.json",
+                &format!("{artifact}\n"),
+            )?;
+            return Ok(None);
+        }
+    };
+    let parsed = match StrategistNextGoalVerdict::parse(&submission.raw_output) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let artifact = json!({
+                "schema_version": 1,
+                "phase": "strategist_next_goal",
+                "goal_id": goal.id,
+                "epoch_id": epoch_id,
+                "status": "schema_degraded",
+                "error": error.to_string(),
+                "raw_output_sha256": format!("{:x}", Sha256::digest(submission.raw_output.as_bytes())),
+                "artifact_path": submission.artifact_path,
+                "retryable": true,
+                "issued_at": timestamp(),
+            });
+            store.write_artifact(
+                &goal.id,
+                "strategist-next-goal-degraded.json",
+                &format!("{artifact}\n"),
+            )?;
+            return Ok(None);
+        }
+    };
     if parsed != submission.verdict {
         bail!("strategist raw output does not match its typed verdict");
     }
-    submission
-        .verdict
-        .validate(&goal.id, epoch_id, &goal.status)?;
+    if let Err(error) = submission.verdict.validate(&goal.id, epoch_id, &goal.status) {
+        let artifact = json!({
+            "schema_version": 1,
+            "phase": "strategist_next_goal",
+            "goal_id": goal.id,
+            "epoch_id": epoch_id,
+            "status": "semantic_degraded",
+            "error": error.to_string(),
+            "raw_output_sha256": format!("{:x}", Sha256::digest(submission.raw_output.as_bytes())),
+            "artifact_path": submission.artifact_path,
+            "retryable": true,
+            "issued_at": timestamp(),
+        });
+        store.write_artifact(
+            &goal.id,
+            "strategist-next-goal-degraded.json",
+            &format!("{artifact}\n"),
+        )?;
+        return Ok(None);
+    }
     validate_phase_execution_identity(&route_decision, &submission.strategist)?;
     if prior_execution_ids.iter().any(|prior| {
         prior == &submission.strategist.execution_id
@@ -6888,6 +6953,35 @@ fn build_approved_plan_graph_inner(
             .model_id
             .clone()
             .context("planner hook is missing model identity")?;
+        let mut draft = submission.draft;
+        let normalized_step_evidence = draft
+            .tasks
+            .iter()
+            .any(|task| !task.execution_steps_evidence_required);
+        if normalized_step_evidence {
+            // Live planner sessions are bound to OMO's ordered work-order
+            // contract. Treat a missing opt-in as a recoverable model
+            // omission, normalize it before sealing, and leave an audit trail
+            // instead of failing the whole objective at PlanGraph admission.
+            for task in &mut draft.tasks {
+                task.execution_steps_evidence_required = true;
+            }
+            store.write_artifact(
+                &goal.id,
+                "planner-contract-normalized.json",
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": 1,
+                        "status": "normalized",
+                        "field": "execution_steps_evidence_required",
+                        "reason": "live planner omitted the ordered-step evidence opt-in",
+                        "task_ids": draft.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),
+                    }))?
+                ),
+            )?;
+        }
+        validate_planner_draft(&goal.id, &draft)?;
         let plan = PlanGraph::seal(
             &goal.id,
             1,
@@ -6897,7 +6991,7 @@ fn build_approved_plan_graph_inner(
                 model_id,
                 session_id: submission.planner.actual_session_id.clone(),
             }),
-            submission.draft,
+            draft,
         )?;
         goal.coordinator_brief = Some(submission.raw_output.clone());
         (
@@ -7103,6 +7197,27 @@ fn build_approved_plan_graph_inner(
             &critic_budget_key,
         )?;
         let submission = submission_result?;
+        if submission.verdict.summary.contains("degraded") {
+            store.write_artifact(
+                &goal.id,
+                &format!("plan-critic-degraded-revision-{}.json", plan.revision),
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": 1,
+                        "status": "degraded",
+                        "phase": "plan_critic",
+                        "plan_revision": plan.revision,
+                        "plan_hash": plan.plan_hash.clone(),
+                        "reviewer_execution_id": submission.reviewer.execution_id.clone(),
+                        "decision": format!("{:?}", submission.verdict.decision),
+                        "reason": submission.verdict.summary.clone(),
+                        "evidence_confidence": "deterministic-verifier-or-pending-review",
+                        "next_action": submission.verdict.revision_instructions.clone(),
+                    }))?
+                ),
+            )?;
+        }
         check_run_cancelled(cancellation_token)?;
         validate_phase_execution_identity(&critic_decision, &submission.reviewer)?;
         // OpenCode worker phases create a verified observation receipt during
@@ -7114,12 +7229,25 @@ fn build_approved_plan_graph_inner(
                 PhaseBackend::Worker(WorkerKind::Opencode | WorkerKind::OpencodeSession)
             )
         {
-            require_verified_repository_observation(
+            if let Err(error) = require_verified_repository_observation(
                 store,
                 &plan,
                 "plan_critic",
                 submission.repository_evidence_path.as_deref(),
-            )?;
+            ) {
+                if low_risk_review_can_degrade(&plan, &verifier) {
+                    write_degraded_observation_artifact(
+                        store,
+                        &goal.id,
+                        "plan_critic",
+                        &plan,
+                        &submission.reviewer,
+                        &error.to_string(),
+                    )?;
+                } else {
+                    return Err(error);
+                }
+            }
         }
         if seen_phase_identities
             .iter()
@@ -7247,6 +7375,27 @@ fn build_approved_plan_graph_inner(
                         &oracle_budget_key,
                     )?;
                     let oracle_submission = oracle_submission_result?;
+                    if oracle_submission.verdict.summary.contains("degraded") {
+                        store.write_artifact(
+                            &goal.id,
+                            &format!("plan-oracle-degraded-revision-{}.json", plan.revision),
+                            &format!(
+                                "{}\n",
+                                serde_json::to_string_pretty(&json!({
+                                    "schema_version": 1,
+                                    "status": "degraded",
+                                    "phase": "plan_oracle",
+                                    "plan_revision": plan.revision,
+                                    "plan_hash": plan.plan_hash.clone(),
+                                    "reviewer_execution_id": oracle_submission.reviewer.execution_id.clone(),
+                                    "decision": format!("{:?}", oracle_submission.verdict.decision),
+                                    "reason": oracle_submission.verdict.summary.clone(),
+                                    "evidence_confidence": "deterministic-verifier-or-pending-review",
+                                    "next_action": oracle_submission.verdict.revision_instructions.clone(),
+                                }))?
+                            ),
+                        )?;
+                    }
                     validate_phase_execution_identity(
                         &oracle_decision,
                         &oracle_submission.reviewer,
@@ -7260,12 +7409,25 @@ fn build_approved_plan_graph_inner(
                             )
                         )
                     {
-                        require_verified_repository_observation(
+                        if let Err(error) = require_verified_repository_observation(
                             store,
                             &plan,
-                            "plan_critic",
+                            "plan_oracle",
                             oracle_submission.repository_evidence_path.as_deref(),
-                        )?;
+                        ) {
+                            if low_risk_review_can_degrade(&plan, &verifier) {
+                                write_degraded_observation_artifact(
+                                    store,
+                                    &goal.id,
+                                    "plan_oracle",
+                                    &plan,
+                                    &oracle_submission.reviewer,
+                                    &error.to_string(),
+                                )?;
+                            } else {
+                                return Err(error);
+                            }
+                        }
                     }
                     if seen_phase_identities
                         .iter()
@@ -7915,6 +8077,43 @@ fn require_verified_repository_observation(
     if receipt.status != RepositoryObservationStatus::Verified {
         bail!("{role} repository observation is unverified");
     }
+    Ok(())
+}
+
+fn low_risk_review_can_degrade(plan: &PlanGraph, verifier: &PlanVerifierReport) -> bool {
+    verifier.passed()
+        && plan.draft.tasks.len() <= 4
+        && plan.draft.tasks.iter().all(|task| {
+            task.risk_tier() == TaskRiskTier::Normal && task.size_tier() != TaskSizeTier::Large
+        })
+}
+
+fn write_degraded_observation_artifact(
+    store: &StateStore,
+    goal_id: &str,
+    role: &str,
+    plan: &PlanGraph,
+    reviewer: &PhaseExecutionIdentity,
+    reason: &str,
+) -> Result<()> {
+    store.write_artifact(
+        goal_id,
+        &format!("{role}-observation-degraded-revision-{}.json", plan.revision),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "status": "degraded",
+                "phase": role,
+                "plan_revision": plan.revision,
+                "plan_hash": plan.plan_hash.clone(),
+                "reviewer_execution_id": reviewer.execution_id.clone(),
+                "reason": reason,
+                "evidence_confidence": "deterministic-verifier-only",
+                "next_action": "retain the plan and require an independent verified observation before high-risk completion",
+            }))?
+        ),
+    )?;
     Ok(())
 }
 

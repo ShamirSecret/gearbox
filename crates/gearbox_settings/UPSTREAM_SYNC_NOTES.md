@@ -851,3 +851,15 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 
 - `crates/gearbox_agent/src/open_code_phase_runtime.rs` 递归解包 OpenCode `--format json` 的 `part.text`、`worker_stdout.output` 和 `assistant_text_delta.delta`，并在 stdout 不含模型文本时读取同一 worker 的 transcript/partial-output。
 - 这只修复 phase transport 到 typed parser 的边界，不放宽 PlanGraph schema 或 PlanCritic 的 repository-observation fail-closed 语义；上游普通 Agent 输出路径不变。
+
+### GBX-205 — repository observation bootstrap and in-progress review projection
+
+- `crates/gearbox_agent/src/open_code_phase_runtime.rs` 现在从嵌套 OpenCode `tool_use` 事件提取可信 workspace/workdir，按 call identity 去除 `worker_stdout` 与 `assistant_text_delta` 的重复 transport，并保留 workspace 外路径与无绑定路径的 fail-closed 行为。
+- `crates/gearbox_agent/src/gui.rs` 在 review bundle 尚未封存时也扫描当前 plan revision 的绑定 repository observation receipt，投影 bounded 的 unverified/invalid blocker；旧 revision 和不匹配 plan hash 的 receipt 不会污染当前 GUI。
+- 这些是 Gear runtime/GUI 投影的最小边界，不改变上游普通 Agent 路径、PlanCritic 门禁或 `.omo/**`。
+- PlanCritic/Oracle 的结构化提示现在明确要求七个检查维度都引用至少一个非空证据项（包括通过检查），与 `PlanCriticVerdict` 的 fail-closed 校验保持一致；这是对免费模型输出稳定性的引导性修复，不放宽证据门禁。
+- Planner 及其 schema repair prompt 现在显式给出 TDD `test.red`/`test.green` 的 `CommandExpectation` 对象形状，避免免费模型把 RED 命令写成裸字符串或单元素数组；解析器仍保持严格，不做静默放宽。
+- PlanCritic/Oracle 的 schema-only repair 不再用没有仓库工具调用的修复会话覆盖首次有效 observation receipt；同一只读计划审查继续绑定首次观测，避免“修 JSON”被误判成仓库观测缺失。
+- 仓库观测解析现在识别 `cd ... && ls/wc` 这类常见 shell 包装命令：不再只看第一个 `cd` token，仍只记录工作区内的真实路径并保持去重和 fail-closed。
+- PlanCritic schema repair prompt 现在重新提供精确的 PlanGraph 与 deterministic verifier 上下文，并明确丢弃 worker-packet/step telemetry 误导内容；repair 仍只修 JSON 合约，不放宽严格解析。
+- PlanCritic/Oracle 初始提示现在明确要求先执行至少一个只读仓库命令，再输出 verdict；没有 repository tool call 的文本回答继续按 fail-closed 处理。
