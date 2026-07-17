@@ -897,3 +897,11 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - `crates/gearbox_agent/src/workers.rs` 将付费判定绑定到实际 route model：`opencode-go/*` 即使使用 `WorkerKind::OpencodeSession` 也计入 premium worker budget；免费 OpenCode 模型不计入。`phase_routing` 在 premium budget 为零时拒绝显式付费 route，避免预算门禁在 dispatch 后才失效。
 - skills freshness cache 按 workspace 与 target set 分片，保留跨 task 的 freshness 观察并避免并行 worker 使用不同 scope 时互相覆盖；命令 worker 与 Gear 原生 worker 仍共用同一 receipt 语义。
 - 变更只影响 Gear runtime 的路由、预算和上下文 receipt，不改变上游 Agent 默认行为或 `.omo/**`。
+
+### 2026-07-17 — Upstream sync review through `1d2a4b3f7f`
+
+- 本轮从 fork 与 `upstream/main` 的 merge-base `b0da438545` 复核到 `1d2a4b3f7f`，共 127 个上游提交；没有直接执行整段 merge，因为上游会删除 Gearbox 专属 crate/覆盖层，且共享源码存在策略重叠。
+- 已逐项合入并保留 upstream provenance 的提交：`94e59ce2f8`、`6d66d5749d`、`fd013f7f56`（git graph 长提交布局与行悬停预览）；`9552acc2bc`（GPUI 静态图片 EXIF 方向）；`a3f6ef252b`（主题参数色）；`c7ee116ead`（VTSLS TypeScript 7 安装错误）；`aa42d3adce`（Rust 嵌套 tabstop）；`625b29d243`（ProjectSearchBar 焦点）；`7d07d39f19`（仅焦点编辑器闪烁光标）；`058f01fa93`（GPUI prompt 阻止后层 popover 收到 mouse-down-out）。
+- `fd013f7f56` 与本 fork 的既有 git graph 上下文菜单实现发生上游/上游语义冲突；仅移除行悬停预览并删除不存在的上游 `commit_context_menu` 导入，保留 Gearbox 现有菜单边界，修复提交为 `1f88ce3191`。
+- 验证：`cargo check -p git_ui --lib`、git graph 长提交回归测试、GPUI EXIF 回归测试、GPUI prompt 回归测试、`cargo check -p languages`、`cargo check -p search`、编辑器焦点光标回归测试均通过；主题 JSON 通过 `jq empty`。
+- 其余上游提交继续保留在候选队列，涉及 Gearbox 覆盖层或依赖未吸收的上游重构时不自动合入；下一轮应从新的 clean worktree 和本节记录继续逐项验证。
