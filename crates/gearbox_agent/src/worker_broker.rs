@@ -2333,7 +2333,7 @@ fn phase_profile_to_path(phase: &PhaseProfile) -> &'static str {
 ///
 /// Each call to [`create_broker`] returns a new `Arc<WorkerBroker>` whose
 /// ledger artifacts are written to an isolated path under
-/// `{artifacts_root}/broker-sessions/{phase}/{goal_id}/{task_id}/{revision}/`.
+/// `{artifacts_root}/broker-sessions/{phase}/{goal_id}/{task_id}/{revision}/{execution_id}/`.
 ///
 /// The factory enforces:
 /// - No duplicate session keys (same execution_id + goal + task + revision).
@@ -2371,7 +2371,7 @@ impl PhaseBrokerFactory {
     /// Create a new broker session for the given phase invocation.
     ///
     /// Returns an `Arc<WorkerBroker>` whose ledger is isolated to:
-    /// `{artifacts_root}/broker-sessions/{phase}/{goal_id}/{task_id}/{revision}/`
+    /// `{artifacts_root}/broker-sessions/{phase}/{goal_id}/{task_id}/{revision}/{execution_id}/`
     ///
     /// # Guards
     ///
@@ -2440,7 +2440,8 @@ impl PhaseBrokerFactory {
             .join(phase_profile_to_path(&phase_decision.phase))
             .join(sanitize_for_path(goal_id))
             .join(sanitize_for_path(task_id))
-            .join(format!("{}", plan_revision));
+            .join(format!("{}", plan_revision))
+            .join(sanitize_for_path(&execution_identity.execution_id));
 
         let replay_check_path = session_root
             .join(sanitize_for_path(goal_id))

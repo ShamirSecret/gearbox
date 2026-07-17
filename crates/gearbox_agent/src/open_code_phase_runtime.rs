@@ -6,14 +6,15 @@ use anyhow::{Context as _, Result, bail};
 use sha2::{Digest as _, Sha256};
 
 use crate::phase_routing::{
-    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseModelBinding, PhaseRouteDecision,
-    PhaseRouteTable,
+    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseModelBinding,
+    PhaseRouteDecision, PhaseRouteTable, RejectedPhaseCandidate, opencode_paid_fallback_model,
 };
 #[cfg(test)]
 use crate::plan_graph::PhaseProfile;
 use crate::plan_graph::{
     PLAN_GRAPH_SCHEMA_EXEMPLAR, PlannerParseDiagnostic, TaskRiskTier, TaskSizeTier,
-    parse_planner_draft_diagnostic, parse_planner_draft_with_objective, validate_planner_draft,
+    deterministic_fallback_draft, parse_planner_draft_diagnostic, parse_planner_draft_with_objective,
+    validate_planner_draft,
 };
 use crate::plan_review::{
     IntentFoldDecision, IntentFoldVerdict, IntentRisk, IntentRiskSeverity, PhaseExecutionIdentity,
@@ -23,12 +24,13 @@ use crate::plan_review::{
 use crate::runtime::{
     IntentFoldInput, IntentFoldSubmission, PhaseRuntime, PlanCriticInput, PlanCriticSubmission,
     PlanRevisionInput, PlanRevisionSubmission, PlannerInput, PlannerSubmission,
-    RepositoryDiscoverySubmission, StrategistNextGoalInput, StrategistNextGoalSubmission,
-    StrategistNextGoalVerdict,
+    RepositoryDiscoverySubmission, StrategistNextGoalDecision, StrategistNextGoalInput,
+    StrategistNextGoalSubmission, StrategistNextGoalVerdict,
 };
 use crate::state::{
-    ModelCallKind, ModelCallLedgerEntry, RepositoryObservationEvent, RepositoryObservationReceipt,
-    Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp, timestamp,
+    GoalStatus, ModelCallKind, ModelCallLedgerEntry, RepositoryObservationEvent,
+    RepositoryObservationReceipt, Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus,
+    id_timestamp, timestamp,
 };
 use crate::task_manager::{
     ManagedTaskStatus, ResidencyState, TaskAttempt, TaskAttemptStatus, TaskRecord,
@@ -349,6 +351,139 @@ impl OpenCodePhaseRunner {
     where
         F: FnMut(&WorkerResult, usize) -> Result<Option<String>>,
     {
+        if let PhaseModelBinding::BackendDeclared(model) = &decision.candidate.model
+            && crate::workers::is_free_model(Some(model))
+            && StateStore::new(&self.workspace)
+                .read_global_provider_cooldown()?
+                .is_some_and(|cooldown| cooldown.is_active())
+        {
+            let cooldown_error = anyhow::anyhow!(
+                "free provider quota cooldown is active; paid phase route required"
+            );
+            let Some(fallback_decision) = paid_fallback_decision(decision, &cooldown_error)?
+            else {
+                bail!(
+                    "free provider quota cooldown is active and phase {:?} has no paid route",
+                    decision.phase
+                );
+            };
+            let store = StateStore::new(&self.workspace);
+            store.initialize()?;
+            let fallback_task_id = format!("{task_id}_paid");
+            store.write_artifact(
+                goal_id,
+                &format!("phase-provider-fallback-{task_id}.json"),
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "status": "cooldown_skipped_free_route",
+                        "phase": format!("{:?}", decision.phase),
+                        "task_id": task_id,
+                        "fallback_task_id": fallback_task_id,
+                        "original_model": intent_fold_model_label(decision),
+                        "fallback_model": intent_fold_model_label(&fallback_decision),
+                        "original_failure": cooldown_error.to_string(),
+                        "fallback_decision": fallback_decision,
+                        "next_action": "treat paid transport as provisional until semantic and repository evidence gates pass"
+                    }))?
+                ),
+            )?;
+            return self.run_with_follow_up_once(
+                &fallback_decision,
+                goal_id,
+                plan_id,
+                plan_revision,
+                plan_hash,
+                &fallback_task_id,
+                task_kind,
+                scope,
+                prompt,
+                &mut follow_up,
+            );
+        }
+        let first_attempt = self.run_with_follow_up_once(
+            decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            plan_hash,
+            task_id,
+            task_kind.clone(),
+            scope.clone(),
+            prompt.clone(),
+            &mut follow_up,
+        );
+        let error = match first_attempt {
+            Ok(output) => return Ok(output),
+            Err(error) if is_provider_recoverable_phase_error(&error) => error,
+            Err(error) => return Err(error),
+        };
+        let Some(fallback_decision) = paid_fallback_decision(decision, &error)? else {
+            return Err(error);
+        };
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        let fallback_task_id = format!("{task_id}_paid");
+        crate::workers::discard_resident_session_for_model_switch(
+            &store,
+            &self.workspace,
+            task_id,
+            WorkerKind::OpencodeSession,
+            match &fallback_decision.candidate.model {
+                PhaseModelBinding::BackendDeclared(model) => Some(model.as_str()),
+                _ => None,
+            },
+        )?;
+        store.write_artifact(
+            goal_id,
+            &format!("phase-provider-fallback-{task_id}.json"),
+            &format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "status": "fallback_dispatched",
+                    "phase": format!("{:?}", decision.phase),
+                    "task_id": task_id,
+                    "fallback_task_id": fallback_task_id,
+                    "original_model": intent_fold_model_label(decision),
+                    "fallback_model": intent_fold_model_label(&fallback_decision),
+                    "original_failure": error.to_string(),
+                    "fallback_decision": fallback_decision,
+                    "next_action": "treat fallback transport as provisional until semantic and repository evidence gates pass"
+                }))?
+            ),
+        )?;
+        self.run_with_follow_up_once(
+            &fallback_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            plan_hash,
+            &fallback_task_id,
+            task_kind,
+            scope,
+            prompt,
+            &mut follow_up,
+        )
+    }
+
+    fn run_with_follow_up_once<F>(
+        &self,
+        decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        plan_hash: Option<&str>,
+        task_id: &str,
+        task_kind: crate::state::TaskKind,
+        scope: Scope,
+        prompt: String,
+        mut follow_up: F,
+    ) -> Result<OpenCodePhaseOutput>
+    where
+        F: FnMut(&WorkerResult, usize) -> Result<Option<String>>,
+    {
         let call_ordinal = self.call_budget.reserve(goal_id)?;
         if !matches!(
             decision.candidate.backend,
@@ -431,7 +566,7 @@ impl OpenCodePhaseRunner {
         let observation = RepositoryObservationReceipt::seal_with_capture_commit(
             &format!(
                 "{}-{}",
-                phase_role_name(&decision.phase),
+                phase_role_name_for_task(&decision.phase, task_id),
                 task_id.replace(':', "_")
             ),
             goal_id,
@@ -591,10 +726,7 @@ impl OpenCodePhaseRunner {
                             // facts when the model cannot serialize its
                             // analysis; planning and independent review still
                             // enforce the hard evidence gates downstream.
-                            verdict = Some(degraded_intent_fold_verdict(
-                                &input,
-                                &parse_error,
-                            ));
+                            verdict = Some(degraded_intent_fold_verdict(&input, &parse_error));
                             return Ok(None);
                         }
                         write_intent_fold_recovery_artifact(
@@ -668,8 +800,7 @@ impl OpenCodePhaseRunner {
                                 &output,
                                 &format!(
                                     "planner contract repair exhausted after {} attempts: {}",
-                                    MAX_PLANNER_SCHEMA_REPAIRS,
-                                    error
+                                    MAX_PLANNER_SCHEMA_REPAIRS, error
                                 ),
                             );
                         }
@@ -690,9 +821,13 @@ impl OpenCodePhaseRunner {
                             &format!("{}\n", serde_json::to_string_pretty(&diagnostic)?),
                         )?;
                         if previous_raw_sha.as_deref() == Some(diagnostic.raw_sha256.as_str()) {
-                            bail!(
-                                "planner repeated the same semantically invalid output: {}",
-                                serde_json::to_string(&diagnostic)?
+                            return self.degraded_planner_submission(
+                                &input,
+                                &output,
+                                &format!(
+                                    "planner repeated the same semantically invalid output: {}",
+                                    serde_json::to_string(&diagnostic)?
+                                ),
                             );
                         }
                         previous_raw_sha = Some(diagnostic.raw_sha256.clone());
@@ -751,9 +886,13 @@ impl OpenCodePhaseRunner {
                         &format!("{}\n", serde_json::to_string_pretty(&diagnostic)?),
                     )?;
                     if previous_raw_sha.as_deref() == Some(diagnostic.raw_sha256.as_str()) {
-                        bail!(
-                            "planner repeated the same malformed output; schema diagnostic: {}",
-                            serde_json::to_string(&diagnostic)?
+                        return self.degraded_planner_submission(
+                            &input,
+                            &output,
+                            &format!(
+                                "planner repeated the same malformed output; schema diagnostic: {}",
+                                serde_json::to_string(&diagnostic)?
+                            ),
                         );
                     }
                     previous_raw_sha = Some(diagnostic.raw_sha256.clone());
@@ -828,11 +967,35 @@ impl OpenCodePhaseRunner {
         } else {
             self.workspace.join(reported_artifact_path)
         };
-        let candidates = [reported_artifact_path, conventional_artifact_path];
+        let mut candidates = vec![reported_artifact_path, conventional_artifact_path];
+        let worker_prefix = format!("planner_{}", input.goal_id);
+        if let Ok(entries) = std::fs::read_dir(self.workspace.join(".gear").join("workers")) {
+            candidates.extend(entries.flatten().filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir()
+                    || !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&worker_prefix)
+                {
+                    return None;
+                }
+                Some(entry.path().join("plan-graph-draft.json"))
+            }));
+        }
+        candidates.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        });
+        candidates.reverse();
         let Some((artifact_path, contents, draft)) = candidates.into_iter().find_map(|path| {
             let contents = std::fs::read_to_string(&path).ok()?;
             let draft = parse_planner_draft_with_objective(&contents, &input.request).ok()?;
             validate_planner_draft(&input.goal_id, &draft).ok()?;
+            if planner_request_requires_multiple_nodes(&input.request) && draft.tasks.len() < 2 {
+                return None;
+            }
             Some((path, contents, draft))
         }) else {
             return Ok(None);
@@ -866,11 +1029,7 @@ impl OpenCodePhaseRunner {
         output: &OpenCodePhaseOutput,
         reason: &str,
     ) -> Result<PlannerSubmission> {
-        let draft = crate::plan_graph::deterministic_fallback_draft(
-            &input.request,
-            &input.scope,
-            &input.verification_commands,
-        );
+        let draft = deterministic_planner_fallback_draft(input);
         validate_planner_draft(&input.goal_id, &draft)?;
         let store = StateStore::new(&self.workspace);
         store.initialize()?;
@@ -1056,20 +1215,19 @@ impl OpenCodePhaseRunner {
             &input.plan.goal_id,
             &input.plan.plan_id,
             input.plan.revision,
-            Some(&input.plan.plan_hash), &base_task_id,
+            Some(&input.plan.plan_hash),
+            &base_task_id,
             crate::state::TaskKind::Plan,
             Scope::new(Vec::new(), Vec::new(), 1),
             prompt,
         )?;
         let mut previous_raw_sha = None;
         for repair_attempt in 0..=MAX_REVISION_SCHEMA_REPAIRS {
-            let draft_result = parse_planner_draft_with_objective(
-                &output.raw_output,
-                &input.plan.draft.objective,
-            )
-            .and_then(|draft| {
-                validate_planner_draft(&input.plan.goal_id, &draft).map(|_| draft)
-            });
+            let draft_result =
+                parse_planner_draft_with_objective(&output.raw_output, &input.plan.draft.objective)
+                    .and_then(|draft| {
+                        validate_planner_draft(&input.plan.goal_id, &draft).map(|_| draft)
+                    });
             match draft_result {
                 Ok(draft) => {
                     return Ok(PlanRevisionSubmission {
@@ -1082,7 +1240,13 @@ impl OpenCodePhaseRunner {
                 Err(error) if repair_attempt < MAX_REVISION_SCHEMA_REPAIRS => {
                     let raw_sha = sha256_hex(&output.raw_output);
                     if previous_raw_sha.as_deref() == Some(raw_sha.as_str()) {
-                        bail!("planner revision repeated the same malformed output: {error}");
+                        return self.degraded_plan_revision_submission(
+                            &input,
+                            &output,
+                            &format!(
+                                "planner revision repeated the same malformed or semantic-invalid output: {error}"
+                            ),
+                        );
                     }
                     previous_raw_sha = Some(raw_sha);
                     let repair_prompt = gear_opencode_plan_revision_repair_prompt(
@@ -1104,18 +1268,14 @@ impl OpenCodePhaseRunner {
                     )?;
                 }
                 Err(error) => {
-                    let mut draft = input.plan.draft.clone();
-                    draft.assumptions.push(format!(
-                        "Planner revision schema degraded after bounded repair: {error}. Preserve the critic findings and re-review this unchanged implementation scope."
-                    ));
-                    validate_planner_draft(&input.plan.goal_id, &draft)?;
-                    let raw_output = serde_json::to_string(&draft)?;
-                    return Ok(PlanRevisionSubmission {
-                        draft,
-                        planner: output.execution_identity,
-                        raw_output,
-                        artifact_path: Some(output.artifact_path),
-                    });
+                    return self.degraded_plan_revision_submission(
+                        &input,
+                        &output,
+                        &format!(
+                            "planner revision schema repair exhausted after {} attempts: {error}",
+                            MAX_REVISION_SCHEMA_REPAIRS
+                        ),
+                    );
                 }
             }
         }
@@ -1154,7 +1314,13 @@ impl OpenCodePhaseRunner {
                 Err(error) if repair_attempt < MAX_STRATEGIST_SCHEMA_REPAIRS => {
                     let raw_sha = sha256_hex(&output.raw_output);
                     if previous_raw_sha.as_deref() == Some(raw_sha.as_str()) {
-                        bail!("strategist repeated the same malformed output: {error}");
+                        return self.degraded_strategist_submission(
+                            &input,
+                            &output,
+                            &format!(
+                                "strategist repeated the same malformed or semantically invalid output: {error}"
+                            ),
+                        );
                     }
                     previous_raw_sha = Some(raw_sha);
                     let repair_prompt = gear_opencode_strategist_repair_prompt(
@@ -1176,16 +1342,319 @@ impl OpenCodePhaseRunner {
                     )?;
                 }
                 Err(error) => {
-                    bail!(
-                        "strategist schema repair exhausted after {} attempts: {}",
-                        MAX_STRATEGIST_SCHEMA_REPAIRS,
-                        error
+                    return self.degraded_strategist_submission(
+                        &input,
+                        &output,
+                        &format!(
+                            "strategist schema repair exhausted after {} attempts: {error}",
+                            MAX_STRATEGIST_SCHEMA_REPAIRS
+                        ),
                     );
                 }
             }
         }
         bail!("strategist schema repair loop terminated unexpectedly")
     }
+
+    fn degraded_plan_revision_submission(
+        &self,
+        input: &PlanRevisionInput,
+        output: &OpenCodePhaseOutput,
+        reason: &str,
+    ) -> Result<PlanRevisionSubmission> {
+        let mut draft = input.plan.draft.clone();
+        draft.assumptions.push(format!(
+            "Planner revision schema degraded after bounded repair: {reason}. Preserve the critic findings and re-review this unchanged implementation scope."
+        ));
+        validate_planner_draft(&input.plan.goal_id, &draft)?;
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        store.write_artifact(
+            &input.plan.goal_id,
+            "planner-revision-schema-degraded.json",
+            &format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "status": "schema_degraded",
+                    "reason": reason,
+                    "raw_output_sha256": sha256_hex(&output.raw_output),
+                    "raw_output_path": output.artifact_path,
+                    "fallback": "preserve_existing_plan_draft"
+                }))?
+            ),
+        )?;
+        let raw_output = serde_json::to_string(&draft)?;
+        Ok(PlanRevisionSubmission {
+            draft,
+            planner: output.execution_identity.clone(),
+            raw_output,
+            artifact_path: Some(output.artifact_path.clone()),
+        })
+    }
+
+    fn degraded_strategist_submission(
+        &self,
+        input: &StrategistNextGoalInput,
+        output: &OpenCodePhaseOutput,
+        reason: &str,
+    ) -> Result<StrategistNextGoalSubmission> {
+        let evidence_path = if input.final_report_path.trim().is_empty() {
+            ".gear/artifacts/strategist-schema-degraded.json".to_string()
+        } else {
+            input.final_report_path.clone()
+        };
+        let final_report_exists = if input.final_report_path.trim().is_empty() {
+            false
+        } else {
+            let report_path = PathBuf::from(&input.final_report_path);
+            let report_path = if report_path.is_absolute() {
+                report_path
+            } else {
+                self.workspace.join(report_path)
+            };
+            report_path.is_file()
+        };
+        let (decision, next_objective, acceptance_signals, required_questions, evidence_refs,
+            answerable_now) = match input.status {
+            GoalStatus::Complete if final_report_exists => (
+                StrategistNextGoalDecision::Complete,
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![evidence_path.clone()],
+                true,
+            ),
+            GoalStatus::Complete => (
+                StrategistNextGoalDecision::NeedsUser,
+                None,
+                Vec::new(),
+                vec![format!(
+                    "The goal is marked complete but final report evidence is unavailable at {evidence_path}; restore or verify it before deciding the next goal."
+                )],
+                Vec::new(),
+                false,
+            ),
+            GoalStatus::Running
+            | GoalStatus::Verifying
+            | GoalStatus::NeedsUser => (
+                StrategistNextGoalDecision::NeedsUser,
+                None,
+                Vec::new(),
+                vec![format!(
+                    "Strategist output remained unstable after bounded repair; review {evidence_path} and rerun the next-goal decision."
+                )],
+                Vec::new(),
+                false,
+            ),
+            GoalStatus::Draft | GoalStatus::Planning | GoalStatus::Blocked | GoalStatus::Limited | GoalStatus::Failed => (
+                StrategistNextGoalDecision::Stop,
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![evidence_path.clone()],
+                false,
+            ),
+        };
+        let verdict = StrategistNextGoalVerdict {
+            schema_version: 1,
+            goal_id: input.goal_id.clone(),
+            epoch_id: input.epoch_id.clone(),
+            reviewed_status: input.status.clone(),
+            decision,
+            next_objective,
+            acceptance_signals,
+            required_questions,
+            evidence_refs,
+            answerable_now,
+            rationale: format!(
+                "Strategist schema degraded after bounded repair; preserve the current status and do not invent a next objective. {reason}"
+            ),
+        };
+        verdict.validate(&input.goal_id, &input.epoch_id, &input.status)?;
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        store.write_artifact(
+            &input.goal_id,
+            "strategist-schema-degraded.json",
+            &format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "status": "schema_degraded",
+                    "reason": reason,
+                    "raw_output_sha256": sha256_hex(&output.raw_output),
+                    "raw_output_path": output.artifact_path,
+                    "fallback": "preserve_status_and_require_recovery"
+                }))?
+            ),
+        )?;
+        let raw_output = serde_json::to_string(&verdict)?;
+        Ok(StrategistNextGoalSubmission {
+            verdict,
+            strategist: output.execution_identity.clone(),
+            raw_output,
+            artifact_path: Some(output.artifact_path.clone()),
+        })
+    }
+}
+
+fn deterministic_planner_fallback_draft(
+    input: &PlannerInput,
+) -> crate::plan_graph::PlanGraphDraft {
+    let mut draft = deterministic_fallback_draft(
+        &input.request,
+        &input.scope,
+        &input.verification_commands,
+    );
+    if !planner_request_requires_multiple_nodes(&input.request) {
+        return draft;
+    }
+
+    let Some(mut implementation) = draft.tasks.pop() else {
+        return draft;
+    };
+    implementation.task_id = "task_002".to_string();
+    implementation.logical_task_id = Some("task_002".to_string());
+    implementation.dependencies = vec!["task_001".to_string()];
+    implementation.parallel_wave = 1;
+    implementation.preconditions.push(
+        "The repository observation work order is complete and its evidence is readable."
+            .to_string(),
+    );
+
+    let mut observation = implementation.clone();
+    observation.task_id = "task_001".to_string();
+    observation.logical_task_id = Some("task_001".to_string());
+    observation.title = "Inspect and record the repository baseline".to_string();
+    observation.goal = format!(
+        "Establish the bounded baseline needed before executing: {}",
+        input.request
+    );
+    observation.deliverable =
+        "A repository observation and baseline evidence receipt for the implementation work order."
+            .to_string();
+    observation.rationale =
+        "Preserve an ordered observation step when the planner output is unavailable or unstable."
+            .to_string();
+    observation.approach = vec![
+        "Read the relevant repository seam and current durable artifacts without editing."
+            .to_string(),
+        "Record the baseline, scope, and the next implementation action as evidence.".to_string(),
+    ];
+    observation.dependencies.clear();
+    observation.parallel_wave = 0;
+    observation.scope.allowed_files.clear();
+    observation.scope.write_scope.clear();
+    observation.scope.max_files_changed = 0;
+    observation.required_capabilities = vec!["read".to_string()];
+    observation.inputs = vec![
+        "Read the repository baseline and the existing durable plan/review artifacts.".to_string(),
+    ];
+    observation.preconditions = vec![
+        "The declared workspace and current goal artifacts are readable.".to_string(),
+    ];
+    observation.must_do = vec![
+        "Inspect the relevant repository seam and current artifacts.".to_string(),
+        "Record the baseline and bounded evidence for the next work order.".to_string(),
+    ];
+    observation.execution_steps = vec![crate::plan_graph::PlanExecutionStep {
+        step_id: "step-001".to_string(),
+        action: "Inspect the relevant repository seam and record the baseline.".to_string(),
+        expected_observation: "The implementation scope and current evidence are explicit."
+            .to_string(),
+        evidence_path: Some(".gear/artifacts/preflight.md".to_string()),
+    }];
+    observation.must_not_do = vec![
+        "Do not edit, delete, reset, or otherwise mutate the working tree.".to_string(),
+    ];
+    observation.test.strategy = crate::plan_graph::TestStrategy::None;
+    observation.test.red = None;
+    observation.test.green.clear();
+    observation.test.no_test_reason = Some(
+        "Observation-only work order; implementation verification belongs to task_002."
+            .to_string(),
+    );
+    observation.evidence = vec![
+        "Persist the repository observation and baseline before implementation.".to_string(),
+    ];
+    observation.rollback = vec![
+        "No working-tree mutation is allowed in the observation work order.".to_string(),
+    ];
+    observation.completion_predicates = vec![
+        "Repository observation and baseline evidence are readable.".to_string(),
+    ];
+    if let Some(artifact) = observation.artifacts.first_mut() {
+        artifact.path = ".gear/artifacts/preflight.md".to_string();
+        artifact.description = "Bounded repository observation and baseline evidence.".to_string();
+    }
+    draft.assumptions.push(
+        "Planner schema degraded; preserve an observation-before-implementation topology."
+            .to_string(),
+    );
+    draft.tasks = vec![observation, implementation];
+    draft
+}
+
+fn is_provider_recoverable_phase_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "provider error",
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "quota exceeded",
+        "usage quota",
+        "temporarily unavailable",
+        "upstream error",
+        "http 429",
+        "http 503",
+        "http 529",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn paid_fallback_decision(
+    decision: &PhaseRouteDecision,
+    error: &anyhow::Error,
+) -> Result<Option<PhaseRouteDecision>> {
+    if decision.selected_candidate != 0
+        || decision.candidate.backend != PhaseBackend::Worker(WorkerKind::OpencodeSession)
+    {
+        return Ok(None);
+    }
+    let PhaseModelBinding::BackendDeclared(model) = &decision.candidate.model else {
+        return Ok(None);
+    };
+    let Some(fallback_model) = opencode_paid_fallback_model(decision.phase.clone(), model) else {
+        return Ok(None);
+    };
+    let mut fallback = decision.clone();
+    fallback.selected_candidate = decision.selected_candidate.saturating_add(1);
+    fallback.candidate.model = PhaseModelBinding::BackendDeclared(fallback_model.to_string());
+    fallback.rejected_candidates.push(RejectedPhaseCandidate {
+        candidate_index: decision.selected_candidate,
+        reason: error.to_string(),
+    });
+    fallback.requested_model = None;
+    fallback.worker_kind = Some(WorkerKind::OpencodeSession);
+    fallback.hash()?;
+    Ok(Some(fallback))
+}
+
+fn planner_request_requires_multiple_nodes(request: &str) -> bool {
+    let request_lowercase = request.to_ascii_lowercase();
+    [
+        "work orders",
+        "work-order nodes",
+        "work order nodes",
+        "multi-node",
+        "plangraph",
+        "工单",
+    ]
+    .iter()
+    .any(|marker| request_lowercase.contains(marker))
 }
 
 /// Keep a low-risk objective recoverable when an independent Oracle has
@@ -1202,7 +1671,11 @@ fn degraded_critic_revision(
     artifact_path: Option<String>,
     reason: &str,
 ) -> Result<PlanCriticSubmission> {
-    let evidence_ref = format!("deterministic-verifier:{}", input.verifier_report.report_hash);
+    let evidence_ref = format!(
+        "deterministic-verifier:{}",
+        input.verifier_report.report_hash
+    );
+    let verifier_passed = input.verifier_report.passed();
     let dimensions = [
         PlanCriticDimension::References,
         PlanCriticDimension::Executability,
@@ -1216,7 +1689,7 @@ fn degraded_critic_revision(
         .into_iter()
         .map(|dimension| PlanCriticCheck {
             dimension,
-            verdict: if dimension == PlanCriticDimension::Contradictions {
+            verdict: if !verifier_passed && dimension == PlanCriticDimension::Contradictions {
                 PlanCriticCheckVerdict::Fail
             } else {
                 PlanCriticCheckVerdict::Pass
@@ -1234,28 +1707,42 @@ fn degraded_critic_revision(
         reviewed_plan_revision: input.plan.revision,
         reviewed_plan_hash: input.plan.plan_hash.clone(),
         reviewed_planner_execution_id: input.planner_receipt.identity.execution_id.clone(),
-        decision: PlanCriticDecision::Revise,
+        decision: if verifier_passed {
+            PlanCriticDecision::Approve
+        } else {
+            PlanCriticDecision::Revise
+        },
         checks,
-        findings: vec![PlanCriticFinding {
-            dimension: PlanCriticDimension::Contradictions,
-            severity: PlanCriticFindingSeverity::Blocking,
-            code: "review_schema_degraded".to_string(),
-            task_id: None,
-            path: None,
-            message: format!("{role} review did not satisfy the typed semantic contract: {reason}"),
-            required_change: Some(
-                "Re-run the bounded review with a fresh independent session and preserve all hard evidence bindings."
-                    .to_string(),
-            ),
-        }],
-        revision_instructions: Some(
+        findings: if verifier_passed {
+            Vec::new()
+        } else {
+            vec![PlanCriticFinding {
+                dimension: PlanCriticDimension::Contradictions,
+                severity: PlanCriticFindingSeverity::Blocking,
+                code: "review_schema_degraded".to_string(),
+                task_id: None,
+                path: None,
+                message: format!("{role} review did not satisfy the typed semantic contract: {reason}"),
+                required_change: Some(
+                    "Re-run the bounded review with a fresh independent session and preserve all hard evidence bindings."
+                        .to_string(),
+                ),
+            }]
+        },
+        revision_instructions: (!verifier_passed).then(|| {
             "Repeat the independent review from the same plan hash after repairing the response contract; do not expand scope."
-                .to_string(),
-        ),
+                .to_string()
+        }),
         needs_user_reason: None,
-        summary: format!(
-            "{role} review degraded after bounded semantic repair; the current plan remains pending review."
-        ),
+        summary: if verifier_passed {
+            format!(
+                "review_degraded: {role} schema repair exhausted ({reason}); deterministic verification passed and the plan is accepted with degraded review evidence"
+            )
+        } else {
+            format!(
+                "{role} review degraded after bounded semantic repair; the current plan remains pending review."
+            )
+        },
     };
     verdict.validate(&input.plan, &input.planner_receipt, &input.verifier_report)?;
     let raw_output = serde_json::to_string(&verdict)?;
@@ -1412,6 +1899,20 @@ fn phase_role_name(phase: &crate::plan_graph::PhaseProfile) -> &'static str {
         crate::plan_graph::PhaseProfile::ReviewerFinal => "reviewer_final",
         crate::plan_graph::PhaseProfile::StrategistNextGoal => "strategist_next_goal",
         crate::plan_graph::PhaseProfile::Summarizer => "summarizer",
+    }
+}
+
+fn phase_role_name_for_task(
+    phase: &crate::plan_graph::PhaseProfile,
+    task_id: &str,
+) -> &'static str {
+    // PlanCritic and PlanOracle share the same route profile, but their
+    // repository observation receipts must remain role-specific so the
+    // runtime can bind each independent review to the correct evidence.
+    if task_id.starts_with("plan_oracle") {
+        "plan_oracle"
+    } else {
+        phase_role_name(phase)
     }
 }
 
@@ -1824,7 +2325,7 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
         })
         .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, rationale, approach, already_in_working_tree, still_needed, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, inputs, preconditions, must_do, execution_steps, must_not_do, references, test, qa, artifacts, evidence, rollback, budget, commit_boundary, commit_message, and completion_predicates. `rationale` is the concrete WHY from OMO; `approach` is an ordered bounded HOW, not a second list of generic must_do items. `already_in_working_tree` must state concrete facts already present before this work order; `still_needed` must contain only the independently verifiable remainder, matching OMO's work-order format. One task must represent one independently verifiable objective; split unrelated behavior, review, documentation, and cleanup into separate work orders even when they touch nearby files. `inputs` and `preconditions` are checked before editing; `execution_steps` must be ordered and each step must include step_id, action, expected_observation, and optional evidence_path; the executor must stop on an unmet step instead of skipping ahead or redesigning the plan. `evidence` records observable proof obligations separately from changed-file deliverables. `rollback` describes the bounded recovery action and `budget` gives optional task limits; neither may be omitted when the task has irreversible or expensive work. `commit_message` is optional for no-commit tasks, but when present it must be a concrete OMO-style commit intent; Gear never commits or pushes automatically. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. For `test.strategy = \"tdd\"`, `red` MUST be one object with `command`, `expected_observation`, and `evidence_path`, and `green` MUST be an array of objects with the same three fields; never encode a command expectation as a bare string or one-element array. Include concrete happy, failure, and adversarial QA scenarios; when adversarial behavior does not apply, record an explicit not-applicable trigger check and evidence path. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, logical_task_id, title, goal, deliverable, rationale, approach, already_in_working_tree, still_needed, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, inputs, preconditions, must_do, execution_steps, must_not_do, references, test, qa, artifacts, evidence, evidence_obligations, rollback, budget, commit_boundary, commit_message, and completion_predicates. `evidence_obligations` must contain stable obligation_id values plus kind, producer, consumer, freshness, required_for, and either evidence_path or an explicit unavailable_reason. `logical_task_id` is the stable identity across revisions; `task_id` is only the current display/dispatch key. Keep logical IDs unique within the plan and preserve them when a task is revised or rekeyed. `rationale` is the concrete WHY from OMO; `approach` is an ordered bounded HOW, not a second list of generic must_do items. `already_in_working_tree` must state concrete facts already present before this work order; `still_needed` must contain only the independently verifiable remainder, matching OMO's work-order format. One task must represent one independently verifiable objective; split unrelated behavior, review, documentation, and cleanup into separate work orders even when they touch nearby files. `inputs` and `preconditions` are checked before editing; `execution_steps` must be ordered and each step must include step_id, action, expected_observation, and optional evidence_path; the executor must stop on an unmet step instead of skipping ahead or redesigning the plan. `evidence` remains a legacy-readable prose projection, while typed obligations are the completion contract. `rollback` describes the bounded recovery action and `budget` gives optional task limits; neither may be omitted when the task has irreversible or expensive work. `commit_message` is optional for no-commit tasks, but when present it must be a concrete OMO-style commit intent; Gear never commits or pushes automatically. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. For `test.strategy = \"tdd\"`, `red` MUST be one object with `command`, `expected_observation`, and `evidence_path`, and `green` MUST be an array of objects with the same three fields; never encode a command expectation as a bare string or one-element array. Include concrete happy, failure, and adversarial QA scenarios; when adversarial behavior does not apply, record an explicit not-applicable trigger check and evidence path. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         PLAN_GRAPH_SCHEMA_EXEMPLAR,
         input.request,
         repository_discovery,
@@ -2109,7 +2610,7 @@ fn trimmed_env_value(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::phase_routing::OpenCodeModelProfiles;
-    use crate::plan_graph::PLAN_GRAPH_SCHEMA_EXEMPLAR;
+    use crate::plan_graph::{PLAN_GRAPH_SCHEMA_EXEMPLAR, deterministic_fallback_draft};
     use crate::state::Scope;
     use crate::workers::WorkerRegistry;
 
@@ -2126,6 +2627,48 @@ mod tests {
             }
         });
         assert_eq!(extract_worker_text_events(&nested.to_string()), model_json);
+    }
+
+    #[test]
+    fn paid_phase_fallback_is_selected_only_for_provider_failures() -> Result<()> {
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "opencode/mimo-v2.5-free".to_string(),
+            executor: "opencode/deepseek-v4-flash-free".to_string(),
+            reviewer: "opencode/mimo-v2.5-free".to_string(),
+        })?;
+        let decision = routes.resolve(
+            &PhaseProfile::Planner,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        let provider_error = anyhow::anyhow!("OpenCode Planner phase failed: provider error");
+        let fallback = paid_fallback_decision(&decision, &provider_error)?
+            .context("free route should have a paid fallback")?;
+        assert_eq!(fallback.selected_candidate, 1);
+        assert_eq!(fallback.rejected_candidates.len(), 1);
+        assert_eq!(fallback.rejected_candidates[0].candidate_index, 0);
+        assert_eq!(intent_fold_model_label(&fallback), "opencode_session/opencode-go/mimo-v2.5");
+        assert!(is_provider_recoverable_phase_error(&provider_error));
+        assert!(!is_provider_recoverable_phase_error(&anyhow::anyhow!(
+            "planner schema is malformed"
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_observation_role_distinguishes_oracle_from_critic() {
+        assert_eq!(
+            phase_role_name_for_task(&PhaseProfile::PlanCritic, "plan_critic_goal_1_1"),
+            "plan_critic"
+        );
+        assert_eq!(
+            phase_role_name_for_task(&PhaseProfile::PlanCritic, "plan_oracle_goal_1_1"),
+            "plan_oracle"
+        );
+        assert_eq!(
+            phase_role_name_for_task(&PhaseProfile::PlanCritic, "plan_oracle_goal_1_1_repair_1"),
+            "plan_oracle"
+        );
     }
 
     #[test]
@@ -2542,14 +3085,12 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
         };
         let decision =
             routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
-        let submission = runner
-            .fold_intent(IntentFoldInput {
-                goal_id: "intent_exhausted_goal".to_string(),
-                request: "produce the explicit outcome".to_string(),
-                scope: Scope::new(Vec::new(), Vec::new(), 1),
-                route_decision: decision,
-            })
-            ?;
+        let submission = runner.fold_intent(IntentFoldInput {
+            goal_id: "intent_exhausted_goal".to_string(),
+            request: "produce the explicit outcome".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            route_decision: decision,
+        })?;
         assert_eq!(submission.verdict.decision, IntentFoldDecision::Ready);
         assert!(submission.verdict.summary.contains("degraded"));
         assert!(IntentFoldVerdict::parse(&submission.raw_output).is_ok());
@@ -2691,6 +3232,210 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
     }
 
     #[test]
+    fn planner_repeated_schema_output_degrades_to_ordered_fallback() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script_path = temp_dir.path().join("planner-repeated-worker.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf '%s' '{\"malformed\":true}' > \"$GEARBOX_WORKER_LAST_MESSAGE\"\n",
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.plan(PlannerInput {
+            goal_id: "repeated_schema_goal".to_string(),
+            request: "execute ordered work orders and preserve a multi-node PlanGraph".to_string(),
+            scope: Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4),
+            verification_commands: Vec::new(),
+            route_decision: decision,
+            intent_fold: None,
+            repository_discovery: None,
+        })?;
+
+        assert_eq!(submission.draft.tasks.len(), 2);
+        assert_eq!(submission.draft.tasks[0].task_id, "task_001");
+        assert!(submission.draft.tasks[0].dependencies.is_empty());
+        assert_eq!(submission.draft.tasks[1].task_id, "task_002");
+        assert_eq!(submission.draft.tasks[1].dependencies, vec!["task_001"]);
+        assert_eq!(submission.draft.tasks[1].parallel_wave, 1);
+        let degraded_path = temp_dir
+            .path()
+            .join(".gear/artifacts/repeated_schema_goal/planner-schema-degraded.json");
+        assert!(degraded_path.is_file());
+        let degraded = std::fs::read_to_string(degraded_path)?;
+        assert!(degraded.contains("schema_degraded"));
+        assert!(degraded.contains("repeated the same malformed output"));
+        Ok(())
+    }
+
+    #[test]
+    fn planner_repeated_semantic_output_degrades_to_ordered_fallback() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script_path = temp_dir.path().join("planner-repeated-semantic-worker.sh");
+        let mut semantic_invalid: serde_json::Value =
+            serde_json::from_str(PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
+        semantic_invalid["tasks"] = serde_json::Value::Array(Vec::new());
+        let semantic_invalid = serde_json::to_string(&semantic_invalid)?;
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{semantic_invalid}' > \"$GEARBOX_WORKER_LAST_MESSAGE\"\n"
+            ),
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.plan(PlannerInput {
+            goal_id: "repeated_semantic_goal".to_string(),
+            request: "execute ordered work orders and preserve a multi-node PlanGraph".to_string(),
+            scope: Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4),
+            verification_commands: Vec::new(),
+            route_decision: decision,
+            intent_fold: None,
+            repository_discovery: None,
+        })?;
+
+        assert_eq!(submission.draft.tasks.len(), 2);
+        assert_eq!(submission.draft.tasks[0].task_id, "task_001");
+        assert_eq!(submission.draft.tasks[1].dependencies, vec!["task_001"]);
+        let degraded_path = temp_dir
+            .path()
+            .join(".gear/artifacts/repeated_semantic_goal/planner-schema-degraded.json");
+        assert!(degraded_path.is_file());
+        let degraded = std::fs::read_to_string(degraded_path)?;
+        assert!(degraded.contains("schema_degraded"));
+        assert!(degraded.contains("semantically invalid output"));
+        Ok(())
+    }
+
+    #[test]
+    fn strategist_schema_drift_preserves_status_and_writes_degraded_receipt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let scope = Scope::new(Vec::new(), Vec::new(), 1);
+        let plan = crate::plan_graph::PlanGraph::seal(
+            "strategist_goal",
+            1,
+            crate::plan_graph::PlanSource::DeterministicFallback,
+            None,
+            deterministic_fallback_draft("inspect the current state", &scope, &[]),
+        )?;
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let route_decision = routes.resolve(
+            &PhaseProfile::StrategistNextGoal,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory: Arc::new(PhaseBrokerFactory::new(
+                Arc::new(WorkerRegistry::default()),
+                temp_dir.path().join(".gearbox-agent"),
+            )),
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: test_worker_config(),
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let input = StrategistNextGoalInput {
+            goal_id: "strategist_goal".to_string(),
+            epoch_id: "epoch_001".to_string(),
+            request: "inspect the current state".to_string(),
+            status: GoalStatus::Running,
+            summary: "verification is still pending".to_string(),
+            plan,
+            final_report_path: ".gear/reports/final.md".to_string(),
+            budget_ledger: crate::state::GoalBudgetLedger {
+                schema_version: 1,
+                goal_id: "strategist_goal".to_string(),
+                reservations: Vec::new(),
+                updated_at: "now".to_string(),
+                ledger_hash: "unsealed-test-ledger".to_string(),
+            },
+            route_decision,
+        };
+        let output = OpenCodePhaseOutput {
+            raw_output: "{malformed".to_string(),
+            execution_identity: PhaseExecutionIdentity {
+                execution_id: "strategist_execution".to_string(),
+                phase_session_id: "strategist_session".to_string(),
+                backend: crate::plan_review::PhaseExecutionBackend::WorkerSession,
+                agent_id: Some("opencode".to_string()),
+                provider_id: Some("opencode".to_string()),
+                model_id: Some("mimo".to_string()),
+                actual_session_id: Some("session".to_string()),
+            },
+            artifact_path: ".gear/workers/strategist/output.json".to_string(),
+            repository_observation_path: None,
+        };
+
+        let submission = runner.degraded_strategist_submission(
+            &input,
+            &output,
+            "strategist repeated the same malformed output",
+        )?;
+        assert_eq!(submission.verdict.decision, StrategistNextGoalDecision::NeedsUser);
+        assert!(!submission.verdict.answerable_now);
+        assert_eq!(submission.verdict.reviewed_status, GoalStatus::Running);
+        let receipt = temp_dir
+            .path()
+            .join(".gear/artifacts/strategist_goal/strategist-schema-degraded.json");
+        assert!(receipt.is_file());
+        assert!(std::fs::read_to_string(receipt)?.contains("schema_degraded"));
+
+        let mut completed_input = input;
+        completed_input.status = GoalStatus::Complete;
+        completed_input.final_report_path = ".gear/reports/missing-final.md".to_string();
+        let completed_submission = runner.degraded_strategist_submission(
+            &completed_input,
+            &output,
+            "strategist repeated the same malformed output",
+        )?;
+        assert_eq!(
+            completed_submission.verdict.decision,
+            StrategistNextGoalDecision::NeedsUser
+        );
+        assert!(!completed_submission.verdict.answerable_now);
+        Ok(())
+    }
+
+    #[test]
     fn planner_recovers_only_the_current_worker_artifact() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let valid_plan_path = temp_dir.path().join("valid-plan.json");
@@ -2743,6 +3488,66 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
 
         assert_eq!(submission.draft.tasks.len(), 1);
         assert_eq!(submission.artifact_path.as_deref(), artifact_path.to_str());
+        Ok(())
+    }
+
+    #[test]
+    fn planner_reuses_historical_multi_node_artifact_for_ordered_request() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let goal_id = "ordered_artifact_goal";
+        let historical_dir = temp_dir
+            .path()
+            .join(".gear/workers")
+            .join(format!("planner_{goal_id}_repair_1"));
+        std::fs::create_dir_all(&historical_dir)?;
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let mut draft = deterministic_fallback_draft("execute ordered work orders", &scope, &[]);
+        let mut second = draft.tasks[0].clone();
+        draft.tasks[0].task_id = "task_001".to_string();
+        draft.tasks[0].logical_task_id = Some("task_001".to_string());
+        second.task_id = "task_002".to_string();
+        second.logical_task_id = Some("task_002".to_string());
+        second.parallel_wave = 1;
+        draft.tasks.push(second);
+        let historical_plan = historical_dir.join("plan-graph-draft.json");
+        std::fs::write(&historical_plan, serde_json::to_string_pretty(&draft)?)?;
+
+        let script_path = temp_dir.path().join("planner-history-worker.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf '%s' '{\"malformed\":true}' > \"$GEARBOX_WORKER_LAST_MESSAGE\"\n",
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision = routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.plan(PlannerInput {
+            goal_id: goal_id.to_string(),
+            request: "execute work orders in order; preserve multi-node PlanGraph".to_string(),
+            scope,
+            verification_commands: Vec::new(),
+            route_decision: decision,
+            intent_fold: None,
+            repository_discovery: None,
+        })?;
+
+        assert_eq!(submission.draft.tasks.len(), 2);
+        assert_eq!(submission.artifact_path.as_deref(), historical_plan.to_str());
         Ok(())
     }
 

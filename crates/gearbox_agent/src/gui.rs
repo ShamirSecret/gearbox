@@ -11,15 +11,16 @@ use serde_json::Value;
 
 use crate::{
     phase_routing::{PhaseBackend, PhaseModelBinding, PhaseRouteReceipt},
-    plan_graph::{PlanGraph, PlanTaskBudget},
+    plan_graph::{PlanGraph, PlanRevisionManifest, PlanRevisionTaskLineage, PlanTaskBudget},
     plan_review::PlanApprovalState,
     plan_review::PlanVerifierReport,
     state::{
         CriterionEvidenceStatus, Event, EventKind, FinalVerificationWaveReceipt, Goal,
         GoalBudgetLedger, ObjectiveGraph, PlanNodeRun, PlanNodeRunLedger, PlanNodeRunStatus,
-        RepositoryObservationReceipt, RepositoryObservationStatus, ReviewEpochBundle, StateStore,
+        GlobalProviderCooldown, RepositoryObservationReceipt, RepositoryObservationStatus,
+        ReviewEpochBundle, StateStore,
     },
-    task_manager::{TaskManager, TaskManagerSnapshot},
+    task_manager::{ProviderRecoverySnapshot, TaskManager, TaskManagerSnapshot},
 };
 
 pub const GEAR_GUI_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
@@ -30,6 +31,7 @@ pub const GEAR_GUI_TIMELINE_CAPACITY: usize = 500;
 pub const GEAR_GUI_WORKER_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 pub const GEAR_GUI_TERMINAL_SUMMARY_BYTES: usize = 16 * 1024;
 pub const GEAR_GUI_MAX_CONVERSATION_SUMMARIES_PER_EPOCH: usize = 12;
+const GEAR_GUI_RESOURCE_RECEIPT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +90,8 @@ pub struct GearRuntimeHealth {
     pub last_error: Option<String>,
     #[serde(default)]
     pub processes: GearRuntimeProcessHealth,
+    #[serde(default)]
+    pub resource_protection: GearRuntimeResourceProtectionSummary,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +105,38 @@ pub struct GearRuntimeProcessHealth {
     pub rust_process_over_limit: bool,
 }
 
+/// Durable resource-protection receipts projected for the GUI.
+///
+/// The runtime remains the source of truth: this is only a bounded summary of
+/// `resource-policy.json` and `process-cleanup.json` artifacts. A missing
+/// receipt is surfaced as `not_recorded` instead of being interpreted as a
+/// successful cleanup.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GearRuntimeResourceProtectionSummary {
+    #[serde(default)]
+    pub policy_receipts: usize,
+    #[serde(default)]
+    pub watcher_disabled: usize,
+    #[serde(default)]
+    pub watcher_enabled: usize,
+    #[serde(default)]
+    pub protection_configured: usize,
+    #[serde(default)]
+    pub protection_degraded: usize,
+    #[serde(default)]
+    pub cleanup_receipts: usize,
+    #[serde(default)]
+    pub cleanup_orphans: usize,
+    #[serde(default = "default_resource_status")]
+    pub watcher_status: String,
+    #[serde(default = "default_resource_status")]
+    pub protection_status: String,
+}
+
+fn default_resource_status() -> String {
+    "not_recorded".to_string()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GearRuntimeLifecycle {
     pub objective_status: Option<String>,
@@ -109,6 +145,12 @@ pub struct GearRuntimeLifecycle {
     pub phase: Option<String>,
     pub stop_reason: Option<String>,
     pub recovery_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_recovery: Option<ProviderRecoverySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_provider_cooldown: Option<GlobalProviderCooldown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_provider_cooldown_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intensity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +264,36 @@ pub struct GearRuntimePlanRevisionDiff {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_tasks: Vec<String>,
     pub objective_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_change: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_logical_task_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_lineage: Vec<GearRuntimePlanTaskLineage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_task_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_re_review: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_applied: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GearRuntimePlanTaskLineage {
+    pub logical_task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_task_id: Option<String>,
+    pub relation: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,6 +437,25 @@ pub struct GearRuntimePlanStepSummary {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GearRuntimePlanEvidenceObligation {
+    pub obligation_id: String,
+    pub kind: String,
+    pub producer: String,
+    pub consumer: String,
+    pub freshness: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_for: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GearRuntimePlanSessionSummary {
     pub attempt: usize,
     pub worker_task_id: String,
@@ -473,6 +564,12 @@ pub struct GearRuntimePlanTaskSummary {
     pub worker_known_failures: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_next_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_diagnostic_receipt_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_diagnostic_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_plan_gap: Option<String>,
     #[serde(default)]
@@ -503,6 +600,8 @@ pub struct GearRuntimePlanTaskSummary {
     pub must_do: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_obligations: Vec<GearRuntimePlanEvidenceObligation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rollback: Vec<String>,
     #[serde(default)]
@@ -697,6 +796,40 @@ impl GearRuntimeSnapshot {
             .as_ref()
             .and_then(|tm| tm.tasks.first())
             .and_then(|task| task.worker_model.clone());
+        let provider_recovery = goal_id
+            .as_deref()
+            .map(
+                |goal_id| match TaskManager::provider_recovery_snapshot(store, goal_id) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => Some(ProviderRecoverySnapshot {
+                        provider_session_id: None,
+                        failed_models: Vec::new(),
+                        cooldown_active: false,
+                        cooldown_until_ms: None,
+                        restored_from: Some("durable_ledger".to_string()),
+                        recovery_status: format!("corrupt: {error:#}"),
+                        artifact_path: Some(
+                            store
+                                .artifact_dir(goal_id)
+                                .join("provider-recovery-ledger.json"),
+                        ),
+                    }),
+                },
+            )
+            .flatten();
+        let (global_provider_cooldown, global_provider_cooldown_status) =
+            match store.read_global_provider_cooldown() {
+                Ok(Some(cooldown)) => {
+                    let status = if cooldown.is_active() {
+                        "active"
+                    } else {
+                        "expired"
+                    };
+                    (Some(cooldown), Some(status.to_string()))
+                }
+                Ok(None) => (None, Some("not_recorded".to_string())),
+                Err(error) => (None, Some(format!("degraded: {error:#}"))),
+            };
         let (phase_routes, phase_route_errors) = phase_route_summaries(store, goal.as_ref());
         let broker_sessions =
             broker_session_summaries(store, goal.as_ref().map(|goal| goal.id.as_str()));
@@ -705,7 +838,13 @@ impl GearRuntimeSnapshot {
             .as_ref()
             .and_then(|plan| plan_quality_summary(store, goal.as_ref(), plan));
         let plan_revision_diff = plan.as_ref().and_then(|plan| {
-            plan_revision_diff(store, goal.as_ref().map(|goal| goal.id.as_str()), plan)
+            plan_revision_diff(
+                store,
+                goal.as_ref().map(|goal| goal.id.as_str()),
+                plan,
+                plan_node_runs.as_ref(),
+                canonical_plan.as_ref(),
+            )
         });
         let plan_approval = canonical_plan
             .as_ref()
@@ -748,6 +887,9 @@ impl GearRuntimeSnapshot {
                 .as_ref()
                 .and_then(|summary| summary.stop_reason.clone()),
             recovery_state: recovery.stuck_reason.clone(),
+            provider_recovery,
+            global_provider_cooldown,
+            global_provider_cooldown_status,
             intensity: std::env::var("GEARBOX_GEAR_WORKER_INTENSITY")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -916,6 +1058,7 @@ impl GearRuntimeSnapshot {
             next_goal,
         };
         let mut health = runtime_health(task_manager.as_ref());
+        health.resource_protection = resource_protection_snapshot(store, task_manager.as_ref());
         health.last_activity_at = last_event_timestamp(store, &session_id);
         let sequence = timeline.last().map(|event| event.sequence).unwrap_or(0);
         Ok(Self {
@@ -981,11 +1124,41 @@ impl GearRuntimeSnapshot {
                             GEAR_GUI_TERMINAL_SUMMARY_BYTES,
                         ));
                     }
+                    if let Some(decision) = attempt.fallback_decision.as_mut() {
+                        decision.raw_observation = decision.raw_observation.take().map(|observation| {
+                            GearRuntimeEventEnvelope::bounded_message(
+                                observation,
+                                GEAR_GUI_TERMINAL_SUMMARY_BYTES,
+                            )
+                        });
+                        decision.reason = GearRuntimeEventEnvelope::bounded_message(
+                            std::mem::take(&mut decision.reason),
+                            GEAR_GUI_TERMINAL_SUMMARY_BYTES,
+                        );
+                    }
                 }
             }
             task_manager.current_output = task_manager.current_output.take().map(|output| {
                 GearRuntimeEventEnvelope::bounded_message(output, GEAR_GUI_WORKER_OUTPUT_TAIL_BYTES)
             });
+        }
+
+        if let Some(provider_recovery) = self.lifecycle.provider_recovery.as_mut() {
+            provider_recovery.failed_models.truncate(16);
+            provider_recovery.recovery_status = GearRuntimeEventEnvelope::bounded_message(
+                std::mem::take(&mut provider_recovery.recovery_status),
+                600,
+            );
+        }
+        if let Some(global_provider_cooldown) = self.lifecycle.global_provider_cooldown.as_mut() {
+            global_provider_cooldown.failed_models.truncate(16);
+            global_provider_cooldown.reason = GearRuntimeEventEnvelope::bounded_message(
+                std::mem::take(&mut global_provider_cooldown.reason),
+                600,
+            );
+        }
+        if let Some(status) = self.lifecycle.global_provider_cooldown_status.as_mut() {
+            *status = GearRuntimeEventEnvelope::bounded_message(std::mem::take(status), 600);
         }
 
         self.request_summary = GearRuntimeEventEnvelope::bounded_message(
@@ -1384,6 +1557,7 @@ fn plan_session_aggregate(
     let elapsed_total_ms = (!history.is_empty()).then(|| {
         history
             .iter()
+            .filter(|session| matches!(session.status.as_str(), "Terminal" | "Superseded"))
             .filter_map(|session| session.elapsed_ms)
             .fold(0u64, u64::saturating_add)
     });
@@ -1464,6 +1638,100 @@ fn plan_progress_from_graph(
         next.map(|task| task.task_id.clone()),
         next.map(|task| task.title.clone()),
     )
+}
+
+fn resource_protection_snapshot(
+    store: &StateStore,
+    task_manager: Option<&TaskManagerSnapshot>,
+) -> GearRuntimeResourceProtectionSummary {
+    let mut task_ids = task_manager
+        .into_iter()
+        .flat_map(|snapshot| snapshot.tasks.iter().map(|task| task.task_id.clone()))
+        .collect::<Vec<_>>();
+    if let Ok(entries) = fs::read_dir(store.workers_dir()) {
+        task_ids.extend(
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned()),
+        );
+    }
+    task_ids.sort();
+    task_ids.dedup();
+
+    let mut summary = GearRuntimeResourceProtectionSummary::default();
+    for task_id in task_ids.into_iter().take(64) {
+        let worker_dir = store.worker_dir(&task_id);
+        let policy_path = worker_dir.join("resource-policy.json");
+        if let Some(policy) = read_bounded_json_value(&policy_path) {
+            summary.policy_receipts = summary.policy_receipts.saturating_add(1);
+            match policy.get("status").and_then(Value::as_str) {
+                Some("disabled") => {
+                    summary.watcher_disabled = summary.watcher_disabled.saturating_add(1)
+                }
+                Some("enabled") => {
+                    summary.watcher_enabled = summary.watcher_enabled.saturating_add(1)
+                }
+                _ => {}
+            }
+            match policy.get("protection_status").and_then(Value::as_str) {
+                Some("configured") => {
+                    summary.protection_configured =
+                        summary.protection_configured.saturating_add(1)
+                }
+                Some("degraded" | "unavailable") => {
+                    summary.protection_degraded = summary.protection_degraded.saturating_add(1)
+                }
+                _ => {}
+            }
+        }
+
+        let cleanup_path = worker_dir.join("process-cleanup.json");
+        if let Some(cleanup) = read_bounded_json_value(&cleanup_path) {
+            summary.cleanup_receipts = summary.cleanup_receipts.saturating_add(1);
+            if cleanup
+                .get("remaining_owned_pids")
+                .and_then(Value::as_array)
+                .is_some_and(|pids| !pids.is_empty())
+            {
+                summary.cleanup_orphans = summary.cleanup_orphans.saturating_add(1);
+            }
+        }
+    }
+
+    summary.watcher_status = match (
+        summary.watcher_disabled > 0,
+        summary.watcher_enabled > 0,
+    ) {
+        (true, true) => "mixed",
+        (true, false) => "disabled",
+        (false, true) => "enabled",
+        (false, false) => "not_recorded",
+    }
+    .to_string();
+    summary.protection_status = match (
+        summary.protection_configured > 0,
+        summary.protection_degraded > 0,
+    ) {
+        (true, true) => "mixed",
+        (true, false) => "configured",
+        (false, true) => "degraded",
+        (false, false) => "not_recorded",
+    }
+    .to_string();
+    summary
+}
+
+fn read_bounded_json_value(path: &Path) -> Option<Value> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take((GEAR_GUI_RESOURCE_RECEIPT_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > GEAR_GUI_RESOURCE_RECEIPT_MAX_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn runtime_health(task_manager: Option<&TaskManagerSnapshot>) -> GearRuntimeHealth {
@@ -1863,6 +2131,33 @@ fn plan_task_summaries(
                 worker_next_steps: node
                     .map(|node| node.worker_next_steps.iter().take(16).cloned().collect())
                     .unwrap_or_default(),
+                worker_diagnostics: node
+                    .map(|node| {
+                        node.worker_diagnostics
+                            .iter()
+                            .take(16)
+                            .map(|diagnostic| {
+                                format!(
+                                    "{}:{}:{} [{}:{}] {}",
+                                    diagnostic.file.as_deref().unwrap_or("<workspace>"),
+                                    diagnostic.line.unwrap_or(0),
+                                    diagnostic.severity,
+                                    diagnostic.status,
+                                    if diagnostic.origin.is_empty() {
+                                        "unknown"
+                                    } else {
+                                        diagnostic.origin.as_str()
+                                    },
+                                    diagnostic.message
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                worker_diagnostic_receipt_path: node
+                    .and_then(|node| node.worker_diagnostic_receipt_path.clone()),
+                worker_diagnostic_status: node
+                    .and_then(|node| node.worker_diagnostic_status.clone()),
                 worker_plan_gap: node.and_then(|node| node.worker_plan_gap.clone()),
                 worker_decision: node
                     .map(|node| format!("{:?}", node.worker_decision))
@@ -1885,6 +2180,35 @@ fn plan_task_summaries(
                 commit_message: task.commit_message.clone(),
                 must_do: task.must_do.iter().take(12).cloned().collect(),
                 evidence: task.evidence.iter().take(16).cloned().collect(),
+                evidence_obligations: task
+                    .evidence_obligations
+                    .iter()
+                    .take(16)
+                    .map(|obligation| {
+                        let receipt = node.and_then(|node| {
+                            let criterion_id = format!("evidence:{}", obligation.obligation_id);
+                            node.criterion_evidence
+                                .iter()
+                                .find(|evidence| evidence.criterion_id == criterion_id)
+                        });
+                        GearRuntimePlanEvidenceObligation {
+                            obligation_id: obligation.obligation_id.clone(),
+                            kind: obligation.kind.clone(),
+                            producer: obligation.producer.clone(),
+                            consumer: obligation.consumer.clone(),
+                            freshness: obligation.freshness.clone(),
+                            required_for: obligation.required_for.iter().take(8).cloned().collect(),
+                            evidence_path: obligation.evidence_path.clone(),
+                            unavailable_reason: receipt
+                                .and_then(|receipt| receipt.unavailable_reason.clone())
+                                .or_else(|| obligation.unavailable_reason.clone()),
+                            status: receipt
+                                .map(|receipt| format!("{:?}", receipt.status))
+                                .unwrap_or_else(|| "Pending".to_string()),
+                            receipt_path: receipt.map(|receipt| receipt.evidence_path.clone()),
+                        }
+                    })
+                    .collect(),
                 rollback: task.rollback.iter().take(16).cloned().collect(),
                 budget: task.budget.clone(),
                 execution_steps: task
@@ -2188,7 +2512,10 @@ fn final_acceptance_marker(
                 .nodes
                 .iter()
                 .find(|node| node.task_id == task.task_id)
-                .is_some_and(|node| node.all_criteria_passed(&task.completion_predicates))
+                .is_some_and(|node| {
+                    node.all_criteria_passed(&task.completion_predicates)
+                        && node.all_evidence_obligations_passed(&task.evidence_obligations)
+                })
         })
     });
     match (criteria_passed, final_receipt.map(|receipt| receipt.passed)) {
@@ -2282,6 +2609,8 @@ fn plan_revision_diff(
     store: &StateStore,
     goal_id: Option<&str>,
     current: &PlanGraph,
+    ledger: Option<&PlanNodeRunLedger>,
+    canonical: Option<&PlanGraph>,
 ) -> Option<GearRuntimePlanRevisionDiff> {
     let goal_id = goal_id?;
     let previous_revision = current.revision.checked_sub(1)?;
@@ -2339,7 +2668,123 @@ fn plan_revision_diff(
     diff.added_tasks.truncate(32);
     diff.removed_tasks.truncate(32);
     diff.changed_tasks.truncate(32);
+
+    let manifest_path = store
+        .artifact_dir(goal_id)
+        .join(format!("plan-revision-manifest-{}.json", current.revision));
+    diff.manifest_path = Some(manifest_path.to_string_lossy().to_string());
+    diff.canonical_applied = canonical.map(|plan| plan.plan_hash == current.plan_hash);
+    let protected_task_ids = ledger
+        .into_iter()
+        .flat_map(|ledger| ledger.nodes.iter())
+        .filter(|node| {
+            matches!(
+                node.status,
+                PlanNodeRunStatus::Running
+                    | PlanNodeRunStatus::RedVerified
+                    | PlanNodeRunStatus::Implemented
+                    | PlanNodeRunStatus::GreenVerified
+                    | PlanNodeRunStatus::Reviewed
+                    | PlanNodeRunStatus::Completed
+            )
+        })
+        .map(|node| node.task_id.clone())
+        .collect::<HashSet<_>>();
+    match read_bounded_json_value(&manifest_path)
+        .and_then(|value| serde_json::from_value::<PlanRevisionManifest>(value).ok())
+    {
+        Some(manifest) => {
+            let has_persisted_lineage = !manifest.task_lineage.is_empty();
+            diff.affected_logical_task_ids = manifest
+                .affected_logical_task_ids
+                .iter()
+                .take(16)
+                .map(|task_id| bounded_text(task_id, 300))
+                .collect();
+            diff.task_lineage = manifest
+                .task_lineage
+                .iter()
+                .take(16)
+                .map(project_plan_task_lineage)
+                .collect();
+            diff.protected_task_ids = protected_task_ids
+                .iter()
+                .filter(|task_id| {
+                    manifest
+                        .superseded_task_ids
+                        .iter()
+                        .chain(manifest.revised_task_ids.iter())
+                        .any(|protected| protected == *task_id)
+                })
+                .take(16)
+                .cloned()
+                .collect();
+            diff.protected_task_ids.sort();
+            if manifest
+                .validate_against_protected(&previous, current, &protected_task_ids)
+                .is_ok()
+            {
+                diff.manifest_status = Some(if has_persisted_lineage {
+                    "valid"
+                } else {
+                    "legacy"
+                }.to_string());
+                diff.manifest_reason = Some(if has_persisted_lineage {
+                    bounded_text(&manifest.reason, 600)
+                } else {
+                    bounded_text(
+                        &format!(
+                            "legacy manifest without persisted task lineage: {}",
+                            manifest.reason
+                        ),
+                        600,
+                    )
+                });
+                diff.risk_change = Some(bounded_text(&manifest.risk_change, 600));
+                diff.evidence_refs = manifest
+                    .evidence_refs
+                    .iter()
+                    .take(16)
+                    .map(|reference| bounded_text(reference, 300))
+                    .collect();
+                diff.requires_re_review = Some(manifest.requires_re_review);
+            } else {
+                diff.manifest_status = Some("invalid".to_string());
+                diff.manifest_reason = Some(
+                    "manifest binding, graph delta, or protected task lineage did not validate"
+                        .to_string(),
+                );
+            }
+        }
+        None if manifest_path.is_file() => {
+            diff.manifest_status = Some("unreadable".to_string());
+            diff.manifest_reason = Some("manifest is missing, oversized, or invalid JSON".to_string());
+        }
+        None => {
+            diff.manifest_status = Some("missing".to_string());
+            diff.manifest_reason = Some("no durable revision manifest was recorded".to_string());
+        }
+    }
     Some(diff)
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn project_plan_task_lineage(lineage: &PlanRevisionTaskLineage) -> GearRuntimePlanTaskLineage {
+    GearRuntimePlanTaskLineage {
+        logical_task_id: bounded_text(&lineage.logical_task_id, 300),
+        base_task_id: lineage
+            .base_task_id
+            .as_deref()
+            .map(|task_id| bounded_text(task_id, 300)),
+        next_task_id: lineage
+            .next_task_id
+            .as_deref()
+            .map(|task_id| bounded_text(task_id, 300)),
+        relation: bounded_text(&lineage.relation, 64),
+    }
 }
 
 fn plan_coverage_summary(
@@ -2637,14 +3082,18 @@ fn review_summary(
                 plan,
                 bundle.as_ref(),
             );
-            blockers.extend(phase_degraded_review_blockers(store, &goal.id));
+            blockers.extend(phase_degraded_review_blockers(store, &goal.id, plan));
             blockers.truncate(8);
             blockers
         },
     })
 }
 
-fn phase_degraded_review_blockers(store: &StateStore, goal_id: &str) -> Vec<String> {
+fn phase_degraded_review_blockers(
+    store: &StateStore,
+    goal_id: &str,
+    plan: Option<&PlanGraph>,
+) -> Vec<String> {
     let Ok(entries) = fs::read_dir(store.artifact_dir(goal_id)) else {
         return Vec::new();
     };
@@ -2664,6 +3113,19 @@ fn phase_degraded_review_blockers(store: &StateStore, goal_id: &str) -> Vec<Stri
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("degraded");
+            if status == "normalized" {
+                return None;
+            }
+            if let Some(p) = plan {
+                if let Some(artifact_revision) = value
+                    .get("plan_revision")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    if artifact_revision != p.revision as u64 {
+                        return None;
+                    }
+                }
+            }
             let reason = value
                 .get("reason")
                 .or_else(|| value.get("error"))
@@ -3175,7 +3637,13 @@ mod tests {
         store.write_plan_candidate(&old)?;
         store.write_plan_candidate(&new)?;
 
-        let diff = plan_revision_diff(&store, Some("goal-revision-diff"), &new)
+        let diff = plan_revision_diff(
+            &store,
+            Some("goal-revision-diff"),
+            &new,
+            None,
+            None,
+        )
             .context("adjacent revision diff should be readable")?;
         assert_eq!(diff.from_revision, 1);
         assert_eq!(diff.to_revision, 2);
@@ -3183,6 +3651,92 @@ mod tests {
         assert_eq!(diff.changed_tasks, vec![new.draft.tasks[0].task_id.clone()]);
         assert!(diff.added_tasks.is_empty());
         assert!(diff.removed_tasks.is_empty());
+        assert_eq!(diff.manifest_status.as_deref(), Some("missing"));
+
+        let manifest = crate::plan_graph::PlanRevisionManifest::derive(
+            &old,
+            &new,
+            "test revision projection",
+            None,
+        )?;
+        store.write_artifact(
+            "goal-revision-diff",
+            "plan-revision-manifest-2.json",
+            &format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+        )?;
+        let diff = plan_revision_diff(
+            &store,
+            Some("goal-revision-diff"),
+            &new,
+            None,
+            Some(&new),
+        )
+        .context("valid manifest projection should be readable")?;
+        assert_eq!(diff.manifest_status.as_deref(), Some("valid"));
+        assert_eq!(diff.canonical_applied, Some(true));
+        assert_eq!(diff.requires_re_review, Some(true));
+        assert_eq!(diff.manifest_reason.as_deref(), Some("test revision projection"));
+        assert_eq!(diff.affected_logical_task_ids, vec![new.draft.tasks[0].task_id.clone()]);
+        assert_eq!(diff.task_lineage.len(), 1);
+        assert_eq!(diff.task_lineage[0].relation, "revised");
+
+        let mut legacy_manifest = serde_json::to_value(&manifest)?;
+        legacy_manifest
+            .as_object_mut()
+            .context("manifest should serialize as an object")?
+            .remove("task_lineage");
+        store.write_artifact(
+            "goal-revision-diff",
+            "plan-revision-manifest-2.json",
+            &format!("{}\n", serde_json::to_string_pretty(&legacy_manifest)?),
+        )?;
+        let diff = plan_revision_diff(
+            &store,
+            Some("goal-revision-diff"),
+            &new,
+            None,
+            None,
+        )
+        .context("legacy manifest projection should remain readable")?;
+        assert_eq!(diff.manifest_status.as_deref(), Some("legacy"));
+        assert!(diff
+            .manifest_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("legacy manifest")));
+
+        store.write_artifact(
+            "goal-revision-diff",
+            "plan-revision-manifest-2.json",
+            &format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+        )?;
+
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-revision-diff", "epoch-1", &new)?;
+        ledger.nodes[0].status = PlanNodeRunStatus::Completed;
+        let diff = plan_revision_diff(
+            &store,
+            Some("goal-revision-diff"),
+            &new,
+            Some(&ledger),
+            None,
+        )
+        .context("protected lineage should remain visible for an invalid manifest")?;
+        assert_eq!(diff.manifest_status.as_deref(), Some("invalid"));
+        assert_eq!(diff.protected_task_ids, vec![new.draft.tasks[0].task_id.clone()]);
+
+        store.write_artifact(
+            "goal-revision-diff",
+            "plan-revision-manifest-2.json",
+            "{not-json}\n",
+        )?;
+        let diff = plan_revision_diff(
+            &store,
+            Some("goal-revision-diff"),
+            &new,
+            None,
+            None,
+        )
+        .context("invalid manifest projection should still return graph diff")?;
+        assert_eq!(diff.manifest_status.as_deref(), Some("unreadable"));
         Ok(())
     }
 
@@ -3694,7 +4248,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(plan_session_aggregate(&history), (3, 1, Some(150_000)));
+        assert_eq!(plan_session_aggregate(&history), (3, 1, Some(120_000)));
     }
 
     #[test]
@@ -3745,6 +4299,9 @@ mod tests {
                 worker_commands_run: Vec::new(),
                 worker_known_failures: Vec::new(),
                 worker_next_steps: Vec::new(),
+                worker_diagnostics: Vec::new(),
+                worker_diagnostic_receipt_path: None,
+                worker_diagnostic_status: None,
                 worker_plan_gap: None,
                 worker_decision: "NotRecorded".to_string(),
                 worker_decision_reason: None,
@@ -3760,6 +4317,7 @@ mod tests {
                 commit_message: None,
                 must_do: Vec::new(),
                 evidence: Vec::new(),
+                evidence_obligations: Vec::new(),
                 rollback: Vec::new(),
                 budget: PlanTaskBudget::default(),
                 execution_steps: Vec::new(),
@@ -3822,6 +4380,9 @@ mod tests {
                 worker_commands_run: Vec::new(),
                 worker_known_failures: Vec::new(),
                 worker_next_steps: Vec::new(),
+                worker_diagnostics: Vec::new(),
+                worker_diagnostic_receipt_path: None,
+                worker_diagnostic_status: None,
                 worker_plan_gap: None,
                 worker_decision: "NotRecorded".to_string(),
                 worker_decision_reason: None,
@@ -3837,6 +4398,7 @@ mod tests {
                 commit_message: None,
                 must_do: Vec::new(),
                 evidence: Vec::new(),
+                evidence_obligations: Vec::new(),
                 rollback: Vec::new(),
                 budget: PlanTaskBudget::default(),
                 execution_steps: Vec::new(),
@@ -3892,6 +4454,7 @@ mod tests {
         for index in 1..130 {
             let mut task = draft.tasks[0].clone();
             task.task_id = format!("task-{index:03}");
+            task.logical_task_id = Some(task.task_id.clone());
             task.title = format!("task {index}");
             task.scope.write_scope = vec![format!("src/file-{index:03}.rs")];
             draft.tasks.push(task);
@@ -4128,6 +4691,30 @@ mod tests {
                 "{\"status\":\"approved\",\"tool\":\"write\"}\n",
             )
             .expect("write feedback event");
+        store
+            .write_worker_file(
+                "task-gui",
+                "resource-policy.json",
+                &format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "mechanism_id": "opencode_file_watcher_resource_guard",
+                        "status": "disabled",
+                        "protection_status": "configured",
+                        "worker": "opencode_session",
+                        "recorded_at": "2026-07-14T00:00:00Z"
+                    })
+                ),
+            )
+            .expect("write resource policy receipt");
+        store
+            .write_worker_file(
+                "task-gui",
+                "process-cleanup.json",
+                "{\"root_reaped\":true,\"remaining_owned_pids\":[]}\n",
+            )
+            .expect("write cleanup receipt");
 
         let snapshot = GearRuntimeSnapshot::from_store(
             &store,
@@ -4155,6 +4742,14 @@ mod tests {
         assert!(task_manager.tasks[0].messageability.is_none());
         assert_eq!(snapshot.feedback_events.len(), 1);
         assert_eq!(snapshot.feedback_events[0].kind, "permission");
+        assert_eq!(snapshot.health.resource_protection.policy_receipts, 1);
+        assert_eq!(snapshot.health.resource_protection.watcher_status, "disabled");
+        assert_eq!(
+            snapshot.health.resource_protection.protection_status,
+            "configured"
+        );
+        assert_eq!(snapshot.health.resource_protection.cleanup_receipts, 1);
+        assert_eq!(snapshot.health.resource_protection.cleanup_orphans, 0);
         let next_goal = snapshot
             .lifecycle
             .next_goal
@@ -4188,6 +4783,60 @@ mod tests {
         )
         .expect("refresh durable projection");
         assert!(refreshed.sequence > first_sequence);
+    }
+
+    #[test]
+    fn resource_protection_projection_surfaces_mixed_and_orphaned_receipts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = StateStore::new(directory.path());
+        store.initialize().expect("initialize state store");
+        for (task_id, status, protection, remaining_pids) in [
+            ("task-disabled", "disabled", "configured", "[]"),
+            ("task-enabled", "enabled", "degraded", "[1234]"),
+        ] {
+            store
+                .write_worker_file(
+                    task_id,
+                    "resource-policy.json",
+                    &format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "status": status,
+                            "protection_status": protection,
+                            "mechanism_id": "opencode_file_watcher_resource_guard"
+                        })
+                    ),
+                )
+                .expect("write resource policy");
+            store
+                .write_worker_file(
+                    task_id,
+                    "process-cleanup.json",
+                    &format!("{{\"remaining_owned_pids\":{remaining_pids}}}\n"),
+                )
+                .expect("write process cleanup");
+        }
+        store
+            .write_worker_file(
+                "task-oversized",
+                "resource-policy.json",
+                &serde_json::to_string(&serde_json::json!({
+                    "status": "disabled",
+                    "protection_status": "configured",
+                    "padding": "x".repeat(GEAR_GUI_RESOURCE_RECEIPT_MAX_BYTES)
+                }))
+                .expect("serialize oversized resource policy"),
+            )
+            .expect("write oversized resource policy");
+
+        let summary = resource_protection_snapshot(&store, None);
+        assert_eq!(summary.policy_receipts, 2);
+        assert_eq!(summary.watcher_disabled, 1);
+        assert_eq!(summary.watcher_enabled, 1);
+        assert_eq!(summary.watcher_status, "mixed");
+        assert_eq!(summary.protection_status, "mixed");
+        assert_eq!(summary.cleanup_receipts, 2);
+        assert_eq!(summary.cleanup_orphans, 1);
     }
 
     #[test]
@@ -4226,5 +4875,96 @@ mod tests {
             None,
         )
         .expect("repaired session should recover snapshot");
+    }
+
+    #[test]
+    fn phase_degraded_review_blockers_skips_normalized_and_filters_by_revision(
+    ) -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = StateStore::new(root.path());
+        store.initialize()?;
+
+        store.write_artifact(
+            "test-goal",
+            "intent-fold-normalized.json",
+            r#"{"status":"normalized","reason":"model output was normalized"}"#,
+        )?;
+        store.write_artifact(
+            "test-goal",
+            "plan-critic-degraded-revision-1.json",
+            r#"{"status":"schema_degraded","reason":"schema mismatch","plan_revision":1}"#,
+        )?;
+        store.write_artifact(
+            "test-goal",
+            "plan-critic-degraded-revision-3.json",
+            r#"{"status":"schema_degraded","reason":"schema mismatch","plan_revision":3}"#,
+        )?;
+        store.write_artifact(
+            "test-goal",
+            "strategist-next-goal-degraded.json",
+            r#"{"status":"schema_degraded","reason":"goal-level failure"}"#,
+        )?;
+        store.write_artifact(
+            "test-goal",
+            "non-degraded-normalized.json",
+            r#"{"status":"completed"}"#,
+        )?;
+
+        let scope =
+            crate::state::Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let draft = crate::plan_graph::deterministic_fallback_draft(
+            "test objective",
+            &scope,
+            &["cargo test".to_string()],
+        );
+        let plan = crate::plan_graph::PlanGraph::seal(
+            "test-goal",
+            3,
+            crate::plan_graph::PlanSource::DeterministicFallback,
+            None,
+            draft,
+        )?;
+
+        let blockers =
+            phase_degraded_review_blockers(&store, "test-goal", Some(&plan));
+
+        assert!(
+            !blockers.iter().any(|b| b.contains("intent-fold-normalized")),
+            "normalized artifact should not be a blocker"
+        );
+        assert!(
+            !blockers.iter().any(|b| b.contains("revision-1")),
+            "stale revision-1 degraded should be filtered out"
+        );
+        assert!(
+            blockers.iter().any(|b| b.contains("revision-3")),
+            "current revision-3 degraded should be visible"
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("strategist-next-goal")),
+            "revisionless degraded should be visible"
+        );
+
+        let blockers_no_plan =
+            phase_degraded_review_blockers(&store, "test-goal", None);
+
+        assert!(
+            blockers_no_plan.iter().any(|b| b.contains("revision-1")),
+            "without plan, revision-1 should appear"
+        );
+        assert!(
+            blockers_no_plan.iter().any(|b| b.contains("revision-3")),
+            "without plan, revision-3 should appear"
+        );
+        assert!(
+            blockers_no_plan
+                .iter()
+                .any(|b| b.contains("strategist-next-goal")),
+            "without plan, strategist should appear"
+        );
+
+        Ok(())
     }
 }

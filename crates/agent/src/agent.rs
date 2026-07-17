@@ -6378,6 +6378,9 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
                 must_not_skip: vec!["typecheck".to_string()],
             },
             stop_conditions,
+            prompt_manifest_path: None,
+            prompt_reconcile_path: None,
+            prompt_capsule_path: None,
         };
         let packet_json =
             serde_json::to_string_pretty(&packet).context("failed to serialize worker packet")?;
@@ -7120,6 +7123,9 @@ impl NativeWorkerBackend for GearAcpBrokerBackend {
                 must_not_skip: vec!["typecheck".to_string()],
             },
             stop_conditions,
+            prompt_manifest_path: None,
+            prompt_reconcile_path: None,
+            prompt_capsule_path: None,
         };
         let packet_json =
             serde_json::to_string_pretty(&packet).context("failed to serialize worker packet")?;

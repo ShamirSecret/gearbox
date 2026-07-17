@@ -4027,22 +4027,107 @@ impl ThreadView {
                                     .when_some(
                                         runtime_snapshot.lifecycle.plan_revision_diff.as_ref(),
                                         |this, diff| {
+                                            let canonical = match diff.canonical_applied {
+                                                Some(true) => "canonical applied",
+                                                Some(false) => "candidate not applied",
+                                                None => "canonical unknown",
+                                            };
+                                            let review = if diff.requires_re_review == Some(true) {
+                                                " · re-review required"
+                                            } else {
+                                                ""
+                                            };
                                             this.child(
-                                                Label::new(format!(
-                                                    "Plan revision diff · r{} → r{} · +{} / -{} / ~{}{}",
-                                                    diff.from_revision,
-                                                    diff.to_revision,
-                                                    diff.added_tasks.len(),
-                                                    diff.removed_tasks.len(),
-                                                    diff.changed_tasks.len(),
-                                                    if diff.objective_changed {
-                                                        " · objective changed"
-                                                    } else {
-                                                        ""
-                                                    },
-                                                ))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Warning),
+                                                v_flex()
+                                                    .child(
+                                                        Label::new(format!(
+                                                            "Plan revision diff · r{} → r{} · +{} / -{} / ~{}{}",
+                                                            diff.from_revision,
+                                                            diff.to_revision,
+                                                            diff.added_tasks.len(),
+                                                            diff.removed_tasks.len(),
+                                                            diff.changed_tasks.len(),
+                                                            if diff.objective_changed {
+                                                                " · objective changed"
+                                                            } else {
+                                                                ""
+                                                            },
+                                                        ))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Warning),
+                                                    )
+                                                    .when_some(
+                                                        diff.manifest_status.as_ref(),
+                                                        |this, status| {
+                                                            this.child(
+                                                                Label::new(format!(
+                                                                    "Revision manifest · {status} · {canonical}{review}"
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(if status == "valid"
+                                                                    && diff.canonical_applied
+                                                                        == Some(true)
+                                                                {
+                                                                    Color::Muted
+                                                                } else {
+                                                                    Color::Warning
+                                                                }),
+                                                            )
+                                                        },
+                                                    )
+                                                    .when_some(
+                                                        diff.manifest_reason.as_ref(),
+                                                        |this, reason| {
+                                                            this.child(
+                                                                Label::new(format!(
+                                                                    "Revision manifest reason · {reason}"
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted),
+                                                            )
+                                                        },
+                                                    )
+                                                    .when(
+                                                        !diff.affected_logical_task_ids.is_empty(),
+                                                        |this| {
+                                                            this.child(
+                                                                Label::new(format!(
+                                                                    "Affected logical tasks · {}",
+                                                                    diff.affected_logical_task_ids.join(" · ")
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted),
+                                                            )
+                                                        },
+                                                    )
+                                                    .children(diff.task_lineage.iter().take(8).map(
+                                                        |lineage| {
+                                                            let base = lineage
+                                                                .base_task_id
+                                                                .as_deref()
+                                                                .unwrap_or("—");
+                                                            let next = lineage
+                                                                .next_task_id
+                                                                .as_deref()
+                                                                .unwrap_or("—");
+                                                            Label::new(format!(
+                                                                "Lineage · {} · {} → {}",
+                                                                lineage.relation, base, next
+                                                            ))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted)
+                                                        },
+                                                    ))
+                                                    .when(!diff.protected_task_ids.is_empty(), |this| {
+                                                        this.child(
+                                                            Label::new(format!(
+                                                                "Protected lineage touched · {}",
+                                                                diff.protected_task_ids.join(" · ")
+                                                            ))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Error),
+                                                        )
+                                                    }),
                                             )
                                         },
                                     )
@@ -5025,6 +5110,38 @@ impl ThreadView {
                             ))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
+                        )
+                        .when(
+                            runtime_snapshot.health.resource_protection.policy_receipts > 0
+                                || runtime_snapshot.health.resource_protection.cleanup_receipts > 0,
+                            |this| {
+                                let protection = &runtime_snapshot.health.resource_protection;
+                                this.child(
+                                    Label::new(format!(
+                                        "Resource protection · watcher {} · protection {} · policies {} · cleanup {}/{}{}",
+                                        protection.watcher_status,
+                                        protection.protection_status,
+                                        protection.policy_receipts,
+                                        protection.cleanup_receipts.saturating_sub(
+                                            protection.cleanup_orphans,
+                                        ),
+                                        protection.cleanup_receipts,
+                                        if protection.cleanup_orphans > 0 {
+                                            " · orphaned worker processes"
+                                        } else {
+                                            ""
+                                        },
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(if protection.cleanup_orphans > 0 {
+                                        Color::Error
+                                    } else if protection.protection_degraded > 0 {
+                                        Color::Warning
+                                    } else {
+                                        Color::Muted
+                                    }),
+                                )
+                            },
                         )
                         .when_some(runtime_snapshot.health.last_error.as_ref(), |this, error| {
                             this.child(

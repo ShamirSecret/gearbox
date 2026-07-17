@@ -4,10 +4,12 @@ use crate::state::{
     CriterionEvidenceStatus, FinalVerificationDimension, FinalVerificationWaveReceipt, Goal,
     GoalStatus, PlanNodeRunLedger, PlanNodeRunStatus, Task,
 };
+use crate::task_manager::FallbackDecisionSnapshot;
 use crate::tools::{DiffSnapshot, ScopeCheck, ShellCommandResult};
 use crate::workers::WorkerResult;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
     let generation_guidance = generation_guidance(detection);
@@ -455,7 +457,10 @@ fn final_acceptance_marker(
                 .nodes
                 .iter()
                 .find(|node| node.task_id == task.task_id)
-                .is_some_and(|node| node.all_criteria_passed(&task.completion_predicates))
+                .is_some_and(|node| {
+                    node.all_criteria_passed(&task.completion_predicates)
+                        && node.all_evidence_obligations_passed(&task.evidence_obligations)
+                })
         })
     });
     match (criteria_passed, final_wave.map(|receipt| receipt.passed)) {
@@ -616,6 +621,47 @@ fn render_plan_task(
     let still_needed = markdown_list(&task.still_needed);
     let approach = markdown_list(&task.approach);
     let evidence = markdown_list(&task.evidence);
+    let evidence_obligations = if task.evidence_obligations.is_empty() {
+        "- none (legacy prose evidence only)".to_string()
+    } else {
+        task.evidence_obligations
+            .iter()
+            .map(|obligation| {
+                let receipt = progress
+                    .and_then(|ledger| {
+                        ledger.nodes.iter().find(|node| node.task_id == task.task_id)
+                    })
+                    .and_then(|node| {
+                        let criterion_id = format!("evidence:{}", obligation.obligation_id);
+                        node.criterion_evidence
+                            .iter()
+                            .find(|evidence| evidence.criterion_id == criterion_id)
+                    });
+                format!(
+                    "- [{}] `{}` kind={} producer={} consumer={} freshness={} required_for={}{}{}",
+                    receipt
+                        .map(|_| criterion_marker(progress, &task.task_id, &format!("evidence:{}", obligation.obligation_id)))
+                        .unwrap_or(" "),
+                    obligation.obligation_id,
+                    obligation.kind,
+                    obligation.producer,
+                    obligation.consumer,
+                    obligation.freshness,
+                    obligation.required_for.join(","),
+                    obligation
+                        .evidence_path
+                        .as_deref()
+                        .map(|path| format!(" evidence=`{path}`"))
+                        .unwrap_or_default(),
+                    receipt
+                        .and_then(|receipt| receipt.unavailable_reason.as_deref())
+                        .map(|reason| format!(" unavailable_reason={reason}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let rollback = markdown_list(&task.rollback);
     let budget = format!(
         "max_attempts={} · max_commands={} · max_duration_seconds={}",
@@ -630,10 +676,50 @@ fn render_plan_task(
             .map_or_else(|| "unbounded".to_string(), |value| value.to_string())
     );
     let blocked_by = blocked_by_summary(task, progress);
+    let post_write_feedback = progress
+        .and_then(|ledger| ledger.nodes.iter().find(|node| node.task_id == task.task_id))
+        .map(|node| {
+            let status = node
+                .worker_diagnostic_status
+                .as_deref()
+                .unwrap_or("not_recorded");
+            let receipt = node
+                .worker_diagnostic_receipt_path
+                .as_deref()
+                .unwrap_or("not_recorded");
+            let diagnostics = if node.worker_diagnostics.is_empty() {
+                "- none".to_string()
+            } else {
+                node.worker_diagnostics
+                    .iter()
+                    .take(16)
+                    .map(|diagnostic| {
+                        format!(
+                            "- [{}:{}] {}:{} {}",
+                            diagnostic.severity,
+                            if diagnostic.origin.is_empty() {
+                                "unknown"
+                            } else {
+                                diagnostic.origin.as_str()
+                            },
+                            diagnostic.file.as_deref().unwrap_or("<workspace>"),
+                            diagnostic.line.unwrap_or(0),
+                            diagnostic.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "status=`{status}` receipt=`{receipt}`\n{diagnostics}"
+            )
+        })
+        .unwrap_or_else(|| "- not recorded".to_string());
 
     format!(
         r#"### [{}] `{}`: {}
 
+- Logical task: `{}`
 - Goal: {}
 - Role: {}
 - Deliverable: {}
@@ -666,6 +752,12 @@ Must do:
 {}
 
 Evidence obligations:
+{}
+
+Legacy evidence:
+{}
+
+Post-write feedback:
 {}
 
 Rollback:
@@ -703,6 +795,7 @@ Completion predicates:
         checkbox,
         task.task_id,
         task.title,
+        task.logical_task_id_or_task_id(),
         task.goal,
         role,
         task.deliverable,
@@ -730,7 +823,9 @@ Completion predicates:
             .map(|satisfied| satisfied.to_string())
             .unwrap_or_else(|| "pending".to_string()),
         must_do_checklist(&task.must_do, status),
+        evidence_obligations,
         evidence,
+        post_write_feedback,
         rollback,
         budget,
         execution_steps,
@@ -978,6 +1073,7 @@ pub fn final_report(
         .collect::<Vec<_>>()
         .join("\n");
     let evidence_chain = final_report_evidence(tasks, worker_result);
+    let fallback_decision_ledger = final_report_fallback_decision_ledger(&goal.id, worker_result);
 
     format!(
         r#"# Final Report
@@ -1026,6 +1122,10 @@ Status: `{}`
 
 {}
 
+## Fallback Decision Ledger
+
+{}
+
 ## Known Limits
 
 - ACP server integration is intentionally deferred until the local CLI runtime is stable.
@@ -1045,11 +1145,12 @@ Status: `{}`
         changed_files,
         scope_summary,
         task_lines,
-        evidence_chain
+        evidence_chain,
+        fallback_decision_ledger
     )
 }
 
-fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String {
+pub(crate) fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String {
     let mut worker_evidence = vec![
         (
             "packet",
@@ -1068,6 +1169,13 @@ fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String
             worker_result.outcome_path.to_string_lossy().to_string(),
         ),
     ];
+
+    if let Some(stdout_path) = &worker_result.stdout_path {
+        worker_evidence.push(("stdout", stdout_path.to_string_lossy().to_string()));
+    }
+    if let Some(stderr_path) = &worker_result.stderr_path {
+        worker_evidence.push(("stderr", stderr_path.to_string_lossy().to_string()));
+    }
 
     for (label, file_name) in [
         ("transcript", "transcript.jsonl"),
@@ -1102,6 +1210,124 @@ fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String
         .chain(task_evidence)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn final_report_fallback_decision_ledger(goal_id: &str, worker_result: &WorkerResult) -> String {
+    let Some(artifact_dir) = worker_result
+        .result_path
+        .parent()
+        .or_else(|| worker_result.outcome_path.parent())
+    else {
+        return "No fallback decision or provider recovery receipts were available.".to_string();
+    };
+    let mut paths = fs::read_dir(artifact_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("fallback-decision-") && name.ends_with(".json"))
+        })
+        .take(16)
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut lines = paths
+        .into_iter()
+        .map(|path| {
+            let decision = fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<FallbackDecisionSnapshot>(&contents).ok());
+            match decision {
+                Some(decision) => format!(
+                    "- `{}`: attempt={}, status={:?}, provider/model={}/{}, reason={} ",
+                    path.display(),
+                    decision.attempt,
+                    decision.status,
+                    decision.previous_worker_kind,
+                    decision.previous_worker_model.as_deref().unwrap_or("none"),
+                    decision.reason
+                ),
+                None => format!("- `{}`: unavailable or malformed receipt", path.display()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(gear_root) = artifact_dir.parent().and_then(Path::parent) {
+        let recovery_path = gear_root
+            .join("artifacts")
+            .join(goal_id)
+            .join("provider-recovery-ledger.json");
+        if recovery_path.is_file() {
+            let recovery = fs::read_to_string(&recovery_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+            match recovery {
+                Some(recovery) => {
+                    let failed_models = recovery
+                        .get("failed_models")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    let provider_session = recovery
+                        .get("provider_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("none");
+                    lines.push(format!(
+                        "- `{}`: provider recovery ledger, failed_models={}, provider_session={}",
+                        recovery_path.display(),
+                        failed_models,
+                        provider_session
+                    ));
+                }
+                None => lines.push(format!(
+                    "- `{}`: unavailable or malformed provider recovery ledger",
+                    recovery_path.display()
+                )),
+            }
+        }
+        let global_cooldown_path = gear_root.join("provider-global-cooldown.json");
+        if global_cooldown_path.is_file() {
+            let cooldown = fs::read_to_string(&global_cooldown_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+            match cooldown {
+                Some(cooldown) => {
+                    let scope = cooldown
+                        .get("provider_scope")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let until = cooldown
+                        .get("cooldown_until_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let models = cooldown
+                        .get("failed_models")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|models| models.len())
+                        .unwrap_or(0);
+                    lines.push(format!(
+                        "- `{}`: global provider cooldown, scope={}, failed_models={}, cooldown_until_ms={}",
+                        global_cooldown_path.display(),
+                        scope,
+                        models,
+                        until
+                    ));
+                }
+                None => lines.push(format!(
+                    "- `{}`: unavailable or malformed global provider cooldown",
+                    global_cooldown_path.display()
+                )),
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        "No fallback decision or provider recovery receipts were available.".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn worker_artifact_path(worker_result: &WorkerResult, file_name: &str) -> Option<PathBuf> {
@@ -1465,5 +1691,120 @@ mod tests {
         assert!(report.contains("transcript.jsonl"));
         assert!(report.contains("tool-events.jsonl"));
         assert!(report.contains("partial-output.md"));
+    }
+
+    #[test]
+    fn final_report_evidence_includes_worker_stdout_and_stderr() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let packet_path = temp_dir.path().join("packet.md");
+        let prompt_path = temp_dir.path().join("prompt.md");
+        let result_path = temp_dir.path().join("result.json");
+        let outcome_path = temp_dir.path().join("outcome.json");
+        let stdout_path = temp_dir.path().join("stdout.log");
+        let stderr_path = temp_dir.path().join("stderr.log");
+        for path in [
+            &packet_path,
+            &prompt_path,
+            &result_path,
+            &outcome_path,
+            &stdout_path,
+            &stderr_path,
+        ] {
+            std::fs::write(path, "evidence").expect("evidence file");
+        }
+
+        let worker_result = WorkerResult {
+            status: crate::workers::WorkerStatus::Succeeded,
+            command: Some("worker".to_string()),
+            exit_code: Some(0),
+            summary: "worker finished".to_string(),
+            packet_path,
+            prompt_path,
+            stdout_path: Some(stdout_path.clone()),
+            stderr_path: Some(stderr_path.clone()),
+            last_message_path: None,
+            result_path,
+            outcome_path,
+        };
+
+        let evidence = super::final_report_evidence(&[], &worker_result);
+        assert!(evidence.contains(&format!("worker_stdout: `{}`", stdout_path.display())));
+        assert!(evidence.contains(&format!("worker_stderr: `{}`", stderr_path.display())));
+    }
+
+    #[test]
+    fn final_report_evidence_includes_report_artifact_evidence() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let worker_result = WorkerResult {
+            status: crate::workers::WorkerStatus::Succeeded,
+            command: Some("worker".to_string()),
+            exit_code: Some(0),
+            summary: "worker finished".to_string(),
+            packet_path: temp_dir.path().join("packet.md"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: None,
+            result_path: temp_dir.path().join("result.json"),
+            outcome_path: temp_dir.path().join("outcome.json"),
+        };
+        for path in [
+            &worker_result.packet_path,
+            &worker_result.prompt_path,
+            &worker_result.result_path,
+            &worker_result.outcome_path,
+        ] {
+            std::fs::write(path, "evidence").expect("evidence file");
+        }
+        std::fs::write(
+            temp_dir.path().join("fallback-decision-1.json"),
+            r#"{
+                "task_id": "task_003",
+                "attempt": 1,
+                "status": "unavailable",
+                "previous_worker_kind": "opencode",
+                "previous_worker_model": "opencode-go/deepseek-v4-flash",
+                "next_worker_kind": null,
+                "next_worker_model": null,
+                "raw_observation": "fallback route available",
+                "reason": "no fallback route",
+                "failure_kind": "no_fallback_route",
+                "recorded_at": "2026-07-17T01:00:00Z"
+            }"#,
+        )
+        .expect("fallback decision evidence");
+
+        let report_task = Task {
+            id: "task_006".to_string(),
+            goal_id: "goal-report-evidence".to_string(),
+            parent_task_id: None,
+            title: "Write delivery report".to_string(),
+            kind: TaskKind::Document,
+            status: TaskStatus::Complete,
+            assigned_worker: None,
+            attempt: 1,
+            scope: Scope::new(vec![], vec![], usize::MAX),
+            inputs: TaskInputs::default(),
+            outputs: TaskOutputs {
+                changed_files: Vec::new(),
+                commands_run: Vec::new(),
+                evidence: vec![temp_dir.path().join("final-report.md").to_string_lossy().to_string()],
+                summary: "Final report artifact created.".to_string(),
+            },
+        };
+
+        let evidence = super::final_report_evidence(&[report_task], &worker_result);
+        assert!(evidence.contains("task_006"));
+        assert!(evidence.contains("Document"));
+        assert!(evidence.contains("final-report.md"));
+        assert!(evidence.contains("worker_packet"));
+        assert!(evidence.contains("worker_result"));
+        assert!(evidence.contains("worker_outcome"));
+        let ledger = super::final_report_fallback_decision_ledger(
+            "goal-report-evidence",
+            &worker_result,
+        );
+        assert!(ledger.contains("status=Unavailable"));
+        assert!(ledger.contains("no fallback route"));
     }
 }

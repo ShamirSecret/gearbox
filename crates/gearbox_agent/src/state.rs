@@ -19,6 +19,75 @@ pub fn id_timestamp() -> String {
     Local::now().format("%Y%m%d_%H%M%S_%3f").to_string()
 }
 
+pub const GLOBAL_PROVIDER_COOLDOWN_SCHEMA_VERSION: u32 = 1;
+
+/// Durable provider-wide cooldown for free-tier quota failures. This is kept
+/// outside a goal so a new run cannot immediately retry an exhausted quota.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalProviderCooldown {
+    pub schema_version: u32,
+    pub provider_scope: String,
+    pub failed_models: Vec<String>,
+    pub reason: String,
+    pub failed_at: String,
+    pub cooldown_until_ms: u64,
+    pub source_task: String,
+    pub source_attempt: usize,
+    pub recorded_at: String,
+    pub receipt_hash: String,
+}
+
+impl GlobalProviderCooldown {
+    pub fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.validate_payload()?;
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("global provider cooldown receipt hash mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn is_active(&self) -> bool {
+        let now_ms = u64::try_from(Local::now().timestamp_millis()).unwrap_or(0);
+        self.cooldown_until_ms > now_ms
+    }
+
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != GLOBAL_PROVIDER_COOLDOWN_SCHEMA_VERSION {
+            bail!("unsupported global provider cooldown schema version");
+        }
+        for (field, value) in [
+            ("provider_scope", self.provider_scope.as_str()),
+            ("reason", self.reason.as_str()),
+            ("failed_at", self.failed_at.as_str()),
+            ("source_task", self.source_task.as_str()),
+            ("recorded_at", self.recorded_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("global provider cooldown {field} cannot be empty");
+            }
+        }
+        if self.failed_models.is_empty() || self.cooldown_until_ms == 0 {
+            bail!("global provider cooldown must contain models and an expiry");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut unsigned = self.clone();
+        unsigned.receipt_hash.clear();
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&unsigned)?)))
+    }
+}
+
 // Leave room for the revision/role separators and the atomic temporary suffix
 // in the single filename. The old 64-byte components could make a repair
 // observation filename exceed NAME_MAX when both task and session identities
@@ -561,6 +630,38 @@ impl Scope {
     }
 }
 
+/// GBX-235: Wrapper around `tools::compute_baseline_aware_scope` that
+/// separates baseline-dirty forbidden paths from real new-forbidden touches.
+///
+/// Pre-existing dirty files in forbidden paths are returned as
+/// `baseline_dirty_forbidden_paths` but do NOT count as `forbidden_touches`
+/// in the returned `ScopeCheck`. Only NEW changes to forbidden paths trigger
+/// `forbidden_touches` (hard block).
+pub fn compute_baseline_aware_scope_with_baseline_dirty(
+    before_diff: &crate::tools::DiffSnapshot,
+    after_diff: &crate::tools::DiffSnapshot,
+    scope: &Scope,
+) -> (crate::tools::ScopeCheck, crate::tools::ScopeDrift, Vec<String>) {
+    let (mut scope_check, drift) =
+        crate::tools::compute_baseline_aware_scope(before_diff, after_diff, scope);
+
+    let baseline_set: std::collections::HashSet<&str> =
+        before_diff.changed_files.iter().map(String::as_str).collect();
+    let mut baseline_dirty: Vec<String> = Vec::new();
+    let mut real_forbidden: Vec<String> = Vec::new();
+
+    for path in scope_check.forbidden_touches.drain(..) {
+        if baseline_set.contains(path.as_str()) {
+            baseline_dirty.push(path);
+        } else {
+            real_forbidden.push(path);
+        }
+    }
+    scope_check.forbidden_touches = real_forbidden;
+
+    (scope_check, drift, baseline_dirty)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TaskInputs {
     pub spec_path: Option<String>,
@@ -710,12 +811,28 @@ pub enum CriterionEvidenceStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanCriterionEvidence {
     pub criterion_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_task_id: Option<String>,
     pub status: CriterionEvidenceStatus,
     pub attempt: usize,
     pub evidence_path: String,
     pub evidence_sha256: String,
     pub captured_at: String,
     pub evidence_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_for: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 pub const PLAN_CRITERION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -730,12 +847,20 @@ impl PlanCriterionEvidence {
     ) -> Result<Self> {
         let mut evidence = Self {
             criterion_id: criterion_id.to_string(),
+            logical_task_id: None,
             status,
             attempt,
             evidence_path: evidence_path.to_string(),
             evidence_sha256: evidence_sha256.to_string(),
             captured_at: timestamp(),
             evidence_hash: String::new(),
+            obligation_id: None,
+            kind: None,
+            producer: None,
+            consumer: None,
+            freshness: None,
+            required_for: Vec::new(),
+            unavailable_reason: None,
         };
         evidence.evidence_hash = evidence.expected_hash()?;
         evidence.validate()?;
@@ -762,6 +887,30 @@ impl PlanCriterionEvidence {
         if self.evidence_hash != self.expected_hash()? {
             bail!("criterion evidence hash mismatch");
         }
+        if self
+            .logical_task_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+            || self
+            .obligation_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+            || self
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.trim().is_empty())
+        {
+            bail!("criterion evidence has empty obligation metadata");
+        }
+        if self.obligation_id.is_some()
+            && (self.kind.as_deref().is_none_or(str::is_empty)
+                || self.producer.as_deref().is_none_or(str::is_empty)
+                || self.consumer.as_deref().is_none_or(str::is_empty)
+                || self.freshness.as_deref().is_none_or(str::is_empty)
+                || self.required_for.is_empty())
+        {
+            bail!("typed criterion evidence has incomplete obligation metadata");
+        }
         Ok(())
     }
 
@@ -782,6 +931,9 @@ pub struct PlanNodeRun {
     pub plan_revision: usize,
     pub plan_hash: String,
     pub task_id: String,
+    /// Stable identity across plan revisions; legacy ledgers may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_task_id: Option<String>,
     pub attempt: usize,
     pub dependencies: Vec<String>,
     pub status: PlanNodeRunStatus,
@@ -811,6 +963,15 @@ pub struct PlanNodeRun {
     pub worker_known_failures: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_next_steps: Vec<String>,
+    /// Bounded post-write diagnostics observed from the current worker attempt.
+    /// These are feedback signals, not a replacement for scope/verification
+    /// evidence or an independent review receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_diagnostics: Vec<PostWriteDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_diagnostic_receipt_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_diagnostic_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_plan_gap: Option<String>,
     #[serde(default)]
@@ -840,6 +1001,32 @@ pub struct PlanNodeRun {
     #[serde(default)]
     pub criterion_evidence: Vec<PlanCriterionEvidence>,
     pub updated_at: String,
+}
+
+/// A deterministic, bounded signal emitted after a worker changes files.
+/// Diagnostics are intentionally separate from hard completion evidence so a
+/// weak model can receive repair feedback without turning a style hint into a
+/// fabricated tool failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostWriteDiagnostic {
+    pub diagnostic_id: String,
+    pub checker: String,
+    pub severity: String,
+    pub status: String,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub message: String,
+    pub diagnostic_hash: String,
+    pub diff_hash: String,
+    pub attempt: usize,
+    pub fresh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    pub repair_signature: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2141,6 +2328,55 @@ impl RepositoryObservationReceipt {
 pub const PLAN_NODE_RUN_LEDGER_SCHEMA_VERSION: u32 = 1;
 
 impl PlanNodeRun {
+    pub fn record_obligation_evidence(
+        &mut self,
+        obligation: &crate::plan_graph::PlanEvidenceObligation,
+        status: CriterionEvidenceStatus,
+        attempt: usize,
+        evidence_path: &str,
+        evidence_sha256: &str,
+    ) -> Result<()> {
+        obligation.validate()?;
+        let criterion_id = format!("evidence:{}", obligation.obligation_id);
+        let mut evidence = PlanCriterionEvidence::seal(
+            &criterion_id,
+            status,
+            attempt,
+            evidence_path,
+            evidence_sha256,
+        )?;
+        evidence.logical_task_id = Some(
+            self.logical_task_id
+                .as_deref()
+                .unwrap_or(self.task_id.as_str())
+                .to_string(),
+        );
+        evidence.obligation_id = Some(obligation.obligation_id.clone());
+        evidence.kind = Some(obligation.kind.clone());
+        evidence.producer = Some(obligation.producer.clone());
+        evidence.consumer = Some(obligation.consumer.clone());
+        evidence.freshness = Some(obligation.freshness.clone());
+        evidence.required_for = obligation.required_for.clone();
+        evidence.unavailable_reason = obligation.unavailable_reason.clone();
+        evidence.evidence_hash = evidence.expected_hash()?;
+        evidence.validate()?;
+        if let Some(existing) = self
+            .criterion_evidence
+            .iter()
+            .find(|existing| existing.criterion_id == criterion_id && existing.attempt == attempt)
+        {
+            if existing != &evidence {
+                bail!("typed evidence obligation was rewritten for the same attempt");
+            }
+            return Ok(());
+        }
+        self.criterion_evidence.push(evidence);
+        self.criterion_evidence
+            .sort_by(|left, right| left.criterion_id.cmp(&right.criterion_id));
+        self.updated_at = timestamp();
+        Ok(())
+    }
+
     pub fn record_criterion_evidence(
         &mut self,
         criterion_id: &str,
@@ -2184,6 +2420,37 @@ impl PlanNodeRun {
                     && evidence.status == CriterionEvidenceStatus::Pass
             })
         })
+    }
+
+    pub fn all_evidence_obligations_passed(
+        &self,
+        obligations: &[crate::plan_graph::PlanEvidenceObligation],
+    ) -> bool {
+        if obligations.is_empty() {
+            return true;
+        }
+        self.attempt > 0
+            && obligations.iter().all(|obligation| {
+                let criterion_id = format!("evidence:{}", obligation.obligation_id);
+                self.criterion_evidence.iter().any(|evidence| {
+                        evidence.criterion_id == criterion_id
+                        && evidence.logical_task_id.as_deref()
+                            == Some(
+                                self.logical_task_id
+                                    .as_deref()
+                                    .unwrap_or(self.task_id.as_str()),
+                            )
+                        && evidence.obligation_id.as_deref()
+                            == Some(obligation.obligation_id.as_str())
+                        && evidence.kind.as_deref() == Some(obligation.kind.as_str())
+                        && evidence.producer.as_deref() == Some(obligation.producer.as_str())
+                        && evidence.consumer.as_deref() == Some(obligation.consumer.as_str())
+                        && evidence.freshness.as_deref() == Some(obligation.freshness.as_str())
+                        && evidence.required_for == obligation.required_for
+                        && evidence.attempt == self.attempt
+                        && evidence.status == CriterionEvidenceStatus::Pass
+                })
+            })
     }
 
     /// QA scenarios are sealed as criterion evidence with a stable `qa:` id.
@@ -2345,6 +2612,7 @@ impl PlanNodeRunLedger {
                     plan_revision: plan.revision,
                     plan_hash: plan.plan_hash.clone(),
                     task_id: task.task_id.clone(),
+                    logical_task_id: Some(task.logical_task_id_or_task_id().to_string()),
                     attempt: 0,
                     dependencies: task.dependencies.clone(),
                     status: PlanNodeRunStatus::Pending,
@@ -2371,6 +2639,9 @@ impl PlanNodeRunLedger {
                     worker_commands_run: Vec::new(),
                     worker_known_failures: Vec::new(),
                     worker_next_steps: Vec::new(),
+                    worker_diagnostics: Vec::new(),
+                    worker_diagnostic_receipt_path: None,
+                    worker_diagnostic_status: None,
                     worker_plan_gap: None,
                     worker_decision: PlanWorkOrderDecision::NotRecorded,
                     worker_decision_reason: None,
@@ -2474,7 +2745,10 @@ impl PlanNodeRunLedger {
             self.nodes
                 .iter()
                 .find(|node| node.task_id == task.task_id)
-                .is_some_and(|node| node.all_criteria_passed(&task.completion_predicates))
+                .is_some_and(|node| {
+                    node.all_criteria_passed(&task.completion_predicates)
+                        && node.all_evidence_obligations_passed(&task.evidence_obligations)
+                })
         })
     }
 
@@ -2554,6 +2828,48 @@ impl PlanNodeRunLedger {
                 node.updated_at = timestamp();
                 requeued.push(node.task_id.clone());
             }
+        }
+        if !requeued.is_empty() {
+            self.updated_at = timestamp();
+        }
+        requeued
+    }
+
+    /// Requeue non-terminal nodes that were in flight when the previous
+    /// process stopped.  A persisted `Running` (or intermediate review/TDD)
+    /// status is evidence of an interrupted attempt, not proof that a worker
+    /// is still alive.  Leaving it in `active_task_ids` would make the
+    /// scheduler see no runnable work after restart and strand the goal.
+    ///
+    /// The prior attempt, worker identities, result paths, and criterion
+    /// evidence remain durable.  Only the current dispatch cursor is reset so
+    /// the next epoch can issue a fresh, ordered work-order attempt.
+    pub fn requeue_incomplete_for_resume(&mut self) -> Vec<String> {
+        let mut requeued = Vec::new();
+        for node in &mut self.nodes {
+            if !matches!(
+                node.status,
+                PlanNodeRunStatus::Runnable
+                    | PlanNodeRunStatus::Running
+                    | PlanNodeRunStatus::RedVerified
+                    | PlanNodeRunStatus::Implemented
+                    | PlanNodeRunStatus::GreenVerified
+                    | PlanNodeRunStatus::Reviewed
+            ) {
+                continue;
+            }
+
+            node.status = PlanNodeRunStatus::Pending;
+            node.preflight_path = None;
+            node.preflight_satisfied = false;
+            node.preflight_checks.clear();
+            for step in &mut node.execution_steps {
+                step.status = PlanStepRunStatus::Pending;
+                step.error = None;
+                step.updated_at = timestamp();
+            }
+            node.updated_at = timestamp();
+            requeued.push(node.task_id.clone());
         }
         if !requeued.is_empty() {
             self.updated_at = timestamp();
@@ -2682,6 +2998,246 @@ impl FinalVerificationWaveReceipt {
         let bytes = serde_json::to_vec(&payload).context("failed to serialize final wave")?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
+}
+
+/// Per-file content fingerprint for baseline attribution.
+///
+/// Distinguishes pre-existing dirty files from real new changes
+/// by comparing content hash, size, and file kind between snapshots.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFingerprint {
+    /// Repository-relative path.
+    pub path: String,
+    /// SHA-256 of the file contents at snapshot time.
+    pub content_hash: String,
+    /// Human-readable file kind (e.g. "rust", "markdown", "binary").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_kind: Option<String>,
+    /// File size in bytes at snapshot time.
+    pub size_bytes: u64,
+}
+
+/// Classification of one file between two snapshots.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAttributionClass {
+    /// File was already changed before the worker started (baseline dirty).
+    UnchangedBaseline,
+    /// File is new (not present in baseline).
+    Added,
+    /// File was modified from its baseline state.
+    Modified,
+    /// File was present in baseline but is now deleted or renamed away.
+    Removed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAttribution {
+    pub fingerprint: FileFingerprint,
+    pub classification: FileAttributionClass,
+}
+
+/// Result of per-file baseline attribution between two snapshots.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerFileAttributionResult {
+    /// Session or attempt identifier.
+    pub session_id: String,
+    pub attempt: usize,
+    /// Files whose after-fingerprint matches the before-fingerprint exactly.
+    pub unchanged_baseline: Vec<FileAttribution>,
+    /// Files present in after but not in before.
+    pub added: Vec<FileAttribution>,
+    /// Files whose content/size changed between before and after.
+    pub modified: Vec<FileAttribution>,
+    /// Files present in before but absent from after (deleted or renamed).
+    pub removed: Vec<FileAttribution>,
+    /// Scope-level verdict: true iff added, modified, and removed are all empty
+    /// (only unchanged baseline files remain).
+    pub scope_verdict: bool,
+}
+
+/// Compute a FileFingerprint for one path by reading it from disk.
+/// Returns None when the path cannot be read (e.g. deleted or directory).
+pub fn fingerprint_file(workspace: &std::path::Path, path: &str) -> Option<FileFingerprint> {
+    let full_path = workspace.join(path);
+    let metadata = std::fs::symlink_metadata(&full_path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let contents = std::fs::read(&full_path).ok()?;
+    let content_hash = format!("{:x}", Sha256::digest(&contents));
+    let file_kind = full_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| match ext {
+            "rs" => "rust",
+            "md" => "markdown",
+            "json" | "jsonl" => "json",
+            "toml" => "toml",
+            "ts" | "tsx" => "typescript",
+            "js" | "jsx" => "javascript",
+            "css" | "scss" | "less" => "stylesheet",
+            "html" => "html",
+            "yaml" | "yml" => "yaml",
+            "sh" | "bash" | "zsh" => "shell",
+            "py" => "python",
+            _ => "other",
+        })
+        .map(ToString::to_string);
+    Some(FileFingerprint {
+        path: path.to_string(),
+        content_hash,
+        file_kind,
+        size_bytes: metadata.len(),
+    })
+}
+
+/// Fingerprint every path in the list from disk, returning a map keyed by path.
+pub fn fingerprint_paths(
+    workspace: &std::path::Path,
+    paths: &[String],
+) -> std::collections::HashMap<String, FileFingerprint> {
+    let mut map = std::collections::HashMap::new();
+    for path in paths {
+        if let Some(fp) = fingerprint_file(workspace, path) {
+            map.insert(path.clone(), fp);
+        }
+    }
+    map
+}
+
+/// Compute per-file baseline attribution between two sets of fingerprints.
+///
+/// `before` fingerprints represent the state before work began (baseline).
+/// `after` fingerprints represent the state after work completed.
+///
+/// Only paths whose after fingerprint differs from before (or is new/removed)
+/// produce non-`UnchangedBaseline` classifications.
+///
+/// Returns a structured result with a scope verdict that is true iff no real
+/// change (add/modify/remove) occurred.
+pub fn compute_per_file_attribution(
+    before: &std::collections::HashMap<String, FileFingerprint>,
+    after: &std::collections::HashMap<String, FileFingerprint>,
+    session_id: &str,
+    attempt: usize,
+) -> PerFileAttributionResult {
+    let before_paths: std::collections::HashSet<&str> =
+        before.keys().map(String::as_str).collect();
+
+    let mut unchanged_baseline = Vec::new();
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut removed = Vec::new();
+
+    for (path, before_fp) in before {
+        if let Some(after_fp) = after.get(path) {
+            if before_fp.content_hash == after_fp.content_hash && before_fp.size_bytes == after_fp.size_bytes {
+                unchanged_baseline.push(FileAttribution {
+                    fingerprint: after_fp.clone(),
+                    classification: FileAttributionClass::UnchangedBaseline,
+                });
+            } else {
+                modified.push(FileAttribution {
+                    fingerprint: after_fp.clone(),
+                    classification: FileAttributionClass::Modified,
+                });
+            }
+        } else {
+            removed.push(FileAttribution {
+                fingerprint: before_fp.clone(),
+                classification: FileAttributionClass::Removed,
+            });
+        }
+    }
+
+    for (path, after_fp) in after {
+        if !before_paths.contains(path.as_str()) {
+            added.push(FileAttribution {
+                fingerprint: after_fp.clone(),
+                classification: FileAttributionClass::Added,
+            });
+        }
+    }
+
+    let scope_verdict = added.is_empty() && modified.is_empty() && removed.is_empty();
+
+    PerFileAttributionResult {
+        session_id: session_id.to_string(),
+        attempt,
+        unchanged_baseline,
+        added,
+        modified,
+        removed,
+        scope_verdict,
+    }
+}
+
+/// Determine whether a shell command is destructive and must be hard-rejected
+/// before execution.
+///
+/// Returns the first matched pattern when the command is destructive, or
+/// `None` when the command is safe to execute.
+pub fn is_destructive_command(command: &str) -> Option<&'static str> {
+    // Tokenize conservatively so shell prefixes, quoted `sh -c` payloads,
+    // absolute binary paths, and `git -C <dir> ...` cannot bypass the gate.
+    // This is intentionally a hard safety boundary: a false positive is
+    // recoverable, while allowing a destructive command can erase user work.
+    let words = command
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '\'' | '"' | ';' | '|' | '&' | '(' | ')')
+        })
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    for (index, word) in words.iter().enumerate() {
+        let executable = word.rsplit('/').next().unwrap_or(word);
+        if executable == "rm" {
+            return Some("rm (destructive)");
+        }
+        if executable != "git" {
+            continue;
+        }
+
+        let mut subcommand = None;
+        let mut cursor = index + 1;
+        while cursor < words.len() {
+            let token = words[cursor].as_str();
+            if token == "-c" {
+                cursor = cursor.saturating_add(2);
+                continue;
+            }
+            if token.starts_with("-c") || token.starts_with("--git-") {
+                cursor += 1;
+                continue;
+            }
+            if token.starts_with('-') {
+                cursor += 1;
+                continue;
+            }
+            subcommand = Some(token);
+            break;
+        }
+
+        match subcommand {
+            Some("checkout") => return Some("git checkout (destructive)"),
+            Some("restore") => return Some("git restore (destructive)"),
+            Some("clean") => return Some("git clean (destructive)"),
+            Some("reset") => {
+                if words[index + 1..].iter().any(|word| word == "--hard") {
+                    return Some("git reset --hard");
+                }
+                if !words[index + 1..].iter().any(|word| word == "--soft") {
+                    return Some("git reset (destructive)");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4042,6 +4598,63 @@ pub struct StateStore {
     root: PathBuf,
 }
 
+pub const CANONICAL_PLAN_BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+/// The approved plan and the receipt chain that authorizes it must be read as
+/// one durable snapshot. The legacy `.plan.json` file remains a compatibility
+/// mirror, while this bundle is the recovery authority after a process stop.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalPlanBundle {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub plan: crate::plan_graph::PlanGraph,
+    pub approval: crate::plan_review::PlanApprovalState,
+    pub binding_hash: String,
+}
+
+impl CanonicalPlanBundle {
+    fn seal(
+        plan: crate::plan_graph::PlanGraph,
+        approval: crate::plan_review::PlanApprovalState,
+    ) -> Result<Self> {
+        let mut bundle = Self {
+            schema_version: CANONICAL_PLAN_BUNDLE_SCHEMA_VERSION,
+            goal_id: plan.goal_id.clone(),
+            plan,
+            approval,
+            binding_hash: String::new(),
+        };
+        bundle.binding_hash = bundle.expected_hash()?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != CANONICAL_PLAN_BUNDLE_SCHEMA_VERSION
+            || self.goal_id.trim().is_empty()
+            || self.goal_id != self.plan.goal_id
+            || self.approval.goal_id != self.goal_id
+        {
+            bail!("canonical plan bundle has an invalid identity or schema");
+        }
+        self.plan.validate()?;
+        self.approval.validate_against(&self.plan)?;
+        if self.binding_hash != self.expected_hash()? {
+            bail!("canonical plan bundle binding hash mismatch");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.binding_hash.clear();
+        let bytes =
+            serde_json::to_vec(&payload).context("failed to serialize canonical plan bundle")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 impl StateStore {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
@@ -4051,6 +4664,121 @@ impl StateStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn global_provider_cooldown_path(&self) -> PathBuf {
+        self.root.join("provider-global-cooldown.json")
+    }
+
+    pub fn read_global_provider_cooldown(&self) -> Result<Option<GlobalProviderCooldown>> {
+        let path = self.global_provider_cooldown_path();
+        if !path.is_file() {
+            return self.infer_legacy_free_provider_cooldown();
+        }
+        let cooldown: GlobalProviderCooldown = read_json_file(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        cooldown
+            .validate()
+            .with_context(|| format!("invalid global provider cooldown at {}", path.display()))?;
+        Ok(Some(cooldown))
+    }
+
+    fn infer_legacy_free_provider_cooldown(&self) -> Result<Option<GlobalProviderCooldown>> {
+        const COOLDOWN_MS: u64 = 24 * 60 * 60 * 1000;
+        let mut failed_models = Vec::new();
+        let mut latest_failure_ms = 0;
+        let mut source_task = None;
+        let mut reason = None;
+        let Ok(entries) = fs::read_dir(self.workers_dir()) else {
+            return Ok(None);
+        };
+        for entry in entries.flatten().take(128) {
+            let path = entry.path().join("provider-cooldown.json");
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+                continue;
+            };
+            let Some(model) = value.get("model").and_then(Value::as_str) else {
+                continue;
+            };
+            if !model
+                .split('/')
+                .next_back()
+                .is_some_and(|suffix| suffix.ends_with("-free"))
+            {
+                continue;
+            }
+            let failure = value
+                .get("failure")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !(failure.contains("rate limit")
+                || failure.contains("quota")
+                || failure.contains("free usage")
+                || failure.contains("limit exhausted")
+                || failure.contains("too many requests"))
+            {
+                continue;
+            }
+            let failed_at = value
+                .get("failed_at")
+                .and_then(Value::as_str)
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                .map(|timestamp| u64::try_from(timestamp.timestamp_millis()).unwrap_or(0))
+                .unwrap_or(0);
+            let now_ms = u64::try_from(Local::now().timestamp_millis()).unwrap_or(0);
+            if failed_at == 0 || now_ms.saturating_sub(failed_at) >= COOLDOWN_MS {
+                continue;
+            }
+            if !failed_models
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(model))
+            {
+                failed_models.push(model.to_string());
+            }
+            if failed_at >= latest_failure_ms {
+                latest_failure_ms = failed_at;
+                source_task = value
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                reason = value
+                    .get("failure")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+            }
+        }
+        if failed_models.is_empty() {
+            return Ok(None);
+        }
+        failed_models.sort_unstable();
+        GlobalProviderCooldown {
+            schema_version: GLOBAL_PROVIDER_COOLDOWN_SCHEMA_VERSION,
+            provider_scope: "opencode-free-tier".to_string(),
+            failed_models,
+            reason: reason.unwrap_or_else(|| "legacy free provider quota".to_string()),
+            failed_at: timestamp(),
+            cooldown_until_ms: latest_failure_ms.saturating_add(COOLDOWN_MS),
+            source_task: source_task.unwrap_or_else(|| "legacy-provider-receipt".to_string()),
+            source_attempt: 0,
+            recorded_at: timestamp(),
+            receipt_hash: String::new(),
+        }
+        .seal()
+        .map(Some)
+    }
+
+    pub fn write_global_provider_cooldown(
+        &self,
+        cooldown: GlobalProviderCooldown,
+    ) -> Result<PathBuf> {
+        let cooldown = cooldown.seal()?;
+        let path = self.global_provider_cooldown_path();
+        write_json_atomic(&path, &cooldown)?;
+        Ok(path)
     }
 
     /// The pre-`.gear` runtime root remains available for explicit migration
@@ -4161,6 +4889,11 @@ impl StateStore {
 
     pub fn plans_dir(&self) -> PathBuf {
         self.root.join("plans")
+    }
+
+    pub fn canonical_plan_bundle_path(&self, goal_id: &str) -> PathBuf {
+        self.plans_dir()
+            .join(format!("{goal_id}.canonical.bundle.json"))
     }
 
     pub fn plan_reviews_dir(&self) -> PathBuf {
@@ -5323,12 +6056,20 @@ impl StateStore {
         plan_graph
             .validate()
             .context("refusing to persist an invalid PlanGraph")?;
-        self.validate_plan_approval_bundle(plan_graph)
+        let approval = self
+            .read_plan_approval_state(&plan_graph.goal_id)?
+            .context("approved PlanGraph is missing approval.json")?;
+        self.validate_plan_approval_bundle_with_approval(plan_graph, &approval)
             .context("refusing to persist a PlanGraph without a valid approval bundle")?;
+        let bundle = CanonicalPlanBundle::seal(plan_graph.clone(), approval)?;
+        write_json_atomic(
+            &self.canonical_plan_bundle_path(&plan_graph.goal_id),
+            &bundle,
+        )?;
         let path = self
             .plans_dir()
             .join(format!("{}.plan.json", plan_graph.goal_id));
-        write_json(&path, plan_graph)?;
+        write_json_atomic(&path, plan_graph)?;
         Ok(path)
     }
 
@@ -5342,7 +6083,7 @@ impl StateStore {
         let path = self
             .plans_dir()
             .join(format!("{}.unreviewed.plan.json", plan_graph.goal_id));
-        write_json(&path, plan_graph)?;
+        write_json_atomic(&path, plan_graph)?;
         Ok(path)
     }
 
@@ -5358,7 +6099,7 @@ impl StateStore {
             plan_graph.revision,
             &plan_graph.plan_hash[..16]
         ));
-        write_json(&path, plan_graph)?;
+        write_json_atomic(&path, plan_graph)?;
         Ok(path)
     }
 
@@ -5757,6 +6498,26 @@ impl StateStore {
     }
 
     pub fn read_plan_graph(&self, goal_id: &str) -> Result<Option<crate::plan_graph::PlanGraph>> {
+        let bundle_path = self.canonical_plan_bundle_path(goal_id);
+        if bundle_path.exists() {
+            let bundle: CanonicalPlanBundle = read_json_file(&bundle_path).with_context(|| {
+                format!(
+                    "failed to read canonical plan bundle {}",
+                    bundle_path.display()
+                )
+            })?;
+            bundle.validate().with_context(|| {
+                format!("invalid canonical plan bundle at {}", bundle_path.display())
+            })?;
+            self.validate_plan_approval_bundle_with_approval(&bundle.plan, &bundle.approval)
+                .with_context(|| {
+                    format!(
+                        "invalid approval receipt chain in canonical plan bundle {}",
+                        bundle_path.display()
+                    )
+                })?;
+            return Ok(Some(bundle.plan));
+        }
         let path = self.plans_dir().join(format!("{goal_id}.plan.json"));
         if !path.exists() {
             return Ok(None);
@@ -5800,6 +6561,14 @@ impl StateStore {
         let approval = self
             .read_plan_approval_state(&plan_graph.goal_id)?
             .context("approved PlanGraph is missing approval.json")?;
+        self.validate_plan_approval_bundle_with_approval(plan_graph, &approval)
+    }
+
+    fn validate_plan_approval_bundle_with_approval(
+        &self,
+        plan_graph: &crate::plan_graph::PlanGraph,
+        approval: &crate::plan_review::PlanApprovalState,
+    ) -> Result<()> {
         approval.validate_against(plan_graph)?;
         let review_dir = self.plan_review_dir(&plan_graph.goal_id);
         let revision = plan_graph.revision;
@@ -5910,19 +6679,44 @@ impl StateStore {
         payload: Value,
     ) -> Result<GoalEpochEvent> {
         let path = self.goal_epoch_path(goal_id);
-        let scan = scan_goal_epoch_event_ledger(&path, goal_id, idempotency_key)?;
+        let mut effective_idempotency_key = idempotency_key.to_string();
+        let mut scan = scan_goal_epoch_event_ledger(&path, goal_id, idempotency_key)?;
         if let Some(recorded) = scan.duplicate.as_ref() {
             if recorded.epoch_id == epoch_id && recorded.kind == kind && recorded.payload == payload
             {
                 return Ok(recorded.clone());
             }
-            bail!("goal epoch idempotency key conflicts with an existing event");
+            if matches!(
+                kind,
+                GoalEpochEventKind::Settled | GoalEpochEventKind::Aborted
+            ) {
+                bail!("goal epoch idempotency key conflicts with an existing event");
+            }
+            // Non-terminal lifecycle observations are replay-safe. A resumed
+            // run may produce a different budget/phase receipt after a
+            // model/provider retry; preserve both observations under a
+            // deterministic payload-derived key instead of turning a
+            // transport retry into a corrupt epoch. Terminal events remain
+            // strict because they close the active epoch.
+            let payload_hash = Sha256::digest(serde_json::to_vec(&(&kind, &payload))?);
+            let payload_hash = format!("{payload_hash:x}");
+            effective_idempotency_key = format!("{idempotency_key}.replay.{}", &payload_hash[..16]);
+            scan = scan_goal_epoch_event_ledger(&path, goal_id, &effective_idempotency_key)?;
+            if let Some(replayed) = scan.duplicate.as_ref() {
+                if replayed.epoch_id == epoch_id
+                    && replayed.kind == kind
+                    && replayed.payload == payload
+                {
+                    return Ok(replayed.clone());
+                }
+                bail!("goal epoch replay key conflicts with an existing event");
+            }
         }
         let event = GoalEpochEvent::seal(
             goal_id,
             epoch_id,
             scan.event_count,
-            idempotency_key,
+            &effective_idempotency_key,
             kind,
             payload,
             scan.previous_hash,
@@ -6093,6 +6887,28 @@ impl StateStore {
         Ok(settled)
     }
 
+    /// Release reservations left open by a process that stopped before the
+    /// worker outcome was reduced. A continuation gets a fresh reservation
+    /// keyed by the plan-node attempt, so a stale reservation must not block
+    /// or collide with the resumed dispatch.
+    pub fn release_reserved_budget_calls(&self, goal_id: &str) -> Result<Vec<String>> {
+        let mut ledger = self.read_goal_budget_ledger(goal_id)?;
+        let mut released = Vec::new();
+        for reservation in &mut ledger.reservations {
+            if reservation.status != BudgetReservationStatus::Reserved {
+                continue;
+            }
+            reservation.status = BudgetReservationStatus::Released;
+            reservation.settled_at = Some(timestamp());
+            released.push(reservation.reservation_id.clone());
+        }
+        if !released.is_empty() {
+            ledger.updated_at = timestamp();
+            self.write_goal_budget_ledger(ledger)?;
+        }
+        Ok(released)
+    }
+
     fn write_goal_budget_ledger(&self, ledger: GoalBudgetLedger) -> Result<()> {
         let goal_id = ledger.goal_id.clone();
         let ledger = ledger.seal()?;
@@ -6151,10 +6967,11 @@ impl StateStore {
         let Some(epoch_id) = active_epoch else {
             return Ok(None);
         };
+        let recovery_key = format!("recovery.{epoch_id}.aborted.{}", events.len());
         let event = self.append_goal_epoch_event(
             goal_id,
             &epoch_id,
-            &format!("recovery.{epoch_id}.aborted"),
+            &recovery_key,
             GoalEpochEventKind::Aborted,
             serde_json::json!({ "reason": reason }),
         )?;
@@ -6230,6 +7047,19 @@ impl StateStore {
         Ok(path)
     }
 
+    pub fn write_artifact_json_atomic<T: Serialize>(
+        &self,
+        goal_id: &str,
+        file_name: &str,
+        value: &T,
+    ) -> Result<PathBuf> {
+        let dir = self.artifact_dir(goal_id);
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let path = dir.join(file_name);
+        write_json_atomic(&path, value)?;
+        Ok(path)
+    }
+
     pub fn write_worker_file(
         &self,
         task_id: &str,
@@ -6241,6 +7071,20 @@ impl StateStore {
         let path = dir.join(file_name);
         fs::write(&path, contents)
             .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn write_worker_json_atomic<T>(
+        &self,
+        task_id: &str,
+        file_name: &str,
+        value: &T,
+    ) -> Result<PathBuf>
+    where
+        T: Serialize + ?Sized,
+    {
+        let path = self.worker_dir(task_id).join(file_name);
+        write_json_atomic(&path, value)?;
         Ok(path)
     }
 
@@ -6705,6 +7549,179 @@ where
 }
 
 #[cfg(test)]
+mod gbx236_per_file_attribution_tests {
+    use super::*;
+
+    #[test]
+    fn per_file_attribution_classifies_unchanged_baseline() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+        let file_path = workspace.join("src/main.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "fn main() {}").unwrap();
+
+        let before = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+        let after = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+        let result = compute_per_file_attribution(&before, &after, "session-1", 1);
+
+        assert_eq!(result.unchanged_baseline.len(), 1);
+        assert!(result.added.is_empty());
+        assert!(result.modified.is_empty());
+        assert!(result.removed.is_empty());
+        assert!(result.scope_verdict);
+        assert_eq!(result.session_id, "session-1");
+        assert_eq!(result.attempt, 1);
+        assert_eq!(
+            result.unchanged_baseline[0].classification,
+            FileAttributionClass::UnchangedBaseline
+        );
+    }
+
+    #[test]
+    fn per_file_attribution_detects_new_additions() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "pub fn lib() {}").unwrap();
+
+        // Before has only main.rs; after has both
+        let before = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+        let after = fingerprint_paths(
+            workspace,
+            &["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        );
+        let result = compute_per_file_attribution(&before, &after, "session-2", 1);
+
+        assert_eq!(result.unchanged_baseline.len(), 1);
+        assert_eq!(result.added.len(), 1);
+        assert_eq!(result.added[0].fingerprint.path, "src/lib.rs");
+        assert_eq!(result.added[0].classification, FileAttributionClass::Added);
+        assert!(result.modified.is_empty());
+        assert!(result.removed.is_empty());
+        assert!(!result.scope_verdict);
+    }
+
+    #[test]
+    fn per_file_attribution_detects_modified_content() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+
+        // Write initial content
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        // Capture fingerprint before modification
+        let before_fp = fingerprint_file(workspace, "src/main.rs")
+            .expect("before fingerprint should succeed");
+        let before = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+
+        // Modify the file
+        std::fs::write(workspace.join("src/main.rs"), "fn main() { println!(\"changed\"); }\n")
+            .unwrap();
+
+        let after = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+        let result = compute_per_file_attribution(&before, &after, "session-3", 1);
+
+        assert!(result.unchanged_baseline.is_empty());
+        assert_eq!(result.modified.len(), 1);
+        assert_eq!(result.modified[0].fingerprint.path, "src/main.rs");
+        assert_eq!(
+            result.modified[0].classification,
+            FileAttributionClass::Modified
+        );
+        assert!(result.added.is_empty());
+        assert!(result.removed.is_empty());
+        assert!(!result.scope_verdict);
+        // Content hash must differ
+        assert_ne!(
+            result.modified[0].fingerprint.content_hash,
+            before_fp.content_hash
+        );
+    }
+
+    #[test]
+    fn per_file_attribution_detects_removed_paths() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let before = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+        // Delete the file before building after
+        std::fs::remove_file(workspace.join("src/main.rs")).unwrap();
+        let after = fingerprint_paths(workspace, &["src/main.rs".to_string()]);
+
+        let result = compute_per_file_attribution(&before, &after, "session-4", 1);
+
+        assert!(result.unchanged_baseline.is_empty());
+        assert!(result.added.is_empty());
+        assert!(result.modified.is_empty());
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].fingerprint.path, "src/main.rs");
+        assert_eq!(
+            result.removed[0].classification,
+            FileAttributionClass::Removed
+        );
+        assert!(!result.scope_verdict);
+    }
+
+    #[test]
+    fn destructive_command_rejects_dangerous_patterns() {
+        // Hard git operations
+        assert!(is_destructive_command("git checkout main").is_some());
+        assert!(is_destructive_command("git checkout -- src/main.rs").is_some());
+        assert!(is_destructive_command("git reset --hard HEAD").is_some());
+        assert!(is_destructive_command("git restore src/main.rs").is_some());
+        assert!(is_destructive_command("git clean -fd").is_some());
+        assert!(is_destructive_command("git -C /tmp checkout main").is_some());
+        assert!(is_destructive_command("sh -c 'git checkout main'").is_some());
+        assert!(is_destructive_command("/bin/rm -f user-file").is_some());
+
+        // Destructive rm
+        assert!(is_destructive_command("rm -rf /tmp").is_some());
+        assert!(is_destructive_command("rm --recursive --force .").is_some());
+
+        // Safe commands should return None
+        assert!(is_destructive_command("cargo check").is_none());
+        assert!(is_destructive_command("cargo test -p gearbox_agent").is_none());
+        assert!(is_destructive_command("echo hello").is_none());
+        assert!(is_destructive_command("git status").is_none());
+        assert!(is_destructive_command("git diff").is_none());
+        assert!(is_destructive_command("git reset --soft HEAD").is_none());
+        assert!(is_destructive_command("git log --oneline").is_none());
+        assert!(is_destructive_command("ls -la").is_none());
+    }
+
+    #[test]
+    fn fingerprint_file_returns_none_for_missing_or_directory() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+
+        // Non-existent file
+        assert!(fingerprint_file(workspace, "nonexistent.rs").is_none());
+
+        // Directory
+        std::fs::create_dir(workspace.join("subdir")).unwrap();
+        assert!(fingerprint_file(workspace, "subdir").is_none());
+    }
+
+    #[test]
+    fn fingerprint_file_returns_content_hash_and_metadata() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+        std::fs::write(workspace.join("test.rs"), "fn main() {}\n").unwrap();
+
+        let fp = fingerprint_file(workspace, "test.rs")
+            .expect("fingerprint should succeed for existing file");
+        assert_eq!(fp.path, "test.rs");
+        assert_eq!(fp.size_bytes, 13);
+        assert_eq!(fp.file_kind.as_deref(), Some("rust"));
+        assert_eq!(fp.content_hash.len(), 64); // SHA-256 hex
+    }
+}
+
+#[cfg(test)]
 mod epoch_tests {
     use super::*;
     use serde_json::json;
@@ -6731,17 +7748,6 @@ mod epoch_tests {
         )?;
         assert_eq!(replay.event_hash, started.event_hash);
         assert_eq!(store.read_goal_epoch_events("goal-1")?.len(), 1);
-        assert!(
-            store
-                .append_goal_epoch_event(
-                    "goal-1",
-                    "epoch-1",
-                    "epoch-1.started",
-                    GoalEpochEventKind::Started,
-                    json!({ "plan_revision": 2 }),
-                )
-                .is_err()
-        );
         let settled = store.append_goal_epoch_event(
             "goal-1",
             "epoch-1",
@@ -6749,6 +7755,17 @@ mod epoch_tests {
             GoalEpochEventKind::Settled,
             json!({ "outcome": "review_required" }),
         )?;
+        assert!(
+            store
+                .append_goal_epoch_event(
+                    "goal-1",
+                    "epoch-1",
+                    "epoch-1.settled",
+                    GoalEpochEventKind::Settled,
+                    json!({ "outcome": "changed" }),
+                )
+                .is_err()
+        );
 
         assert_eq!(started.sequence, 0);
         assert_eq!(settled.sequence, 1);
@@ -6759,6 +7776,63 @@ mod epoch_tests {
         let contents = fs::read_to_string(&path)?;
         fs::write(&path, contents.replace("review_required", "complete"))?;
         assert!(store.read_goal_epoch_events("goal-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn goal_epoch_resume_and_failure_abort_keys_allow_changed_payloads() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        store.append_goal_epoch_event(
+            "goal-resume",
+            "epoch-resume",
+            "epoch-resume.started",
+            GoalEpochEventKind::Started,
+            json!({ "session_id": "session-1" }),
+        )?;
+        store.append_goal_epoch_event(
+            "goal-resume",
+            "epoch-resume",
+            "recovery.epoch-resume.aborted",
+            GoalEpochEventKind::Aborted,
+            json!({ "reason": "previous process" }),
+        )?;
+        store.append_goal_epoch_event(
+            "goal-resume",
+            "epoch-resume",
+            "epoch-resume.started.resume.1",
+            GoalEpochEventKind::Started,
+            json!({ "session_id": "session-2" }),
+        )?;
+        store.append_goal_epoch_event(
+            "goal-resume",
+            "epoch-resume",
+            "epoch-resume.review.completed",
+            GoalEpochEventKind::PhaseCompleted,
+            json!({ "status": "running", "review": 1 }),
+        )?;
+        let replayed_phase = store.append_goal_epoch_event(
+            "goal-resume",
+            "epoch-resume",
+            "epoch-resume.review.completed",
+            GoalEpochEventKind::PhaseCompleted,
+            json!({ "status": "complete", "review": 2 }),
+        )?;
+        assert_ne!(
+            replayed_phase.idempotency_key,
+            "epoch-resume.review.completed"
+        );
+        let failure = store.append_goal_epoch_event(
+            "goal-resume",
+            "epoch-resume",
+            "epoch-resume.aborted.failure.deadbeef",
+            GoalEpochEventKind::Aborted,
+            json!({ "status": "failed", "reason": "new failure" }),
+        )?;
+        assert_eq!(failure.kind, GoalEpochEventKind::Aborted);
+        assert_eq!(store.read_goal_epoch_events("goal-resume")?.len(), 6);
         Ok(())
     }
 
@@ -7384,6 +8458,49 @@ mod epoch_tests {
     }
 
     #[test]
+    fn continuation_releases_open_worker_reservations() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let budget = Budget {
+            max_worker_calls: 4,
+            max_tokens_per_call: 60,
+            max_tokens_per_epoch: 240,
+            max_usage_unknown_calls: 4,
+            ..Budget::default()
+        };
+        let lease = store.acquire_goal_run_lease(
+            "goal-recovery",
+            "epoch-recovery",
+            "session-1",
+            std::time::Duration::from_secs(60),
+        )?;
+        store.reserve_budget_call(
+            &lease,
+            "epoch-recovery.worker.3",
+            "worker",
+            true,
+            false,
+            &budget,
+        )?;
+        lease.release()?;
+
+        let released = store.release_reserved_budget_calls("goal-recovery")?;
+        assert_eq!(released, vec!["epoch-recovery.worker.3"]);
+        let ledger = store.read_goal_budget_ledger("goal-recovery")?;
+        assert_eq!(
+            ledger.reservations[0].status,
+            BudgetReservationStatus::Released
+        );
+        assert!(
+            store
+                .release_reserved_budget_calls("goal-recovery")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn epoch_call_budget_does_not_consume_worker_call_budget() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -7440,6 +8557,7 @@ mod plan_wave_tests {
     use super::*;
     use crate::plan_graph::{PlanGraph, PlanSource};
     use crate::state::Scope;
+    use crate::tools::DiffSnapshot;
     use std::collections::HashMap;
 
     fn two_task_plan() -> Result<PlanGraph> {
@@ -7451,11 +8569,13 @@ mod plan_wave_tests {
         );
         let mut second = draft.tasks[0].clone();
         second.task_id = "task_004".to_string();
+        second.logical_task_id = Some("task_004".to_string());
         second.title = "Execute the second independent node".to_string();
         second.parallel_wave = 0;
         second.scope.allowed_files = vec!["tests".to_string()];
         second.scope.write_scope = vec!["tests".to_string()];
         draft.tasks[0].task_id = "task_003".to_string();
+        draft.tasks[0].logical_task_id = Some("task_003".to_string());
         draft.tasks.push(second);
         PlanGraph::seal(
             "goal-wave",
@@ -7470,6 +8590,14 @@ mod plan_wave_tests {
     fn worker_step_evidence_rejects_out_of_order_completion() -> Result<()> {
         let plan = two_task_plan()?;
         let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        assert_eq!(
+            ledger
+                .nodes
+                .iter()
+                .map(|node| node.logical_task_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("task_003"), Some("task_004")]
+        );
         let node = ledger.node_mut("task_003")?;
         node.execution_steps = vec![
             PlanStepRun {
@@ -7612,6 +8740,39 @@ mod plan_wave_tests {
     }
 
     #[test]
+    fn typed_evidence_receipt_is_bound_to_obligation_and_attempt() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        let obligation = crate::plan_graph::PlanEvidenceObligation {
+            obligation_id: "green_001".to_string(),
+            kind: "artifact".to_string(),
+            producer: "executor".to_string(),
+            consumer: "completion_gate".to_string(),
+            freshness: "attempt".to_string(),
+            required_for: vec!["completion".to_string()],
+            evidence_path: Some("artifacts/green.md".to_string()),
+            unavailable_reason: None,
+        };
+        let node = ledger.node_mut("task_003")?;
+        node.attempt = 1;
+        node.record_obligation_evidence(
+            &obligation,
+            CriterionEvidenceStatus::Pass,
+            1,
+            "artifacts/green.md",
+            "sha-green",
+        )?;
+        assert!(node.all_evidence_obligations_passed(&[obligation.clone()]));
+        let mut wrong_producer = obligation.clone();
+        wrong_producer.producer = "reviewer".to_string();
+        assert!(!node.all_evidence_obligations_passed(&[wrong_producer]));
+        let mut wrong_id = obligation;
+        wrong_id.obligation_id = "other".to_string();
+        assert!(!node.all_evidence_obligations_passed(&[wrong_id]));
+        Ok(())
+    }
+
+    #[test]
     fn failed_plan_nodes_requeue_for_continuation_without_losing_evidence() -> Result<()> {
         let plan = two_task_plan()?;
         let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
@@ -7658,6 +8819,50 @@ mod plan_wave_tests {
         assert_eq!(ledger.epoch_id, "epoch-2");
         assert!(ledger.nodes.iter().all(|node| node.epoch_id == "epoch-2"));
         assert_eq!(ledger.node_mut("task_003")?.attempt, 1);
+        ledger.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_plan_nodes_requeue_after_restart_without_losing_worker_evidence() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        let node = ledger.node_mut("task_003")?;
+        node.attempt = 3;
+        node.status = PlanNodeRunStatus::Running;
+        node.worker_task_id = Some("worker-in-flight".to_string());
+        node.worker_result_path = Some(".gear/workers/worker-in-flight/result.json".to_string());
+        node.worker_outcome_path = Some(".gear/workers/worker-in-flight/outcome.json".to_string());
+        node.preflight_path = Some("artifacts/old-preflight.md".to_string());
+        node.preflight_satisfied = true;
+        node.execution_steps[0].status = PlanStepRunStatus::Completed;
+        node.execution_steps[1].status = PlanStepRunStatus::Running;
+
+        let reviewed = ledger.node_mut("task_004")?;
+        reviewed.status = PlanNodeRunStatus::Reviewed;
+        reviewed.worker_result_path = Some("artifacts/reviewed-result.json".to_string());
+
+        let requeued = ledger.requeue_incomplete_for_resume();
+        assert_eq!(
+            requeued,
+            vec!["task_003".to_string(), "task_004".to_string()]
+        );
+        let node = ledger.node_mut("task_003")?;
+        assert_eq!(node.status, PlanNodeRunStatus::Pending);
+        assert_eq!(node.attempt, 3);
+        assert_eq!(
+            node.worker_result_path.as_deref(),
+            Some(".gear/workers/worker-in-flight/result.json")
+        );
+        assert_eq!(node.worker_task_id.as_deref(), Some("worker-in-flight"));
+        assert!(!node.preflight_satisfied);
+        assert!(node.preflight_path.is_none());
+        assert!(
+            node.execution_steps
+                .iter()
+                .all(|step| step.status == PlanStepRunStatus::Pending)
+        );
+        assert!(ledger.active_task_ids().is_empty());
         ledger.validate()?;
         Ok(())
     }
@@ -7732,6 +8937,7 @@ mod plan_wave_tests {
             plan_revision: 1,
             plan_hash: "hash-1".to_string(),
             task_id: "task-003".to_string(),
+            logical_task_id: None,
             attempt: 1,
             dependencies: Vec::new(),
             status: PlanNodeRunStatus::Implemented,
@@ -7746,6 +8952,9 @@ mod plan_wave_tests {
             worker_commands_run: Vec::new(),
             worker_known_failures: Vec::new(),
             worker_next_steps: Vec::new(),
+            worker_diagnostics: Vec::new(),
+            worker_diagnostic_receipt_path: None,
+            worker_diagnostic_status: None,
             worker_plan_gap: None,
             worker_decision: PlanWorkOrderDecision::NotRecorded,
             worker_decision_reason: None,
@@ -8424,6 +9633,140 @@ mod plan_wave_tests {
             })?;
         assert_eq!(updated.epoch_id, "epoch-2");
         assert_eq!(updated.blocking_reason(), Some("context pressure detected"));
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_dirty_forbidden_paths_do_not_trigger_hard_block() -> Result<()> {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["crates/gearbox_agent/src/gui.rs".to_string()],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["crates/gearbox_agent/src/gui.rs".to_string()],
+            diff_hash: None,
+        };
+        let scope = Scope::new(
+            vec!["crates/gearbox_agent/src/workers.rs".to_string()],
+            vec!["crates/gearbox_agent/src/gui.rs".to_string()],
+            10,
+        );
+
+        let (scope_check, _drift, baseline_dirty) =
+            compute_baseline_aware_scope_with_baseline_dirty(&before, &after, &scope);
+
+        // Baseline-dirty forbidden path should NOT trigger a hard block
+        assert!(
+            scope_check.forbidden_touches.is_empty(),
+            "baseline-dirty forbidden paths must not appear in forbidden_touches: {:?}",
+            scope_check.forbidden_touches
+        );
+        // It SHOULD be tracked as baseline_dirty
+        assert_eq!(
+            baseline_dirty,
+            vec!["crates/gearbox_agent/src/gui.rs".to_string()],
+            "baseline-dirty forbidden paths must be reported separately"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_forbidden_touches_still_hard_block_after_baseline_filter() -> Result<()> {
+        let before = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec!["README.md".to_string()],
+            diff_hash: None,
+        };
+        let after = DiffSnapshot {
+            is_git_repo: true,
+            status: String::new(),
+            changed_files: vec![
+                "README.md".to_string(),
+                ".omo/config.json".to_string(),
+            ],
+            diff_hash: None,
+        };
+        let scope = Scope::new(
+            vec!["src".to_string()],
+            vec![".omo".to_string()],
+            10,
+        );
+
+        let (scope_check, _drift, baseline_dirty) =
+            compute_baseline_aware_scope_with_baseline_dirty(&before, &after, &scope);
+
+        // New forbidden touch (not in baseline) must still hard-block
+        assert_eq!(
+            scope_check.forbidden_touches,
+            vec![".omo/config.json".to_string()],
+            "new forbidden touches must still appear in forbidden_touches"
+        );
+        // No baseline-dirty forbidden paths
+        assert!(
+            baseline_dirty.is_empty(),
+            "no files should be baseline-dirty in this test"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn global_provider_cooldown_round_trips_with_hash_binding() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let store = StateStore::new(workspace.path());
+        store.initialize()?;
+        let cooldown = GlobalProviderCooldown {
+            schema_version: GLOBAL_PROVIDER_COOLDOWN_SCHEMA_VERSION,
+            provider_scope: "opencode-free-tier".to_string(),
+            failed_models: vec!["opencode/hy3-free".to_string()],
+            reason: "provider rate limit".to_string(),
+            failed_at: timestamp(),
+            cooldown_until_ms: u64::try_from(Local::now().timestamp_millis())
+                .unwrap_or(0)
+                .saturating_add(86_400_000),
+            source_task: "goal::task".to_string(),
+            source_attempt: 1,
+            recorded_at: timestamp(),
+            receipt_hash: String::new(),
+        };
+        let path = store.write_global_provider_cooldown(cooldown)?;
+        assert_eq!(path, store.global_provider_cooldown_path());
+        let restored = store
+            .read_global_provider_cooldown()?
+            .expect("global cooldown should be durable");
+        restored.validate()?;
+        assert!(restored.is_active());
+        assert_eq!(restored.failed_models, ["opencode/hy3-free"]);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_free_provider_receipt_infers_day_cooldown_without_global_artifact() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let store = StateStore::new(workspace.path());
+        store.initialize()?;
+        let worker_dir = store.worker_dir("goal::task");
+        fs::create_dir_all(&worker_dir)?;
+        fs::write(
+            worker_dir.join("provider-cooldown.json"),
+            serde_json::json!({
+                "task_id": "goal::task",
+                "model": "opencode/mimo-v2.5-free",
+                "failure": "provider quota exceeded",
+                "failed_at": timestamp(),
+            })
+            .to_string(),
+        )?;
+        let cooldown = store
+            .read_global_provider_cooldown()?
+            .expect("legacy free quota should infer a cooldown");
+        assert!(cooldown.is_active());
+        assert_eq!(cooldown.source_task, "goal::task");
+        assert_eq!(cooldown.failed_models, ["opencode/mimo-v2.5-free"]);
         Ok(())
     }
 }

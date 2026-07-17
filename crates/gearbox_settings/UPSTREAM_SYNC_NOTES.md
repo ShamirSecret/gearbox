@@ -863,3 +863,21 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - 仓库观测解析现在识别 `cd ... && ls/wc` 这类常见 shell 包装命令：不再只看第一个 `cd` token，仍只记录工作区内的真实路径并保持去重和 fail-closed。
 - PlanCritic schema repair prompt 现在重新提供精确的 PlanGraph 与 deterministic verifier 上下文，并明确丢弃 worker-packet/step telemetry 误导内容；repair 仍只修 JSON 合约，不放宽严格解析。
 - PlanCritic/Oracle 初始提示现在明确要求先执行至少一个只读仓库命令，再输出 verdict；没有 repository tool call 的文本回答继续按 fail-closed 处理。
+- 2026-07-17 GBX-116 resource-protection GUI projection：`crates/gearbox_agent/src/gui.rs` 从 durable `resource-policy.json` 与 `process-cleanup.json` 有界投影 watcher/protection/cleanup 状态，`crates/agent_ui/src/conversation_view/thread_view.rs` 在 Gear health 面板显示保护与孤儿进程状态；共享 `crates/agent/src/agent.rs` 的 WorkerPacket 测试夹具同步新增 prompt manifest/reconcile/capsule 可选字段。普通 Agent 行为不变。
+
+### 2026-07-17 GBX-251 — Plan revision manifest GUI projection
+
+- `crates/gearbox_agent/src/gui.rs` 从当前 revision 的 durable `plan-revision-manifest-<revision>.json` 有界读取并校验 canonical applied、`requires_re_review`、risk/evidence refs 及受保护工单 lineage；缺失、超限或无效 JSON 只投影明确状态，不伪造 manifest。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在 Gear Work Orders 面板显示 manifest 状态、canonical/re-review 状态、受保护 lineage 变化和受限原因；只增加 Gearbox runtime 投影，上游普通 Agent 对话路径不变。
+
+### 2026-07-17 GBX-252 — Stable logical task lineage projection
+
+- `crates/gearbox_agent/src/gui.rs` 将 manifest 的 bounded logical task lineage 投影到 Gear snapshot；展示型 task ID 改名不会绕过 runtime 的 protected lineage 校验。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在 Gear revision 面板显示 affected logical task 与 base/next relation；只消费 runtime snapshot，不改变上游普通 Agent 对话路径。
+
+### 2026-07-17 GBX-253 — Typed evidence obligations and attempt-bound receipts
+
+- `crates/gearbox_agent/src/plan_graph.rs` 为新计划增加 `PlanEvidenceObligation`，保留旧 `evidence` 文案并在 live planner 边界做确定性兼容归一化；字段包含 obligation、kind、producer、consumer、freshness、required_for、evidence_path/unavailable_reason。
+- `crates/gearbox_agent/src/state.rs` 将 obligation metadata 绑定到当前 PlanNode attempt 的 criterion receipt；完成门只在存在 typed obligations 时检查对应 `evidence:<obligation_id>` receipt，旧 deterministic/legacy 计划继续可读取。
+- `crates/gearbox_agent/src/runtime.rs` 只在 planner/revision runtime 边界重封归一化后的 raw output，避免 seal 隐式改写模型回执；缺证据写入 bounded marker 和 `Blocked/Fail`，不伪造通过。
+- `crates/gearbox_agent/src/gui.rs` 与 `crates/gearbox_agent/src/product.rs` 只读投影 obligation 状态、receipt 路径和 unavailable reason；不改变上游普通 Agent 行为或 `.omo/**`。

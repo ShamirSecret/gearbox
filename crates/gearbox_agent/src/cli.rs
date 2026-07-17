@@ -18,7 +18,7 @@ use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
 use crate::workers::{Intensity, WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
 
-const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'if [ "$GEARBOX_WORKER_RESUME" = "true" ]; then opencode run --pure --format json --session "$GEARBOX_WORKER_SESSION_ID" --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; else opencode run --pure --format json --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; fi'"#;
+const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'if [ "$GEARBOX_WORKER_RESUME" = "true" ]; then opencode run --pure --print-logs --format json --session "$GEARBOX_WORKER_SESSION_ID" --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; else opencode run --pure --print-logs --format json --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; fi'"#;
 
 #[derive(Debug, Parser)]
 #[command(name = "gear")]
@@ -39,6 +39,9 @@ struct RunCommand {
 
     #[arg(long)]
     objective: bool,
+
+    #[arg(long)]
+    session_id: Option<String>,
 
     #[arg(long)]
     auto_continue: bool,
@@ -272,8 +275,8 @@ pub fn run() -> Result<()> {
                 coordinator_review_hook: None,
                 task_manager_control: None,
                 task_manager: None,
-                session_id: None,
-                continuation: false,
+                session_id: command.session_id,
+                continuation: command.objective,
                 intensity: {
                     let parsed = match command.intensity.as_deref() {
                         Some(value) => Some(
@@ -344,8 +347,11 @@ fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
         .clone()
         .or_else(|| worker_command_for_kind(worker_kind, command))
         .or_else(|| {
-            (worker_kind == WorkerKind::OpencodeSession)
-                .then(|| DEFAULT_OPENCODE_SESSION_COMMAND.to_string())
+            matches!(
+                worker_kind,
+                WorkerKind::Opencode | WorkerKind::OpencodeSession
+            )
+            .then(|| DEFAULT_OPENCODE_SESSION_COMMAND.to_string())
         })
         .or_else(|| worker_kind.default_command(worker_model.as_deref()))
         .filter(|command| !command.trim().is_empty());
@@ -357,8 +363,14 @@ fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
             &worker_model,
             command,
         )?
-    } else if command.opencode_free_fallbacks {
-        opencode_free_fallback_routes()
+    } else if command.opencode_free_fallbacks
+        || matches!(worker_kind, WorkerKind::Opencode | WorkerKind::OpencodeSession)
+    {
+        opencode_free_fallback_routes_with_precedence(
+            worker_kind,
+            worker_command.as_deref(),
+            worker_model.as_deref(),
+        )
     } else {
         Vec::new()
     };
@@ -402,6 +414,58 @@ fn opencode_free_fallback_routes() -> Vec<WorkerRoute> {
         worker_model: Some(worker_model.to_string()),
     })
     .collect()
+}
+
+fn opencode_paid_fallback_routes() -> Vec<WorkerRoute> {
+    [
+        "opencode-go/mimo-v2.5",
+        "opencode-go/deepseek-v4-flash",
+    ]
+    .into_iter()
+    .map(|worker_model| WorkerRoute {
+        worker_kind: WorkerKind::OpencodeSession,
+        worker_command: Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string()),
+        worker_model: Some(worker_model.to_string()),
+    })
+    .collect()
+}
+
+/// Build the free-first fallback route list while preserving explicit-model precedence.
+///
+/// When an explicit `worker_model` is provided, it becomes the first actual
+/// route so that the user's requested model is the first dispatch attempt. The
+/// verified free routes are then followed by the explicitly allowed paid
+/// OpenCode Go routes. A paid route is never selected before all free routes
+/// have been attempted, and duplicates are removed.
+fn opencode_free_fallback_routes_with_precedence(
+    worker_kind: WorkerKind,
+    worker_command: Option<&str>,
+    worker_model: Option<&str>,
+) -> Vec<WorkerRoute> {
+    let explicit = worker_model
+        .filter(|model| !model.trim().is_empty())
+        .map(|model| model.trim().to_string());
+    let mut routes = Vec::new();
+    if let Some(explicit_model) = explicit {
+        routes.push(WorkerRoute {
+            worker_kind,
+            worker_command: worker_command
+                .filter(|command| !command.trim().is_empty())
+                .map(|command| command.to_string())
+                .or_else(|| Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string())),
+            worker_model: Some(explicit_model.clone()),
+        });
+        routes.extend(
+            opencode_free_fallback_routes()
+                .into_iter()
+                .chain(opencode_paid_fallback_routes())
+                .filter(|route| route.worker_model.as_deref() != Some(explicit_model.as_str())),
+        );
+    } else {
+        routes.extend(opencode_free_fallback_routes());
+        routes.extend(opencode_paid_fallback_routes());
+    }
+    routes
 }
 
 fn worker_routes_from_sequence(
@@ -478,6 +542,7 @@ mod tests {
         RunCommand {
             prompt: "build a test app".to_string(),
             objective: false,
+            session_id: None,
             auto_continue: false,
             max_epochs: 3,
             max_objective_calls: 96,
@@ -558,6 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn default_opencode_worker_has_a_session_command() -> Result<()> {
+        let config = worker_config_from_command(&run_command())?;
+        assert_eq!(config.worker_kind, WorkerKind::Opencode);
+        assert!(config.require_worker);
+        assert_eq!(
+            config.worker_command.as_deref(),
+            Some(DEFAULT_OPENCODE_SESSION_COMMAND)
+        );
+        assert_eq!(
+            config
+                .worker_routes
+                .iter()
+                .map(|route| route.worker_model.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("opencode/hy3-free"),
+                Some("opencode/mimo-v2.5-free"),
+                Some("opencode/deepseek-v4-flash-free"),
+                Some("opencode-go/mimo-v2.5"),
+                Some("opencode-go/deepseek-v4-flash"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cli_worker_config_enables_verified_opencode_free_fallbacks_without_overriding_sequence()
     -> Result<()> {
         let mut command = run_command();
@@ -575,6 +666,8 @@ mod tests {
                 Some("opencode/hy3-free"),
                 Some("opencode/mimo-v2.5-free"),
                 Some("opencode/deepseek-v4-flash-free"),
+                Some("opencode-go/mimo-v2.5"),
+                Some("opencode-go/deepseek-v4-flash"),
             ]
         );
         assert!(config.worker_routes.iter().all(|route| {
@@ -592,6 +685,75 @@ mod tests {
             explicit_config.worker_routes[0].worker_model.as_deref(),
             Some("opencode/custom-free")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_worker_config_explicit_model_precedes_free_fallbacks() -> Result<()> {
+        let mut command = run_command();
+        command.opencode_free_fallbacks = true;
+        command.worker_model = Some("opencode/deepseek-v4-flash-free".to_string());
+
+        let config = worker_config_from_command(&command)?;
+
+        assert_eq!(
+            config.worker_routes[0].worker_model.as_deref(),
+            Some("opencode/deepseek-v4-flash-free")
+        );
+        assert_eq!(config.worker_routes[0].worker_kind, WorkerKind::Opencode);
+        assert_eq!(
+            config.worker_routes[0].worker_command.as_deref(),
+            Some(DEFAULT_OPENCODE_SESSION_COMMAND)
+        );
+        assert_eq!(
+            config.worker_routes.len(),
+            5,
+            "explicit model plus free and paid fallbacks (deduplicated)"
+        );
+        assert!(
+            config
+                .worker_routes
+                .iter()
+                .filter(|route| {
+                    route.worker_model.as_deref() == Some("opencode/deepseek-v4-flash-free")
+                })
+                .count()
+                == 1,
+            "explicit model must not be duplicated in the fallback list"
+        );
+        assert_eq!(
+            config.worker_routes[3].worker_model.as_deref(),
+            Some("opencode-go/mimo-v2.5")
+        );
+        assert_eq!(
+            config.worker_routes[4].worker_model.as_deref(),
+            Some("opencode-go/deepseek-v4-flash")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_worker_config_free_fallbacks_default_order_without_explicit_model() -> Result<()> {
+        let mut command = run_command();
+        command.opencode_free_fallbacks = true;
+
+        let config = worker_config_from_command(&command)?;
+
+        assert_eq!(
+            config
+                .worker_routes
+                .iter()
+                .map(|route| route.worker_model.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("opencode/hy3-free"),
+                Some("opencode/mimo-v2.5-free"),
+                Some("opencode/deepseek-v4-flash-free"),
+                Some("opencode-go/mimo-v2.5"),
+                Some("opencode-go/deepseek-v4-flash"),
+            ]
+        );
+        assert_eq!(config.worker_routes[0].worker_kind, WorkerKind::OpencodeSession);
         Ok(())
     }
 

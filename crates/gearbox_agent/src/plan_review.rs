@@ -1,4 +1,6 @@
-use crate::plan_graph::{PlanGraph, PlanSource, TestStrategy, parse_planner_draft_with_objective};
+use crate::plan_graph::{
+    PlanGraph, PlanSource, PlanTaskContract, TestStrategy, parse_planner_draft_with_objective,
+};
 use anyhow::{Context as _, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1058,26 +1060,40 @@ fn reference_findings(plan: &PlanGraph, workspace_root: &Path) -> Vec<String> {
 
     for task in &plan.draft.tasks {
         for reference in &task.references {
-            if let Err(error) = validate_repository_relative_path(&reference.path) {
-                findings.push(format!(
-                    "task `{}` reference `{}` is unsafe: {error}",
-                    task.task_id, reference.path
-                ));
-                continue;
-            }
             let Some(canonical_root) = canonical_root.as_deref() else {
                 continue;
             };
-            let candidate = workspace_root.join(&reference.path);
-            let canonical_candidate = match candidate.canonicalize() {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    findings.push(format!(
-                        "task `{}` reference `{}` does not resolve: {error}",
-                        task.task_id, reference.path
-                    ));
+            let mut resolved = None;
+            let mut last_error = None;
+            for candidate_path in reference_path_candidates(&reference.path) {
+                if let Err(error) = validate_repository_relative_path(&candidate_path) {
+                    last_error = Some(error.to_string());
                     continue;
                 }
+                let candidate = workspace_root.join(&candidate_path);
+                match candidate.canonicalize() {
+                    Ok(canonical_candidate) => {
+                        resolved = Some(canonical_candidate);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            let Some(canonical_candidate) = resolved else {
+                if reference_is_declared_write_target(task, &reference.path) {
+                    // A plan may name the file it is about to create as a
+                    // reference.  It is not a pre-existing dependency, so
+                    // absence is expected; scope and path safety were still
+                    // validated before reaching this branch.
+                    continue;
+                }
+                findings.push(format!(
+                    "task `{}` reference `{}` does not resolve: {}",
+                    task.task_id,
+                    reference.path,
+                    last_error.unwrap_or_else(|| "invalid repository-relative path".to_string())
+                ));
+                continue;
             };
             if !canonical_candidate.starts_with(canonical_root) {
                 findings.push(format!(
@@ -1088,6 +1104,37 @@ fn reference_findings(plan: &PlanGraph, workspace_root: &Path) -> Vec<String> {
         }
     }
     findings
+}
+
+fn reference_is_declared_write_target(task: &PlanTaskContract, reference_path: &str) -> bool {
+    reference_path_candidates(reference_path)
+        .into_iter()
+        .filter(|candidate| validate_repository_relative_path(candidate).is_ok())
+        .any(|candidate| {
+            task.scope.write_scope.iter().any(|write_path| {
+                normalize_repository_path(write_path) == normalize_repository_path(&candidate)
+            })
+        })
+}
+
+/// Plan references commonly include a human-facing `file:start-end` suffix.
+/// Keep the original reference in receipts, but resolve the file portion when
+/// checking repository containment so line annotations do not become false
+/// hard failures.
+fn reference_path_candidates(path: &str) -> Vec<String> {
+    let mut candidates = vec![path.to_string()];
+    if let Some((file, range)) = path.rsplit_once(':')
+        && !file.is_empty()
+        && range.split_once('-').is_some_and(|(start, end)| {
+            !start.is_empty()
+                && !end.is_empty()
+                && start.chars().all(|character| character.is_ascii_digit())
+                && end.chars().all(|character| character.is_ascii_digit())
+        })
+    {
+        candidates.push(file.to_string());
+    }
+    candidates
 }
 
 fn scope_findings(plan: &PlanGraph) -> Vec<String> {
@@ -1815,6 +1862,54 @@ mod tests {
                 .limitations
                 .iter()
                 .any(|limitation| limitation == PLAN_VERIFIER_LIMITATION)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_allows_a_missing_reference_that_is_the_exact_write_target() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        let task = draft.tasks.first_mut().context("fixture task missing")?;
+        task.scope.write_scope = vec!["src/new.rs".to_string()];
+        task.references = vec![PlanReference {
+            path: "src/new.rs".to_string(),
+            reason: "Creation target".to_string(),
+            symbol: None,
+        }];
+        let plan = PlanGraph::seal(
+            "goal-1",
+            2,
+            PlanSource::PlannerModel,
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        assert!(
+            report
+                .check(PlanVerifierDimension::ReferencePaths)
+                .is_some_and(|check| check.passed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_resolves_human_facing_line_range_references() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft.tasks[0].references[0].path = "src/lib.rs:1-1".to_string();
+        let plan = PlanGraph::seal(
+            "goal-1",
+            2,
+            PlanSource::PlannerModel,
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        assert!(
+            report
+                .check(PlanVerifierDimension::ReferencePaths)
+                .is_some_and(|check| check.passed)
         );
         Ok(())
     }

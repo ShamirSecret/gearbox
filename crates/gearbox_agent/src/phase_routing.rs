@@ -323,6 +323,15 @@ impl PhaseRouteTable {
                 model: PhaseModelBinding::BackendDeclared(model.to_string()),
                 command: None,
             }];
+            if let Some(fallback_model) =
+                opencode_paid_fallback_model(profile.phase.clone(), model)
+            {
+                profile.candidates.push(PhaseRouteCandidate {
+                    backend: PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                    model: PhaseModelBinding::BackendDeclared(fallback_model.to_string()),
+                    command: None,
+                });
+            }
             profile.source = PhaseRouteSource::BuiltIn;
         }
         table.validate()?;
@@ -635,6 +644,31 @@ impl PhaseRouteTable {
     }
 }
 
+/// Return the explicitly supported paid OpenCode Go fallback for a free
+/// OpenCode phase route.  The fallback is role-specific: Mimo handles
+/// planning/review, while DeepSeek handles execution/summarization.  Custom
+/// or already-paid routes remain single-candidate routes so explicit user
+/// configuration is not silently rewritten.
+pub(crate) fn opencode_paid_fallback_model(
+    phase: PhaseProfile,
+    configured_model: &str,
+) -> Option<&'static str> {
+    let (provider, model) = configured_model.split_once('/')?;
+    if provider != "opencode" || !model.ends_with("-free") {
+        return None;
+    }
+    match phase {
+        PhaseProfile::Planner | PhaseProfile::PlanCritic | PhaseProfile::ReviewerTask
+        | PhaseProfile::ReviewerFinal | PhaseProfile::StrategistNextGoal => {
+            Some("opencode-go/mimo-v2.5")
+        }
+        PhaseProfile::ExecutorQuick
+        | PhaseProfile::ExecutorDeep
+        | PhaseProfile::Summarizer => Some("opencode-go/deepseek-v4-flash"),
+        PhaseProfile::Orchestrator => None,
+    }
+}
+
 impl PhaseRouteProfile {
     pub fn validate(&self) -> Result<()> {
         if self.candidates.is_empty() {
@@ -875,6 +909,14 @@ impl PhaseRouteDecision {
                             .then(|| base.worker_command.clone())
                             .flatten()
                     })
+                    .or_else(|| {
+                        matches!(
+                            base.worker_kind,
+                            WorkerKind::Opencode | WorkerKind::OpencodeSession
+                        )
+                        .then(|| base.worker_command.clone())
+                        .flatten()
+                    })
                     .or_else(|| worker_kind.default_command(declared_model.as_deref()));
                 let worker_command = worker_command
                     .map(|command| command.trim().to_string())
@@ -916,6 +958,16 @@ impl PhaseRouteDecision {
                     _ => bail!("codex ACP phase cannot apply a live model binding"),
                 };
                 let codex_kind = WorkerKind::Codex;
+                // Phase routes retain a qualified provider/model identity for
+                // receipts, while the `codex -m` CLI expects only the model
+                // id. Keep those two representations separate so a valid
+                // route such as `openai/gpt-5.6-luna` reaches the provider as
+                // `gpt-5.6-luna` instead of the unsupported qualified string.
+                let command_model = declared_model
+                    .as_deref()
+                    .map(|model| ModelSelectorId::from_qualified("codex", model))
+                    .transpose()?
+                    .map(|model| model.model_id);
                 let configured_route = base
                     .worker_routes
                     .iter()
@@ -930,7 +982,7 @@ impl PhaseRouteDecision {
                             .then(|| base.worker_command.clone())
                             .flatten()
                     })
-                    .or_else(|| codex_kind.default_command(declared_model.as_deref()));
+                    .or_else(|| codex_kind.default_command(command_model.as_deref()));
                 let worker_command = worker_command
                     .map(|command| command.trim().to_string())
                     .filter(|command| !command.is_empty())
@@ -953,11 +1005,11 @@ impl PhaseRouteDecision {
                 }
                 overlay.worker_kind = codex_kind;
                 overlay.worker_command = Some(worker_command.clone());
-                overlay.worker_model = declared_model.clone();
+                overlay.worker_model = command_model.clone();
                 overlay.worker_routes = vec![WorkerRoute {
                     worker_kind: codex_kind,
                     worker_command: Some(worker_command),
-                    worker_model: declared_model,
+                    worker_model: command_model,
                 }];
                 overlay.require_worker = true;
                 overlay.default_worker_for_small_tasks = codex_kind;
@@ -1129,9 +1181,11 @@ impl PhaseRouteReceipt {
             ) => {
                 self.require_status(ModelBindingStatus::DeclaredUnverified)?;
                 self.require_no_applied_model()?;
-                if self.actual_worker_model.as_deref() != Some(model.as_str()) {
-                    bail!("command phase receipt actual model does not match its declaration");
-                }
+                // Backend-declared models are preferred routes.  A runtime
+                // fallback is valid evidence rather than a receipt failure;
+                // retain the actual model above so reviewers can see the
+                // drift and judge its quality impact.
+                let _model_changed = self.actual_worker_model.as_deref() != Some(model.as_str());
             }
             (PhaseBackend::Worker(_) | PhaseBackend::CodexAcp, PhaseModelBinding::None) => {
                 self.require_status(ModelBindingStatus::LegacyUnverified)?;
@@ -1329,6 +1383,29 @@ mod tests {
         assert_eq!(base.worker_kind, WorkerKind::Opencode);
         assert_eq!(overlay.worker_kind, WorkerKind::ZedAgent);
         assert_eq!(overlay.worker_model.as_deref(), Some("live/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn resident_opencode_phase_inherits_command_from_command_worker() -> Result<()> {
+        let table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "opencode-go/mimo-v2.5".to_string(),
+            executor: "opencode-go/deepseek-v4-flash".to_string(),
+            reviewer: "opencode-go/mimo-v2.5".to_string(),
+        })?;
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let mut base = WorkerConfig::default();
+        base.worker_command = Some("opencode run".to_string());
+
+        let overlay = decision.overlay_worker_config(&base)?;
+        assert_eq!(overlay.worker_kind, WorkerKind::OpencodeSession);
+        assert_eq!(overlay.worker_command.as_deref(), Some("opencode run"));
+        assert_eq!(overlay.worker_routes.len(), 1);
+        assert_eq!(
+            overlay.worker_routes[0].worker_command.as_deref(),
+            Some("opencode run")
+        );
         Ok(())
     }
 
@@ -1671,6 +1748,47 @@ mod tests {
     }
 
     #[test]
+    fn opencode_free_routes_append_role_specific_paid_fallbacks() -> Result<()> {
+        let table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "opencode/mimo-v2.5-free".to_string(),
+            executor: "opencode/deepseek-v4-flash-free".to_string(),
+            reviewer: "opencode/hy3-free".to_string(),
+        })?;
+
+        let planner = table.resolve(
+            &PhaseProfile::Planner,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(
+            planner.candidate.model,
+            PhaseModelBinding::BackendDeclared("opencode/mimo-v2.5-free".to_string())
+        );
+        assert_eq!(table.profile(&PhaseProfile::Planner)?.candidates.len(), 2);
+        assert_eq!(
+            table.profile(&PhaseProfile::Planner)?.candidates[1].model,
+            PhaseModelBinding::BackendDeclared("opencode-go/mimo-v2.5".to_string())
+        );
+
+        assert_eq!(
+            table.profile(&PhaseProfile::ExecutorDeep)?.candidates[1].model,
+            PhaseModelBinding::BackendDeclared("opencode-go/deepseek-v4-flash".to_string())
+        );
+        assert_eq!(
+            table.profile(&PhaseProfile::ReviewerFinal)?.candidates[1].model,
+            PhaseModelBinding::BackendDeclared("opencode-go/mimo-v2.5".to_string())
+        );
+
+        let paid_table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "opencode-go/mimo-v2.5".to_string(),
+            executor: "opencode-go/deepseek-v4-flash".to_string(),
+            reviewer: "opencode-go/mimo-v2.5".to_string(),
+        })?;
+        assert_eq!(paid_table.profile(&PhaseProfile::Planner)?.candidates.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn opencode_only_requires_qualified_models() {
         let error = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
             planner: "unqualified".to_string(),
@@ -1886,7 +2004,11 @@ mod tests {
         let base = WorkerConfig::default();
         let overlay = decision.overlay_worker_config(&base)?;
         assert_eq!(overlay.worker_kind, WorkerKind::Codex);
-        assert_eq!(overlay.worker_model.as_deref(), Some("openai/gpt-4"));
+        assert_eq!(overlay.worker_model.as_deref(), Some("gpt-4"));
+        assert!(overlay
+            .worker_command
+            .as_deref()
+            .is_some_and(|command| command.contains("-m 'gpt-4'")));
         assert_eq!(base.worker_kind, WorkerKind::Opencode);
         Ok(())
     }

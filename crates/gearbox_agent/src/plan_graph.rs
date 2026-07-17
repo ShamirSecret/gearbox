@@ -7,6 +7,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 
 pub const PLAN_GRAPH_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_REVISION_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Compact contract example embedded in planner repair prompts. Keep this
 /// synchronized with the typed draft by exercising it in the unit tests below.
@@ -24,6 +25,7 @@ pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
   "final_verification": ["run the final verification wave and persist evidence"],
   "tasks": [{
     "task_id": "task_a",
+    "logical_task_id": "logical_task_a",
     "title": "Implement the bounded change",
     "goal": "Deliver the requested behavior",
     "deliverable": "verified implementation",
@@ -61,6 +63,7 @@ pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
     },
     "artifacts": [{"path": ".gear/artifacts/final-report.md", "description": "verification report", "required": true}],
     "evidence": ["record the command exit status and changed paths"],
+    "evidence_obligations": [{"obligation_id": "observation_001", "kind": "runtime_observation", "producer": "executor", "consumer": "completion_gate", "freshness": "attempt", "required_for": ["completion"], "evidence_path": ".gear/artifacts/verification.md", "unavailable_reason": null}],
     "rollback": ["restore the task-scoped changes if verification fails"],
     "budget": {"max_attempts": 2, "max_commands": 3, "max_duration_seconds": null},
     "commit_boundary": "no_commit",
@@ -144,8 +147,369 @@ pub struct PlanGraph {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRevisionOperation {
+    pub operation: String,
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRevisionTaskLineage {
+    pub logical_task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_task_id: Option<String>,
+    pub relation: String,
+}
+
+/// Deterministic delta between two sealed PlanGraph revisions.
+///
+/// The planner may still submit a complete draft, but the runtime records the
+/// actual change set so a model cannot silently delete or rewrite an approved
+/// work order without an auditable successor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRevisionManifest {
+    pub schema_version: u32,
+    pub base_plan_id: String,
+    pub base_plan_hash: String,
+    pub base_revision: usize,
+    pub next_plan_id: String,
+    pub next_plan_hash: String,
+    pub next_revision: usize,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub risk_change: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_task_id: Option<String>,
+    pub affected_logical_task_ids: Vec<String>,
+    pub operations: Vec<PlanRevisionOperation>,
+    #[serde(default)]
+    pub task_lineage: Vec<PlanRevisionTaskLineage>,
+    pub retained_task_ids: Vec<String>,
+    pub added_task_ids: Vec<String>,
+    pub revised_task_ids: Vec<String>,
+    pub superseded_task_ids: Vec<String>,
+    pub scope_changed: bool,
+    pub acceptance_changed: bool,
+    pub evidence_changed: bool,
+    pub requires_re_review: bool,
+}
+
+impl PlanRevisionManifest {
+    pub fn derive(
+        base: &PlanGraph,
+        next: &PlanGraph,
+        reason: impl Into<String>,
+        cursor_task_id: Option<&str>,
+    ) -> Result<Self> {
+        let evidence_refs = vec![format!(
+            "derived:plan-revision:{}->{}",
+            base.plan_hash, next.plan_hash
+        )];
+        Self::derive_with_evidence_refs(base, next, reason, cursor_task_id, evidence_refs)
+    }
+
+    pub fn derive_with_evidence_refs(
+        base: &PlanGraph,
+        next: &PlanGraph,
+        reason: impl Into<String>,
+        cursor_task_id: Option<&str>,
+        evidence_refs: Vec<String>,
+    ) -> Result<Self> {
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            bail!("plan revision manifest requires a non-empty reason");
+        }
+        let mut evidence_refs = evidence_refs
+            .into_iter()
+            .map(|reference| reference.trim().to_string())
+            .collect::<Vec<_>>();
+        if evidence_refs.iter().any(String::is_empty) {
+            bail!("plan revision manifest evidence references cannot be empty");
+        }
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        if evidence_refs.is_empty() {
+            bail!("plan revision manifest requires evidence references");
+        }
+        if evidence_refs.len() > 32 {
+            bail!("plan revision manifest allows at most 32 evidence references");
+        }
+        if base.goal_id != next.goal_id {
+            bail!("plan revision cannot change goal identity");
+        }
+        if next.revision != base.revision.saturating_add(1) {
+            bail!(
+                "plan revision must advance by one: base={} next={}",
+                base.revision,
+                next.revision
+            );
+        }
+        let base_tasks = base
+            .draft
+            .tasks
+            .iter()
+            .map(|task| (task.task_id.clone(), task))
+            .collect::<HashMap<_, _>>();
+        let next_tasks = next
+            .draft
+            .tasks
+            .iter()
+            .map(|task| (task.task_id.clone(), task))
+            .collect::<HashMap<_, _>>();
+        let mut retained_task_ids = Vec::new();
+        let mut revised_task_ids = Vec::new();
+        for (task_id, base_task) in &base_tasks {
+            match next_tasks.get(task_id) {
+                Some(next_task) if *next_task == *base_task => {
+                    retained_task_ids.push(task_id.clone())
+                }
+                Some(_) => revised_task_ids.push(task_id.clone()),
+                None => {}
+            }
+        }
+        let mut superseded_task_ids = base_tasks
+            .keys()
+            .filter(|task_id| !next_tasks.contains_key(*task_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut added_task_ids = next_tasks
+            .keys()
+            .filter(|task_id| !base_tasks.contains_key(*task_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for ids in [
+            &mut retained_task_ids,
+            &mut revised_task_ids,
+            &mut superseded_task_ids,
+            &mut added_task_ids,
+        ] {
+            ids.sort();
+        }
+        let base_by_logical = base_tasks
+            .values()
+            .map(|task| (task.logical_task_id_or_task_id().to_string(), *task))
+            .collect::<HashMap<_, _>>();
+        let next_by_logical = next_tasks
+            .values()
+            .map(|task| (task.logical_task_id_or_task_id().to_string(), *task))
+            .collect::<HashMap<_, _>>();
+        let mut logical_ids = base_by_logical
+            .keys()
+            .chain(next_by_logical.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        logical_ids.sort();
+        logical_ids.dedup();
+        let task_lineage = logical_ids
+            .into_iter()
+            .map(|logical_task_id| {
+                let base_task = base_by_logical.get(&logical_task_id);
+                let next_task = next_by_logical.get(&logical_task_id);
+                let relation = match (base_task, next_task) {
+                    (Some(base), Some(next)) if base.task_id == next.task_id && *base == *next => {
+                        "retained"
+                    }
+                    (Some(base), Some(next)) if base.task_id != next.task_id => "rekeyed",
+                    (Some(_), Some(_)) => "revised",
+                    (Some(_), None) => "superseded",
+                    (None, Some(_)) => "added",
+                    (None, None) => unreachable!("logical task id came from one of the graphs"),
+                };
+                PlanRevisionTaskLineage {
+                    logical_task_id,
+                    base_task_id: base_task.map(|task| task.task_id.clone()),
+                    next_task_id: next_task.map(|task| task.task_id.clone()),
+                    relation: relation.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut affected_logical_task_ids = task_lineage
+            .iter()
+            .filter(|lineage| lineage.relation != "retained")
+            .map(|lineage| lineage.logical_task_id.clone())
+            .collect::<Vec<_>>();
+        affected_logical_task_ids.sort();
+        affected_logical_task_ids.dedup();
+        let rekeyed_task_ids = task_lineage
+            .iter()
+            .filter(|lineage| lineage.relation == "rekeyed")
+            .filter_map(|lineage| lineage.next_task_id.clone())
+            .collect::<Vec<_>>();
+        let mut operations = Vec::new();
+        if !added_task_ids.is_empty() {
+            operations.push(PlanRevisionOperation {
+                operation: "add".to_string(),
+                task_ids: added_task_ids.clone(),
+            });
+        }
+        if !revised_task_ids.is_empty() {
+            operations.push(PlanRevisionOperation {
+                operation: "revise-unstarted".to_string(),
+                task_ids: revised_task_ids.clone(),
+            });
+        }
+        if !superseded_task_ids.is_empty() {
+            operations.push(PlanRevisionOperation {
+                operation: "supersede".to_string(),
+                task_ids: superseded_task_ids.clone(),
+            });
+        }
+        if !rekeyed_task_ids.is_empty() {
+            operations.push(PlanRevisionOperation {
+                operation: "rekey".to_string(),
+                task_ids: rekeyed_task_ids,
+            });
+        }
+        let scope_changed = base_tasks.iter().any(|(task_id, base_task)| {
+            next_tasks
+                .get(task_id)
+                .is_some_and(|next_task| next_task.scope != base_task.scope)
+        });
+        let acceptance_changed = base.draft.final_acceptance != next.draft.final_acceptance
+            || base_tasks.iter().any(|(task_id, base_task)| {
+                next_tasks.get(task_id).is_some_and(|next_task| {
+                    next_task.completion_predicates != base_task.completion_predicates
+                        || next_task.qa != base_task.qa
+                        || next_task.test != base_task.test
+                })
+            });
+        let evidence_changed = base_tasks.iter().any(|(task_id, base_task)| {
+            next_tasks.get(task_id).is_some_and(|next_task| {
+                next_task.evidence != base_task.evidence
+                    || next_task.artifacts != base_task.artifacts
+                    || next_task.execution_steps != base_task.execution_steps
+                    || next_task.execution_steps_evidence_required
+                        != base_task.execution_steps_evidence_required
+            })
+        });
+        let mut risk_changes = Vec::new();
+        if !added_task_ids.is_empty() {
+            risk_changes.push("task scope added");
+        }
+        if !revised_task_ids.is_empty() {
+            risk_changes.push("task contract revised");
+        }
+        if !superseded_task_ids.is_empty() {
+            risk_changes.push("task superseded");
+        }
+        if task_lineage
+            .iter()
+            .any(|lineage| lineage.relation == "rekeyed")
+        {
+            risk_changes.push("logical task rekeyed");
+        }
+        if scope_changed {
+            risk_changes.push("write scope changed");
+        }
+        if acceptance_changed {
+            risk_changes.push("acceptance or QA changed");
+        }
+        if evidence_changed {
+            risk_changes.push("evidence contract changed");
+        }
+        let risk_change = if risk_changes.is_empty() {
+            "no detected contract-risk delta".to_string()
+        } else {
+            risk_changes.join("; ")
+        };
+        Ok(Self {
+            schema_version: PLAN_REVISION_MANIFEST_SCHEMA_VERSION,
+            base_plan_id: base.plan_id.clone(),
+            base_plan_hash: base.plan_hash.clone(),
+            base_revision: base.revision,
+            next_plan_id: next.plan_id.clone(),
+            next_plan_hash: next.plan_hash.clone(),
+            next_revision: next.revision,
+            reason,
+            evidence_refs,
+            risk_change,
+            cursor_task_id: cursor_task_id.map(ToString::to_string),
+            affected_logical_task_ids,
+            operations,
+            task_lineage,
+            retained_task_ids,
+            added_task_ids,
+            revised_task_ids,
+            superseded_task_ids,
+            scope_changed,
+            acceptance_changed,
+            evidence_changed,
+            requires_re_review: true,
+        })
+    }
+
+    pub fn validate_against(&self, base: &PlanGraph, next: &PlanGraph) -> Result<()> {
+        self.validate_against_protected(base, next, &HashSet::new())
+    }
+
+    pub fn validate_against_protected(
+        &self,
+        base: &PlanGraph,
+        next: &PlanGraph,
+        protected_task_ids: &HashSet<String>,
+    ) -> Result<()> {
+        if self.schema_version != PLAN_REVISION_MANIFEST_SCHEMA_VERSION
+            || self.base_plan_id != base.plan_id
+            || self.base_plan_hash != base.plan_hash
+            || self.base_revision != base.revision
+            || self.next_plan_id != next.plan_id
+            || self.next_plan_hash != next.plan_hash
+            || self.next_revision != next.revision
+        {
+            bail!("plan revision manifest binding does not match sealed graphs");
+        }
+        if !self.requires_re_review {
+            bail!("plan revision manifest must require independent re-review");
+        }
+        let expected = Self::derive_with_evidence_refs(
+            base,
+            next,
+            &self.reason,
+            self.cursor_task_id.as_deref(),
+            self.evidence_refs.clone(),
+        )?;
+        let mut comparable = self.clone();
+        // Manifests written before explicit lineage was introduced remain
+        // readable when their task ids are the only available identity. New
+        // runtime-generated manifests always persist the full mapping.
+        if comparable.task_lineage.is_empty() {
+            comparable.task_lineage = expected.task_lineage.clone();
+        }
+        if expected != comparable {
+            bail!("plan revision manifest does not match the deterministic graph delta");
+        }
+        if let Some(cursor_task_id) = self.cursor_task_id.as_deref()
+            && self
+                .superseded_task_ids
+                .iter()
+                .any(|task_id| task_id == cursor_task_id)
+        {
+            bail!("plan revision cannot supersede the active cursor task");
+        }
+        if let Some(task_id) = comparable.task_lineage.iter().find_map(|lineage| {
+            let protected = lineage
+                .base_task_id
+                .as_ref()
+                .is_some_and(|base_task_id| protected_task_ids.contains(base_task_id));
+            (protected && lineage.relation != "retained")
+                .then(|| lineage.base_task_id.clone().unwrap_or_default())
+        }) {
+            bail!("plan revision cannot supersede or rewrite protected task `{task_id}`");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanTaskContract {
     pub task_id: String,
+    /// Stable identity across plan revisions. Legacy plans may omit it and
+    /// use the display task id through `logical_task_id_or_task_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_task_id: Option<String>,
     pub title: String,
     pub goal: String,
     pub deliverable: String,
@@ -192,6 +556,8 @@ pub struct PlanTaskContract {
     /// claim completion merely because a file was changed.
     #[serde(default)]
     pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_obligations: Vec<PlanEvidenceObligation>,
     #[serde(default)]
     pub rollback: Vec<String>,
     #[serde(default)]
@@ -223,6 +589,84 @@ pub struct PlanExecutionStep {
     pub evidence_path: Option<String>,
 }
 
+/// Typed evidence requirements keep producer, consumer, and freshness
+/// explicit while preserving the legacy human-readable `evidence` field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEvidenceObligation {
+    pub obligation_id: String,
+    pub kind: String,
+    pub producer: String,
+    pub consumer: String,
+    pub freshness: String,
+    pub required_for: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl PlanEvidenceObligation {
+    pub fn validate(&self) -> Result<()> {
+        if self.obligation_id.trim().is_empty()
+            || !self.obligation_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            bail!("evidence obligation id must be a non-empty ASCII identifier");
+        }
+        for (field, value) in [
+            ("kind", self.kind.as_str()),
+            ("producer", self.producer.as_str()),
+            ("consumer", self.consumer.as_str()),
+            ("freshness", self.freshness.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("evidence obligation `{}` has empty {field}", self.obligation_id);
+            }
+        }
+        if self.required_for.is_empty()
+            || self
+                .required_for
+                .iter()
+                .any(|requirement| requirement.trim().is_empty())
+        {
+            bail!(
+                "evidence obligation `{}` must define required_for",
+                self.obligation_id
+            );
+        }
+        if let Some(path) = self.evidence_path.as_deref() {
+            let path = std::path::Path::new(path);
+            if path.is_absolute()
+                || path == std::path::Path::new("..")
+                || path.starts_with("..")
+            {
+                bail!(
+                    "evidence obligation `{}` path must be workspace-relative",
+                    self.obligation_id
+                );
+            }
+        }
+        if self.evidence_path.is_none() && self.unavailable_reason.is_none() {
+            bail!(
+                "evidence obligation `{}` must provide evidence_path or unavailable_reason",
+                self.obligation_id
+            );
+        }
+        if self
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.trim().is_empty())
+        {
+            bail!(
+                "evidence obligation `{}` has an empty unavailable_reason",
+                self.obligation_id
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskSizeTier {
@@ -240,6 +684,50 @@ pub enum TaskRiskTier {
 }
 
 impl PlanTaskContract {
+    /// Upgrade legacy prose evidence into deterministic typed obligations at
+    /// the seal boundary.  Raw prose is retained for old workers and reports.
+    pub fn normalize_legacy_evidence_obligations(&mut self) {
+        if !self.evidence_obligations.is_empty() {
+            return;
+        }
+        self.evidence_obligations = self
+            .evidence
+            .iter()
+            .enumerate()
+            .map(|(index, requirement)| {
+                let digest = format!("{:x}", Sha256::digest(requirement.as_bytes()));
+                let trimmed = requirement.trim();
+                let path = (trimmed.starts_with(".gear/")
+                    || (trimmed.contains('/') && !trimmed.contains(char::is_whitespace)))
+                    .then(|| trimmed.to_string());
+                let unavailable_reason = path
+                    .is_none()
+                    .then(|| "legacy prose evidence has no explicit artifact path".to_string());
+                PlanEvidenceObligation {
+                    obligation_id: format!("legacy_evidence_{:03}_{}", index + 1, &digest[..12]),
+                    kind: if path.is_some() {
+                        "artifact".to_string()
+                    } else {
+                        "runtime_observation".to_string()
+                    },
+                    producer: "executor".to_string(),
+                    consumer: "completion_gate".to_string(),
+                    freshness: "attempt".to_string(),
+                    required_for: vec!["completion".to_string()],
+                    evidence_path: path,
+                    unavailable_reason,
+                }
+            })
+            .collect();
+    }
+
+    pub fn logical_task_id_or_task_id(&self) -> &str {
+        self.logical_task_id
+            .as_deref()
+            .filter(|logical_task_id| !logical_task_id.trim().is_empty())
+            .unwrap_or(&self.task_id)
+    }
+
     /// Derive a stable worker size from the sealed task contract, not from a
     /// model's subjective difficulty label.
     pub fn size_tier(&self) -> TaskSizeTier {
@@ -482,6 +970,7 @@ impl PlanGraph {
         }
 
         let mut tasks_by_id = HashMap::new();
+        let mut logical_tasks_by_id = HashSet::new();
         for task in &self.draft.tasks {
             task.validate()?;
             // A session-bound planner receipt identifies the new OMO-style
@@ -510,6 +999,25 @@ impl PlanGraph {
                 bail!(
                     "planner-model task `{}` must define a rationale and bounded approach",
                     task.task_id
+                );
+            }
+            if self.source == PlanSource::PlannerModel
+                && self
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.session_id.as_ref())
+                    .is_some()
+                && task.logical_task_id.is_none()
+            {
+                bail!(
+                    "planner-model task `{}` must define logical_task_id",
+                    task.task_id
+                );
+            }
+            if !logical_tasks_by_id.insert(task.logical_task_id_or_task_id()) {
+                bail!(
+                    "duplicate PlanGraph logical task id `{}`",
+                    task.logical_task_id_or_task_id()
                 );
             }
             if tasks_by_id.insert(task.task_id.as_str(), task).is_some() {
@@ -680,6 +1188,12 @@ impl PlanGraph {
             .iter()
             .flat_map(|task| task.artifacts.iter().cloned())
             .collect();
+        contract.evidence_obligations = self
+            .draft
+            .tasks
+            .iter()
+            .flat_map(|task| task.evidence_obligations.iter().cloned())
+            .collect();
         contract.completion_predicates = self
             .draft
             .final_acceptance
@@ -709,6 +1223,17 @@ impl PlanTaskContract {
             })
         {
             bail!("PlanGraph task id must be a non-empty ASCII identifier");
+        }
+        if let Some(logical_task_id) = self.logical_task_id.as_deref()
+            && (logical_task_id.trim().is_empty()
+                || !logical_task_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                }))
+        {
+            bail!(
+                "PlanGraph task `{}` has an invalid logical task id",
+                self.task_id
+            );
         }
         for (field, value) in [
             ("title", self.title.as_str()),
@@ -744,6 +1269,17 @@ impl PlanTaskContract {
         ] {
             if values.iter().any(|value| value.trim().is_empty()) {
                 bail!("PlanGraph task `{}` has a blank {field} item", self.task_id);
+            }
+        }
+        let mut obligation_ids = HashSet::new();
+        for obligation in &self.evidence_obligations {
+            obligation.validate()?;
+            if !obligation_ids.insert(obligation.obligation_id.as_str()) {
+                bail!(
+                    "PlanGraph task `{}` has duplicate evidence obligation `{}`",
+                    self.task_id,
+                    obligation.obligation_id
+                );
             }
         }
         if self.execution_steps_evidence_required {
@@ -940,6 +1476,22 @@ impl PlanTaskContract {
                     .iter()
                     .map(|requirement| format!("EVIDENCE: {requirement}")),
             )
+            .chain(self.evidence_obligations.iter().map(|obligation| {
+                format!(
+                    "EVIDENCE OBLIGATION [{}]: kind={} producer={} consumer={} freshness={} required_for={}{}",
+                    obligation.obligation_id,
+                    obligation.kind,
+                    obligation.producer,
+                    obligation.consumer,
+                    obligation.freshness,
+                    obligation.required_for.join(","),
+                    obligation
+                        .evidence_path
+                        .as_deref()
+                        .map(|path| format!(" path=`{path}`"))
+                        .unwrap_or_default()
+                )
+            }))
             .chain(
                 self.rollback
                     .iter()
@@ -1103,6 +1655,7 @@ pub fn deterministic_fallback_draft(
         ],
         tasks: vec![PlanTaskContract {
             task_id: "task_003".to_string(),
+            logical_task_id: Some("task_003".to_string()),
             title: "Execute the bounded implementation contract".to_string(),
             goal: objective.to_string(),
             deliverable: "A minimal verified implementation of the requested change.".to_string(),
@@ -1193,6 +1746,7 @@ pub fn deterministic_fallback_draft(
             evidence: vec![
                 "Record changed paths, commands, exit status, and known failures.".to_string(),
             ],
+            evidence_obligations: Vec::new(),
             rollback: vec![
                 "Preserve evidence and revert only this task's bounded changes if verification fails."
                     .to_string(),
@@ -1236,7 +1790,12 @@ pub fn parse_planner_draft(output: &str) -> Result<PlanGraphDraft> {
 /// keeps strict nested-schema validation without flattening the task graph.
 pub fn parse_planner_draft_with_objective(output: &str, objective: &str) -> Result<PlanGraphDraft> {
     match parse_planner_draft(output) {
-        Ok(draft) => Ok(draft),
+        Ok(mut draft) => {
+            if draft.objective.trim().is_empty() {
+                draft.objective = objective.to_string();
+            }
+            Ok(draft)
+        }
         Err(original) => {
             let trimmed = output.trim();
             let json = if let Some(rest) = trimmed.strip_prefix("```json") {
@@ -1252,7 +1811,11 @@ pub fn parse_planner_draft_with_objective(output: &str, objective: &str) -> Resu
             let object = value
                 .as_object_mut()
                 .context("planner response is not a JSON object")?;
-            if object.contains_key("objective") {
+            let objective_is_usable = object
+                .get("objective")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            if objective_is_usable {
                 return Err(original);
             }
             object.insert(
@@ -1402,6 +1965,23 @@ mod tests {
         assert_eq!(draft.tasks[0].commit_message, None);
     }
 
+    #[test]
+    fn planner_parser_replaces_blank_or_null_objective() {
+        for invalid_objective in [Value::Null, Value::String("  ".to_string())] {
+            let mut value: Value = serde_json::from_str(PLAN_GRAPH_SCHEMA_EXEMPLAR).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("objective".to_string(), invalid_objective);
+            let draft = parse_planner_draft_with_objective(
+                &serde_json::to_string(&value).unwrap(),
+                "canonical objective",
+            )
+            .unwrap();
+            assert_eq!(draft.objective, "canonical objective");
+        }
+    }
+
     fn valid_draft() -> PlanGraphDraft {
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
         let mut draft =
@@ -1436,6 +2016,229 @@ mod tests {
         assert_eq!(draft.tasks[0].evidence.len(), 1);
         assert_eq!(draft.tasks[0].rollback.len(), 1);
         assert_eq!(draft.tasks[0].budget.max_attempts, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn planner_seal_upgrades_legacy_evidence_to_typed_obligations() -> Result<()> {
+        let mut draft = valid_draft();
+        draft.tasks[0].normalize_legacy_evidence_obligations();
+        let graph = PlanGraph::seal(
+            "goal-evidence",
+            1,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test-provider".to_string(),
+                model_id: "test-model".to_string(),
+                session_id: Some("session-evidence".to_string()),
+            }),
+            draft,
+        )?;
+        let obligation = graph.draft.tasks[0]
+            .evidence_obligations
+            .first()
+            .context("legacy evidence was not upgraded")?;
+        assert_eq!(obligation.producer, "executor");
+        assert_eq!(obligation.consumer, "completion_gate");
+        assert_eq!(obligation.freshness, "attempt");
+        assert_eq!(obligation.required_for, vec!["completion"]);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_evidence_obligation_rejects_workspace_escape() {
+        let obligation = PlanEvidenceObligation {
+            obligation_id: "escape".to_string(),
+            kind: "artifact".to_string(),
+            producer: "executor".to_string(),
+            consumer: "completion_gate".to_string(),
+            freshness: "attempt".to_string(),
+            required_for: vec!["completion".to_string()],
+            evidence_path: Some("../outside.txt".to_string()),
+            unavailable_reason: None,
+        };
+        assert!(obligation.validate().is_err());
+    }
+
+    #[test]
+    fn plan_revision_manifest_records_delta_and_rejects_stale_base() -> Result<()> {
+        let base = PlanGraph::seal(
+            "goal-manifest",
+            1,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test".to_string(),
+                model_id: "test".to_string(),
+                session_id: None,
+            }),
+            valid_draft(),
+        )?;
+        let mut next_draft = base.draft.clone();
+        next_draft.tasks[0].title = "Revised bounded change".to_string();
+        let next = PlanGraph::seal(
+            "goal-manifest",
+            2,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test".to_string(),
+                model_id: "test".to_string(),
+                session_id: None,
+            }),
+            next_draft,
+        )?;
+        let manifest = PlanRevisionManifest::derive(
+            &base,
+            &next,
+            "critic requested a narrower deliverable",
+            Some("task_003"),
+        )?;
+        assert_eq!(manifest.base_revision, 1);
+        assert_eq!(manifest.next_revision, 2);
+        assert_eq!(manifest.revised_task_ids, vec!["task_003"]);
+        assert_eq!(manifest.affected_logical_task_ids, vec!["task_003"]);
+        assert_eq!(manifest.evidence_refs.len(), 1);
+        assert!(manifest.risk_change.contains("task contract revised"));
+        assert!(manifest.requires_re_review);
+        manifest.validate_against(&base, &next)?;
+        let protected = HashSet::from(["task_003".to_string()]);
+        assert!(
+            manifest
+                .validate_against_protected(&base, &next, &protected)
+                .is_err()
+        );
+
+        let mut stale = manifest.clone();
+        stale.base_plan_hash = "stale-hash".to_string();
+        assert!(stale.validate_against(&base, &next).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_revision_manifest_tracks_rekeyed_logical_task() -> Result<()> {
+        let base = PlanGraph::seal(
+            "goal-lineage",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            valid_draft(),
+        )?;
+        let mut next_draft = base.draft.clone();
+        next_draft.tasks[0].task_id = "task_renamed".to_string();
+        let next = PlanGraph::seal(
+            "goal-lineage",
+            2,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            next_draft,
+        )?;
+
+        let manifest = PlanRevisionManifest::derive(&base, &next, "rename display key", None)?;
+        assert_eq!(manifest.affected_logical_task_ids, vec!["task_003"]);
+        assert_eq!(manifest.task_lineage.len(), 1);
+        assert_eq!(manifest.task_lineage[0].logical_task_id, "task_003");
+        assert_eq!(
+            manifest.task_lineage[0].base_task_id.as_deref(),
+            Some("task_003")
+        );
+        assert_eq!(
+            manifest.task_lineage[0].next_task_id.as_deref(),
+            Some("task_renamed")
+        );
+        assert_eq!(manifest.task_lineage[0].relation, "rekeyed");
+        assert!(
+            manifest
+                .operations
+                .iter()
+                .any(|operation| operation.operation == "rekey")
+        );
+        manifest.validate_against(&base, &next)?;
+        assert!(
+            manifest
+                .validate_against_protected(&base, &next, &HashSet::from(["task_003".to_string()]))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_model_requires_unique_logical_task_ids() -> Result<()> {
+        let mut missing = valid_draft();
+        missing.tasks[0].logical_task_id = None;
+        let error = PlanGraph::seal(
+            "goal-lineage",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            missing,
+        )
+        .expect_err("planner plans must declare a logical task identity");
+        assert!(error.to_string().contains("logical_task_id"));
+
+        let mut legacy = valid_draft();
+        legacy.tasks[0].logical_task_id = None;
+        PlanGraph::seal(
+            "goal-lineage",
+            1,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "legacy".to_string(),
+                model_id: "legacy".to_string(),
+                session_id: None,
+            }),
+            legacy,
+        )?;
+
+        let mut duplicate = valid_draft();
+        let mut second = duplicate.tasks[0].clone();
+        second.task_id = "task_004".to_string();
+        second.title = "second task".to_string();
+        second.parallel_wave = 1;
+        duplicate.tasks.push(second);
+        let error = PlanGraph::seal(
+            "goal-lineage",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            duplicate,
+        )
+        .expect_err("logical task identity must be unique within a plan");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate PlanGraph logical task id")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_revision_manifest_rejects_superseding_active_cursor() -> Result<()> {
+        let base = PlanGraph::seal(
+            "goal-cursor",
+            1,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test".to_string(),
+                model_id: "test".to_string(),
+                session_id: None,
+            }),
+            valid_draft(),
+        )?;
+        let mut next_draft = base.draft.clone();
+        next_draft.tasks[0].task_id = "task_replacement".to_string();
+        let next = PlanGraph::seal(
+            "goal-cursor",
+            2,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test".to_string(),
+                model_id: "test".to_string(),
+                session_id: None,
+            }),
+            next_draft,
+        )?;
+        let manifest =
+            PlanRevisionManifest::derive(&base, &next, "replace active task", Some("task_003"))?;
+        assert!(manifest.validate_against(&base, &next).is_err());
         Ok(())
     }
 
@@ -1599,6 +2402,50 @@ mod tests {
     }
 
     #[test]
+    fn plan_revision_manifest_preserves_critic_evidence_refs() -> Result<()> {
+        let base = PlanGraph::seal(
+            "goal-manifest-evidence",
+            1,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test".to_string(),
+                model_id: "test".to_string(),
+                session_id: None,
+            }),
+            valid_draft(),
+        )?;
+        let mut next_draft = base.draft.clone();
+        next_draft.tasks[0].title = "Narrower change".to_string();
+        let next = PlanGraph::seal(
+            "goal-manifest-evidence",
+            2,
+            PlanSource::PlannerModel,
+            Some(PlannerReceipt {
+                provider_id: "test".to_string(),
+                model_id: "test".to_string(),
+                session_id: None,
+            }),
+            next_draft,
+        )?;
+        let manifest = PlanRevisionManifest::derive_with_evidence_refs(
+            &base,
+            &next,
+            "critic requested a narrower deliverable",
+            Some("task_003"),
+            vec![
+                "critic-check:scope".to_string(),
+                "verifier-report.json".to_string(),
+            ],
+        )?;
+        assert_eq!(
+            manifest.evidence_refs,
+            vec!["critic-check:scope", "verifier-report.json"]
+        );
+        manifest.validate_against(&base, &next)?;
+        Ok(())
+    }
+
+    #[test]
     fn plan_graph_rejects_tdd_without_matching_red_green() {
         let mut draft = valid_draft();
         draft.tasks[0].test.green[0].command = "cargo test other".to_string();
@@ -1619,6 +2466,7 @@ mod tests {
         let mut draft = valid_draft();
         let mut second = draft.tasks[0].clone();
         second.task_id = "task_004".to_string();
+        second.logical_task_id = Some("task_004".to_string());
         second.title = "Second task".to_string();
         draft.tasks.push(second);
         assert!(
@@ -1711,14 +2559,17 @@ mod tests {
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
         let mut draft = deterministic_fallback_draft("graph", &scope, &[]);
         draft.tasks[0].task_id = "node_a".to_string();
+        draft.tasks[0].logical_task_id = Some("node_a".to_string());
         draft.tasks[0].title = "A".to_string();
         draft.tasks[0].scope.write_scope = vec!["src/a".to_string()];
         let mut node_b = draft.tasks[0].clone();
         node_b.task_id = "node_b".to_string();
+        node_b.logical_task_id = Some("node_b".to_string());
         node_b.title = "B".to_string();
         node_b.scope.write_scope = vec!["src/b".to_string()];
         let mut node_c = draft.tasks[0].clone();
         node_c.task_id = "node_c".to_string();
+        node_c.logical_task_id = Some("node_c".to_string());
         node_c.title = "C".to_string();
         node_c.scope.write_scope = vec!["src/c".to_string()];
         let first = draft.tasks.remove(0);
@@ -1764,9 +2615,11 @@ mod tests {
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
         let mut draft = deterministic_fallback_draft("graph", &scope, &[]);
         draft.tasks[0].task_id = "node_a".to_string();
+        draft.tasks[0].logical_task_id = Some("node_a".to_string());
         draft.tasks[0].scope.write_scope = vec!["src/a".to_string()];
         let mut node_b = draft.tasks[0].clone();
         node_b.task_id = "node_b".to_string();
+        node_b.logical_task_id = Some("node_b".to_string());
         node_b.dependencies = vec!["node_a".to_string()];
         node_b.parallel_wave = 1;
         node_b.scope.write_scope = vec!["src/b".to_string()];

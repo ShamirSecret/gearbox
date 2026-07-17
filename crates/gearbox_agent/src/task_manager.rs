@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -20,12 +20,13 @@ use crate::tools::CancellationToken;
 use crate::worker_broker::WorkerBroker;
 use crate::workers::{
     WorkerCategory, WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome, WorkerRegistry,
-    WorkerResult, WorkerSessionHandle, WorkerStartRequest, WorkerStatus, WorkerSubscription,
+    WorkerResult, WorkerRoute, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
+    WorkerSubscription,
     category_requires_worker_evidence, discard_resident_session_for_model_switch, is_free_model,
     provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
     snapshot_worker_evidence_paths, validate_worker_evidence_receipt_with_baseline,
     worker_kind_supports_evidence_contract, worker_model_is_unavailable,
-    write_result_and_outcome_with_outcome,
+    write_result_and_outcome_with_outcome, FREE_PROVIDER_COOLDOWN_MARKER,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +289,128 @@ pub struct TaskAttempt {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackDecisionStatus {
+    Queued,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackDecisionSnapshot {
+    pub task_id: String,
+    pub attempt: usize,
+    pub status: FallbackDecisionStatus,
+    pub previous_worker_kind: String,
+    pub previous_worker_model: Option<String>,
+    pub next_worker_kind: Option<String>,
+    pub next_worker_model: Option<String>,
+    pub raw_observation: Option<String>,
+    pub reason: String,
+    pub failure_kind: Option<TaskFailureKind>,
+    pub recorded_at: String,
+}
+
+const GOAL_WORKER_MODEL_COOLDOWN: Duration = Duration::from_secs(60);
+const PROVIDER_RECOVERY_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_RECOVERY_FILE_NAME: &str = "provider-recovery-ledger.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableProviderRecoveryEntry {
+    pub provider_model_key: String,
+    pub worker_kind: String,
+    pub worker_model: String,
+    pub task_id: String,
+    pub attempt: usize,
+    pub failure_kind: TaskFailureKind,
+    pub failed_at: String,
+    pub cooldown_until_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableProviderRecoveryLedger {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub provider_session_id: Option<String>,
+    pub failed_models: Vec<DurableProviderRecoveryEntry>,
+    pub updated_at: String,
+    pub ledger_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ProviderCooldownReceipt {
+    task_id: String,
+    model: Option<String>,
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn task_id_belongs_to_goal(task_id: &str, goal_id: &str) -> bool {
+    task_id == goal_id
+        || task_id.starts_with(&format!("{goal_id}::"))
+        || task_id.contains(&format!("_{goal_id}"))
+}
+
+impl DurableProviderRecoveryLedger {
+    fn new(goal_id: &str) -> Self {
+        Self {
+            schema_version: PROVIDER_RECOVERY_SCHEMA_VERSION,
+            goal_id: goal_id.to_string(),
+            provider_session_id: None,
+            failed_models: Vec::new(),
+            updated_at: timestamp(),
+            ledger_hash: String::new(),
+        }
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.ledger_hash.clear();
+        let bytes = serde_json::to_vec(&self)
+            .context("failed to serialize provider recovery ledger")?;
+        self.ledger_hash = format!("{:x}", Sha256::digest(bytes));
+        self.validate(&self.goal_id.clone())?;
+        Ok(self)
+    }
+
+    fn validate(&self, goal_id: &str) -> Result<()> {
+        if self.schema_version != PROVIDER_RECOVERY_SCHEMA_VERSION
+            || self.goal_id != goal_id
+            || self.updated_at.trim().is_empty()
+            || self.ledger_hash.len() != 64
+            || self.ledger_hash != self.expected_hash()?
+        {
+            bail!("provider recovery ledger binding or hash is invalid");
+        }
+        if self
+            .failed_models
+            .iter()
+            .any(|entry| entry.provider_model_key.trim().is_empty()
+                || entry.worker_kind.trim().is_empty()
+                || entry.worker_model.trim().is_empty()
+                || entry.task_id.trim().is_empty()
+                || entry.failed_at.trim().is_empty())
+        {
+            bail!("provider recovery ledger contains an incomplete failed-model entry");
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut unsigned = self.clone();
+        unsigned.ledger_hash.clear();
+        let bytes = serde_json::to_vec(&unsigned)
+            .context("failed to serialize unsigned provider recovery ledger")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task_id: String,
@@ -375,6 +498,10 @@ pub struct TaskAttemptSnapshot {
     pub route_transform_path: Option<PathBuf>,
     pub summary: String,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_decision: Option<FallbackDecisionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_decision_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +551,23 @@ pub struct TaskManagerSnapshot {
     pub artifacts_root: Option<PathBuf>,
     pub tasks: Vec<TaskSnapshot>,
     pub current_output: Option<String>,
+}
+
+/// Bounded UI/CLI projection of the provider recovery state persisted for a goal.
+///
+/// The durable ledger remains the source of truth; this projection intentionally
+/// exposes only the current cooldown and a small failed-model set so a long-lived
+/// GUI cannot grow with every retry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRecoverySnapshot {
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_models: Vec<String>,
+    pub cooldown_active: bool,
+    pub cooldown_until_ms: Option<u64>,
+    pub restored_from: Option<String>,
+    pub recovery_status: String,
+    pub artifact_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -822,6 +966,9 @@ impl ConcurrencyManager {
 
 fn is_read_only_task(task: &Task) -> bool {
     matches!(task.kind, TaskKind::Review)
+        || task.inputs.plan_task.as_ref().is_some_and(|plan_task| {
+            plan_task.scope.write_scope.is_empty() && plan_task.scope.max_files_changed == 0
+        })
 }
 
 fn is_write_task(task: &Task) -> bool {
@@ -1763,6 +1910,7 @@ pub struct TaskManager {
     session_scope: Option<String>,
     goal_unavailable_worker_models: HashMap<String, HashMap<String, Instant>>,
     goal_provider_sessions: HashMap<String, String>,
+    goal_recovery_loaded: HashSet<String>,
     goal_epoch_context: Option<GoalEpochContext>,
     activity_heartbeats: HashMap<String, Arc<Mutex<Instant>>>,
     tool_call_circuit_states: HashMap<String, Arc<Mutex<ToolCallCircuitState>>>,
@@ -1775,7 +1923,6 @@ pub struct TaskManager {
 
 pub type SharedTaskManager = Arc<Mutex<TaskManager>>;
 
-const GOAL_WORKER_MODEL_COOLDOWN: Duration = Duration::from_secs(60);
 const DEFAULT_WORKER_FANOUT_LIMIT: usize = 60;
 
 fn worker_fanout_limit_from_environment() -> usize {
@@ -1879,6 +2026,7 @@ impl Default for TaskManager {
             session_scope: None,
             goal_unavailable_worker_models: HashMap::new(),
             goal_provider_sessions: HashMap::new(),
+            goal_recovery_loaded: HashSet::new(),
             goal_epoch_context: None,
             activity_heartbeats: HashMap::new(),
             tool_call_circuit_states: HashMap::new(),
@@ -1946,6 +2094,7 @@ impl TaskManager {
         if self.session_scope.as_deref() != Some(session_id.as_str()) {
             self.goal_unavailable_worker_models.clear();
             self.goal_provider_sessions.clear();
+            self.goal_recovery_loaded.clear();
         }
         self.session_scope = Some(session_id);
     }
@@ -1981,6 +2130,7 @@ impl TaskManager {
         }) {
             self.goal_unavailable_worker_models.clear();
             self.goal_provider_sessions.clear();
+            self.goal_recovery_loaded.clear();
         }
         self.goal_epoch_context = Some(context);
         Ok(())
@@ -2197,6 +2347,7 @@ impl TaskManager {
     pub fn start(&mut self, request: WorkerStartRequest<'_>) -> Result<String> {
         let task_id = request.task.id.clone();
         let queued_task = queued_task_from_request(request);
+        self.restore_goal_recovery_state(&queued_task.store, &queued_task.task.goal_id)?;
         let selected_route = queued_task
             .config
             .selected_route_for_hint(queued_task.route_attempt, queued_task.route_hint.as_deref());
@@ -2772,13 +2923,26 @@ impl TaskManager {
             .running_tasks
             .iter()
             .filter(|(task_id, running_task)| {
+                // OpenCode sessions are provider-backed and may legitimately
+                // spend a long time without producing a text heartbeat. The
+                // provider owns their response lifetime; this sweep is only a
+                // resource safeguard for workers whose command adapter can be
+                // judged stale locally.
+                let task_id = task_id.as_str();
+                let worker_kind = self
+                    .records
+                    .get(task_id)
+                    .and_then(|record| WorkerKind::parse(&record.worker_kind))
+                    .unwrap_or(running_task.queued_task.config.worker_kind);
+                if Self::worker_kind_owns_response_lifetime(worker_kind) {
+                    return false;
+                }
                 // Free-model workers must not be killed by stale-task sweep.
                 // See GBX-063/064: free models may have long periods without text
                 // output while the process is still alive. Only explicit errors,
                 // cancellation, non-zero exit, or tool meltdown should terminate them.
                 // Check multiple model sources because the task record's model
                 // may not be populated when the sweep runs.
-                let task_id = task_id.as_str();
                 if is_free_model(
                     self.records
                         .get(task_id)
@@ -2843,6 +3007,13 @@ impl TaskManager {
         Ok(stale_count)
     }
 
+    fn worker_kind_owns_response_lifetime(worker_kind: WorkerKind) -> bool {
+        matches!(
+            worker_kind,
+            WorkerKind::Opencode | WorkerKind::OpencodeSession
+        )
+    }
+
     fn settle_finished_task(&mut self, finished_task: FinishedTaskMessage) -> Result<()> {
         let task_id = finished_task.task_id.clone();
         match self.settle_running_task(
@@ -2874,6 +3045,12 @@ impl TaskManager {
                     self.forget_task(task_id)?;
                     return Ok(None);
                 };
+                // Keep the epoch that owned the running slot before applying
+                // a fallback transition. `queue_next_attempt` increments the
+                // record epoch, but the slot still belongs to the completed
+                // attempt; releasing with the new epoch would make the
+                // fallback attempt's later release look like a duplicate.
+                let running_run_epoch = record.run_epoch;
                 if let Some(session_id) = running_task.handle.session_id() {
                     record.session_id = Some(session_id);
                 }
@@ -2894,6 +3071,7 @@ impl TaskManager {
                 } else {
                     None
                 };
+                let read_only_task = is_read_only_task(&running_task.queued_task.task);
                 let mut evidence_retry_reason = None;
                 if let Some(evidence_check) = evidence_failure {
                     match evidence_check {
@@ -2909,6 +3087,68 @@ impl TaskManager {
                                 Some(&receipt_path),
                                 None,
                             )?;
+                        }
+                        Err(reason) if read_only_task => {
+                            // OMO-style exploration and review turns are
+                            // evidence-producing, but they do not mutate the
+                            // workspace.  A model may legitimately reuse an
+                            // existing observation receipt or omit the
+                            // transport marker even after completing the
+                            // inspection.  Preserve the hard repository
+                            // checks and make the format failure observable,
+                            // while letting Gear materialize a bounded,
+                            // auditable receipt instead of retrying the same
+                            // read-only session.
+                            let attempt = record
+                                .attempts
+                                .last()
+                                .map(|attempt| attempt.attempt)
+                                .unwrap_or(1);
+                            let receipt_path = write_generated_read_only_evidence_receipt(
+                                &running_task.queued_task.workspace,
+                                task_id,
+                                attempt,
+                                &result,
+                                &outcome,
+                                &reason,
+                            )?;
+                            write_worker_evidence_gate_artifact(
+                                &running_task.store,
+                                task_id,
+                                attempt,
+                                Some(&receipt_path),
+                                Some(&format!("soft read-only evidence degradation: {reason}")),
+                            )?;
+                            result.summary = format!(
+                                "{} (Gear generated a read-only evidence receipt: {})",
+                                result.summary,
+                                receipt_path.display()
+                            );
+                            outcome.summary = result.summary.clone();
+                        }
+                        Err(reason) if should_soft_accept_worker_evidence_failure(&reason) => {
+                            // A missing transport marker is a format failure,
+                            // not proof that the worker did no useful work.
+                            // Keep the degradation visible and let the
+                            // runtime's independent diff, verification,
+                            // review, and completion gates decide whether the
+                            // work can advance. Unsafe paths and malformed
+                            // receipts remain hard failures.
+                            let attempt = record
+                                .attempts
+                                .last()
+                                .map(|attempt| attempt.attempt)
+                                .unwrap_or(1);
+                            let degradation = format!("soft worker evidence degradation: {reason}");
+                            write_worker_evidence_gate_artifact(
+                                &running_task.store,
+                                task_id,
+                                attempt,
+                                None,
+                                Some(&degradation),
+                            )?;
+                            result.summary = format!("{} ({degradation})", result.summary);
+                            outcome.summary = result.summary.clone();
                         }
                         Err(reason) => {
                             let attempt = record
@@ -3007,8 +3247,9 @@ impl TaskManager {
                 }
                 self.remember_unavailable_model_for_goal(
                     &running_task.queued_task.task.goal_id,
+                    &running_task.store,
                     &record,
-                );
+                )?;
                 self.remember_provider_session_for_goal(
                     &running_task.queued_task.task.goal_id,
                     &running_task.store,
@@ -3047,11 +3288,21 @@ impl TaskManager {
                                         "worker fallback queued",
                                         None,
                                     )?;
+                                    write_fallback_decision_artifact(
+                                        &running_task.store,
+                                        &record.task_id,
+                                        previous_attempt,
+                                        Some(next_attempt),
+                                        FallbackDecisionStatus::Queued,
+                                        Some(result.summary.as_str()),
+                                        "worker fallback queued",
+                                        None,
+                                    )?;
                                 }
                             }
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
-                            let run_epoch = record.run_epoch;
+                            let run_epoch = running_run_epoch;
                             record_worker_settle_event(
                                 &running_task.store,
                                 &running_task.queued_task.task.goal_id,
@@ -3072,10 +3323,22 @@ impl TaskManager {
                             reason,
                             failure_kind,
                         } => {
-                            record.failure_kind = Some(failure_kind);
+                            record.failure_kind = Some(failure_kind.clone());
                             record.retry_reason = Some(reason.clone());
                             if let Some(attempt) = record.attempts.last_mut() {
-                                attempt.retry_reason = Some(reason);
+                                attempt.retry_reason = Some(reason.clone());
+                            }
+                            if let Some(previous_attempt) = previous_attempt.as_ref() {
+                                write_fallback_decision_artifact(
+                                    &running_task.store,
+                                    &record.task_id,
+                                    previous_attempt,
+                                    None,
+                                    FallbackDecisionStatus::Unavailable,
+                                    Some(result.summary.as_str()),
+                                    &reason,
+                                    Some(&failure_kind),
+                                )?;
                             }
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
@@ -3119,10 +3382,12 @@ impl TaskManager {
                     self.forget_task(task_id)?;
                     return Ok(None);
                 };
+                let running_run_epoch = record.run_epoch;
                 if let Some(session_id) = running_task.handle.session_id() {
                     record.session_id = Some(session_id);
                 }
                 let error_text = format!("{error:#}");
+                let fallback_observation = error_text.clone();
                 let transition = if record.status == ManagedTaskStatus::Interrupted {
                     transition_task_record(
                         &mut record,
@@ -3203,11 +3468,21 @@ impl TaskManager {
                                         "worker fallback queued",
                                         None,
                                     )?;
+                                    write_fallback_decision_artifact(
+                                        &running_task.store,
+                                        &record.task_id,
+                                        previous_attempt,
+                                        Some(next_attempt),
+                                        FallbackDecisionStatus::Queued,
+                                        Some(fallback_observation.as_str()),
+                                        "worker fallback queued",
+                                        None,
+                                    )?;
                                 }
                             }
                             write_task_record(&running_task.store, &record)?;
                             append_task_lifecycle_event(&running_task.store, &record, None)?;
-                            let run_epoch = record.run_epoch;
+                            let run_epoch = running_run_epoch;
                             record_worker_settle_event(
                                 &running_task.store,
                                 &running_task.queued_task.task.goal_id,
@@ -3228,12 +3503,22 @@ impl TaskManager {
                             reason,
                             failure_kind,
                         } => {
-                            record.failure_kind = Some(failure_kind);
+                            record.failure_kind = Some(failure_kind.clone());
                             record.retry_reason = Some(reason.clone());
                             if let Some(attempt) = record.attempts.last_mut() {
-                                attempt.retry_reason = Some(reason);
+                                attempt.retry_reason = Some(reason.clone());
                             }
                             if let Some(previous_attempt) = previous_attempt.as_ref() {
+                                write_fallback_decision_artifact(
+                                    &running_task.store,
+                                    &record.task_id,
+                                    previous_attempt,
+                                    None,
+                                    FallbackDecisionStatus::Unavailable,
+                                    Some(fallback_observation.as_str()),
+                                    &reason,
+                                    Some(&failure_kind),
+                                )?;
                                 write_route_transform_artifact(
                                     &running_task.store,
                                     &record.task_id,
@@ -3600,6 +3885,25 @@ impl TaskManager {
         let activity_heartbeat = Arc::new(Mutex::new(Instant::now()));
         let circuit_state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
         let circuit_policy = self.runtime_policy.tool_call_circuit_breaker.clone();
+        // Write current incomplete step anchor from the PlanNodeRun ledger so
+        // the revived worker session can inject it into the recovery prompt,
+        // consistent with try_resume_plan_session.
+        if let Some(step_id) = crate::workers::current_step_from_ledger(
+            &resident_task.queued_task.store,
+            &resident_task.queued_task.task.goal_id,
+            task_id,
+        ) {
+            let step_path = resident_task
+                .queued_task
+                .store
+                .worker_dir(task_id)
+                .join("current-step-id");
+            if let Err(e) = std::fs::write(&step_path, step_id.as_bytes()) {
+                eprintln!(
+                    "Gear recovery: failed to write current-step-id for `{task_id}`: {e:#}"
+                );
+            }
+        }
         let revive_result = (|| -> Result<(RunningTask, ReviveDispatchOutcome)> {
             handle.reset_event_history()?;
             let subscription = subscribe_to_worker_events_with_activity_and_circuit(
@@ -4234,6 +4538,12 @@ impl TaskManager {
         let tasks = records
             .into_iter()
             .map(|record| {
+                let task_id = record.task_id.clone();
+                let worker_dir = self
+                    .task_record_paths
+                    .get(&task_id)
+                    .and_then(|path| path.parent())
+                    .map(Path::to_path_buf);
                 let messageability = Some(messageability_for_record(&record));
                 let attempts_len = record.attempts.len();
                 let status = record.status.clone();
@@ -4243,7 +4553,7 @@ impl TaskManager {
                 let continuation_hint = continuation_hint_for_record(&record);
                 let last_command = last_task_command_snapshot(&record);
                 TaskSnapshot {
-                    task_id: record.task_id,
+                    task_id,
                     status: record.status,
                     residency_state: record.residency_state,
                     messageability,
@@ -4261,6 +4571,12 @@ impl TaskManager {
                         .map(|attempt| {
                             let result_path = attempt.result_path.clone();
                             let outcome_path = attempt.outcome_path.clone();
+                            let (fallback_decision_path, fallback_decision) = worker_dir
+                                .as_deref()
+                                .map(|worker_dir| {
+                                    read_fallback_decision_projection(worker_dir, attempt.attempt)
+                                })
+                                .unwrap_or((None, None));
                             let artifact_dir = attempt
                                 .result_path
                                 .as_ref()
@@ -4285,6 +4601,8 @@ impl TaskManager {
                                 route_transform_path,
                                 summary: attempt.summary,
                                 error: attempt.error,
+                                fallback_decision,
+                                fallback_decision_path,
                             }
                         })
                         .collect(),
@@ -4363,6 +4681,8 @@ impl TaskManager {
         let tasks = records
             .into_iter()
             .map(|record| {
+                let task_id = record.task_id.clone();
+                let worker_dir = store.worker_dir(&task_id);
                 let attempts_len = record.attempts.len();
                 let status = record.status.clone();
                 let has_failure_kind = record.failure_kind.is_some();
@@ -4371,7 +4691,7 @@ impl TaskManager {
                 let continuation_hint = continuation_hint_for_record(&record);
                 let last_command = last_task_command_snapshot(&record);
                 TaskSnapshot {
-                    task_id: record.task_id,
+                    task_id,
                     status: record.status,
                     residency_state: record.residency_state,
                     messageability: None,
@@ -4389,6 +4709,8 @@ impl TaskManager {
                         .map(|attempt| {
                             let result_path = attempt.result_path.clone();
                             let outcome_path = attempt.outcome_path.clone();
+                            let (fallback_decision_path, fallback_decision) =
+                                read_fallback_decision_projection(&worker_dir, attempt.attempt);
                             let artifact_dir = attempt
                                 .result_path
                                 .as_ref()
@@ -4412,6 +4734,8 @@ impl TaskManager {
                                 ),
                                 summary: attempt.summary,
                                 error: attempt.error,
+                                fallback_decision,
+                                fallback_decision_path,
                             }
                         })
                         .collect(),
@@ -4703,9 +5027,294 @@ impl TaskManager {
         Ok(())
     }
 
-    fn remember_unavailable_model_for_goal(&mut self, goal_id: &str, record: &TaskRecord) {
+    fn provider_recovery_path(store: &StateStore, goal_id: &str) -> PathBuf {
+        store.artifact_dir(goal_id).join(PROVIDER_RECOVERY_FILE_NAME)
+    }
+
+    /// Read the bounded provider recovery projection used by GUI and CLI
+    /// surfaces. Corrupt ledgers are returned as errors so callers can render
+    /// an explicit recovery failure instead of silently treating it as ready.
+    pub fn provider_recovery_snapshot(
+        store: &StateStore,
+        goal_id: &str,
+    ) -> Result<Option<ProviderRecoverySnapshot>> {
+        let ledger_path = Self::provider_recovery_path(store, goal_id);
+        let now_ms = unix_timestamp_millis();
+        if let Some(ledger) = Self::read_provider_recovery_ledger(store, goal_id)? {
+            let mut failed_models = ledger
+                .failed_models
+                .iter()
+                .filter(|entry| entry.cooldown_until_ms > now_ms)
+                .map(|entry| entry.worker_model.clone())
+                .collect::<Vec<_>>();
+            failed_models.sort();
+            failed_models.dedup();
+            failed_models.truncate(16);
+            let cooldown_until_ms = ledger
+                .failed_models
+                .iter()
+                .map(|entry| entry.cooldown_until_ms)
+                .filter(|until_ms| *until_ms > now_ms)
+                .max();
+            return Ok(Some(ProviderRecoverySnapshot {
+                provider_session_id: ledger.provider_session_id,
+                cooldown_active: cooldown_until_ms.is_some(),
+                cooldown_until_ms,
+                restored_from: Some("durable_ledger".to_string()),
+                recovery_status: if cooldown_until_ms.is_some() {
+                    "cooldown_active".to_string()
+                } else {
+                    "ready".to_string()
+                },
+                artifact_path: Some(ledger_path),
+                failed_models,
+            }));
+        }
+
+        // Keep the projection compatible with receipts written before the
+        // durable ledger existed. Their mtime gives us the same bounded
+        // cooldown window used during restart restoration.
+        let mut legacy_models = HashMap::<String, u64>::new();
+        if let Ok(entries) = fs::read_dir(store.workers_dir()) {
+            for entry in entries.flatten() {
+                let receipt_path = entry.path().join("provider-cooldown.json");
+                if !receipt_path.is_file() {
+                    continue;
+                }
+                let Ok(contents) = fs::read_to_string(&receipt_path) else {
+                    continue;
+                };
+                let Ok(receipt) = serde_json::from_str::<ProviderCooldownReceipt>(&contents)
+                else {
+                    continue;
+                };
+                if !task_id_belongs_to_goal(&receipt.task_id, goal_id) {
+                    continue;
+                }
+                let Some(model) = receipt
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                else {
+                    continue;
+                };
+                let Ok(modified) =
+                    fs::metadata(&receipt_path).and_then(|metadata| metadata.modified())
+                else {
+                    continue;
+                };
+                let Ok(age) = SystemTime::now().duration_since(modified) else {
+                    continue;
+                };
+                if age >= GOAL_WORKER_MODEL_COOLDOWN {
+                    continue;
+                }
+                let modified_ms = modified
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(now_ms.saturating_sub(age.as_millis() as u64));
+                let cooldown_until_ms = modified_ms
+                    .saturating_add(GOAL_WORKER_MODEL_COOLDOWN.as_millis() as u64);
+                legacy_models
+                    .entry(model.to_string())
+                    .and_modify(|until_ms| *until_ms = (*until_ms).max(cooldown_until_ms))
+                    .or_insert(cooldown_until_ms);
+            }
+        }
+        if legacy_models.is_empty() {
+            return Ok(None);
+        }
+        let mut failed_models = legacy_models.keys().cloned().collect::<Vec<_>>();
+        failed_models.sort();
+        failed_models.truncate(16);
+        let cooldown_until_ms = legacy_models.values().copied().max();
+        Ok(Some(ProviderRecoverySnapshot {
+            provider_session_id: None,
+            failed_models,
+            cooldown_active: cooldown_until_ms.is_some_and(|until_ms| until_ms > now_ms),
+            cooldown_until_ms,
+            restored_from: Some("legacy_worker_receipt".to_string()),
+            recovery_status: "legacy_cooldown_active".to_string(),
+            artifact_path: None,
+        }))
+    }
+
+    fn read_provider_recovery_ledger(
+        store: &StateStore,
+        goal_id: &str,
+    ) -> Result<Option<DurableProviderRecoveryLedger>> {
+        let path = Self::provider_recovery_path(store, goal_id);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let ledger: DurableProviderRecoveryLedger = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        ledger.validate(goal_id).with_context(|| {
+            format!("invalid provider recovery ledger at {}", path.display())
+        })?;
+        Ok(Some(ledger))
+    }
+
+    fn write_provider_recovery_ledger(
+        store: &StateStore,
+        ledger: DurableProviderRecoveryLedger,
+    ) -> Result<PathBuf> {
+        let goal_id = ledger.goal_id.clone();
+        let ledger = ledger.seal()?;
+        store.write_artifact_json_atomic(&goal_id, PROVIDER_RECOVERY_FILE_NAME, &ledger)
+    }
+
+    fn restore_goal_recovery_state(
+        &mut self,
+        store: &StateStore,
+        goal_id: &str,
+    ) -> Result<()> {
+        if self.goal_recovery_loaded.contains(goal_id) {
+            return Ok(());
+        }
+
+        let now_ms = unix_timestamp_millis();
+        if let Some(ledger) = Self::read_provider_recovery_ledger(store, goal_id)? {
+            if let Some(provider_session_id) = ledger
+                .provider_session_id
+                .as_deref()
+                .filter(|session_id| !session_id.trim().is_empty())
+            {
+                self.goal_provider_sessions
+                    .insert(goal_id.to_string(), provider_session_id.to_string());
+            }
+            for entry in ledger.failed_models {
+                if entry.cooldown_until_ms <= now_ms {
+                    continue;
+                }
+                let remaining = Duration::from_millis(entry.cooldown_until_ms - now_ms);
+                self.goal_unavailable_worker_models
+                    .entry(goal_id.to_string())
+                    .or_default()
+                    .insert(entry.worker_model, Instant::now() + remaining);
+            }
+        }
+
+        // Receipts written before the ledger existed are still useful during
+        // their bounded cooldown window. Their filesystem mtime is the only
+        // trustworthy freshness signal because the legacy receipt has no
+        // numeric expiry field.
+        if let Ok(entries) = fs::read_dir(store.workers_dir()) {
+            for entry in entries.flatten() {
+                let receipt_path = entry.path().join("provider-cooldown.json");
+                if !receipt_path.is_file() {
+                    continue;
+                }
+                let Ok(contents) = fs::read_to_string(&receipt_path) else {
+                    continue;
+                };
+                let Ok(receipt) = serde_json::from_str::<ProviderCooldownReceipt>(&contents)
+                else {
+                    continue;
+                };
+                if !task_id_belongs_to_goal(&receipt.task_id, goal_id) {
+                    continue;
+                }
+                let Some(model) = receipt
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                else {
+                    continue;
+                };
+                let Ok(modified) = fs::metadata(&receipt_path).and_then(|metadata| metadata.modified())
+                else {
+                    continue;
+                };
+                let Ok(age) = SystemTime::now().duration_since(modified) else {
+                    continue;
+                };
+                if age >= GOAL_WORKER_MODEL_COOLDOWN {
+                    continue;
+                }
+                let remaining = GOAL_WORKER_MODEL_COOLDOWN - age;
+                self.goal_unavailable_worker_models
+                    .entry(goal_id.to_string())
+                    .or_default()
+                    .insert(model.to_string(), Instant::now() + remaining);
+            }
+        }
+
+        self.goal_recovery_loaded.insert(goal_id.to_string());
+        Ok(())
+    }
+
+    fn persist_failed_provider_model(
+        &self,
+        store: &StateStore,
+        goal_id: &str,
+        record: &TaskRecord,
+    ) -> Result<()> {
+        let Some(attempt) = record.attempts.last() else {
+            return Ok(());
+        };
+        let Some(failure_kind @ (TaskFailureKind::ModelUnavailable
+        | TaskFailureKind::ProviderTemporarilyUnavailable)) = attempt.failure_kind.as_ref()
+        else {
+            return Ok(());
+        };
+        let Some(worker_model) = attempt
+            .worker_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            return Ok(());
+        };
+        let worker_kind = WorkerKind::parse(&attempt.worker_kind).unwrap_or(WorkerKind::Custom);
+        let entry = DurableProviderRecoveryEntry {
+            provider_model_key: route_identity_key(worker_kind, Some(worker_model)),
+            worker_kind: attempt.worker_kind.clone(),
+            worker_model: worker_model.to_string(),
+            task_id: record.task_id.clone(),
+            attempt: attempt.attempt,
+            failure_kind: failure_kind.clone(),
+            failed_at: timestamp(),
+            cooldown_until_ms: unix_timestamp_millis()
+                .saturating_add(GOAL_WORKER_MODEL_COOLDOWN.as_millis() as u64),
+        };
+        let mut ledger = Self::read_provider_recovery_ledger(store, goal_id)?
+            .unwrap_or_else(|| DurableProviderRecoveryLedger::new(goal_id));
+        ledger
+            .failed_models
+            .retain(|existing| existing.provider_model_key != entry.provider_model_key);
+        ledger.failed_models.push(entry);
+        ledger.updated_at = timestamp();
+        Self::write_provider_recovery_ledger(store, ledger)?;
+        Ok(())
+    }
+
+    fn persist_provider_session(
+        &self,
+        store: &StateStore,
+        goal_id: &str,
+        provider_session_id: &str,
+    ) -> Result<()> {
+        let mut ledger = Self::read_provider_recovery_ledger(store, goal_id)?
+            .unwrap_or_else(|| DurableProviderRecoveryLedger::new(goal_id));
+        ledger.provider_session_id = Some(provider_session_id.to_string());
+        ledger.updated_at = timestamp();
+        Self::write_provider_recovery_ledger(store, ledger)?;
+        Ok(())
+    }
+
+    fn remember_unavailable_model_for_goal(
+        &mut self,
+        goal_id: &str,
+        store: &StateStore,
+        record: &TaskRecord,
+    ) -> Result<()> {
         let Some(previous_attempt) = record.attempts.last() else {
-            return;
+            return Ok(());
         };
         if !matches!(
             previous_attempt.failure_kind,
@@ -4713,7 +5322,7 @@ impl TaskManager {
                 TaskFailureKind::ModelUnavailable | TaskFailureKind::ProviderTemporarilyUnavailable
             )
         ) {
-            return;
+            return Ok(());
         }
         let Some(worker_model) = previous_attempt
             .worker_model
@@ -4721,15 +5330,31 @@ impl TaskManager {
             .map(str::trim)
             .filter(|worker_model| !worker_model.is_empty())
         else {
-            return;
+            return Ok(());
         };
         self.goal_unavailable_worker_models
             .entry(goal_id.to_string())
             .or_default()
             .insert(worker_model.to_string(), Instant::now());
+        self.persist_failed_provider_model(store, goal_id, record)
     }
 
-    fn apply_goal_unavailable_models(&mut self, queued_task: &mut QueuedTask) {
+    fn apply_goal_unavailable_models(&mut self, queued_task: &mut QueuedTask) -> Result<()> {
+        if queued_task
+            .store
+            .read_global_provider_cooldown()?
+            .is_some_and(|cooldown| cooldown.is_active())
+            && !queued_task
+                .config
+                .unavailable_worker_models
+                .iter()
+                .any(|model| model == FREE_PROVIDER_COOLDOWN_MARKER)
+        {
+            queued_task
+                .config
+                .unavailable_worker_models
+                .push(FREE_PROVIDER_COOLDOWN_MARKER.to_string());
+        }
         let unavailable_models = self
             .goal_unavailable_worker_models
             .get_mut(&queued_task.task.goal_id)
@@ -4738,12 +5363,12 @@ impl TaskManager {
                 models.keys().cloned().collect::<Vec<_>>()
             });
         let Some(unavailable_models) = unavailable_models else {
-            return;
+            return Ok(());
         };
         if unavailable_models.is_empty() {
             self.goal_unavailable_worker_models
                 .remove(&queued_task.task.goal_id);
-            return;
+            return Ok(());
         }
         for unavailable_model in unavailable_models {
             if !queued_task
@@ -4758,6 +5383,7 @@ impl TaskManager {
                     .push(unavailable_model);
             }
         }
+        Ok(())
     }
 
     fn remember_provider_session_for_goal(
@@ -4771,6 +5397,9 @@ impl TaskManager {
         };
         self.goal_provider_sessions
             .insert(goal_id.to_string(), provider_session_id);
+        if let Some(provider_session_id) = self.goal_provider_sessions.get(goal_id) {
+            self.persist_provider_session(store, goal_id, provider_session_id)?;
+        }
         Ok(())
     }
 
@@ -4803,7 +5432,18 @@ impl TaskManager {
     }
 
     fn start_queued_task(&mut self, mut queued_task: QueuedTask) -> Result<()> {
-        self.apply_goal_unavailable_models(&mut queued_task);
+        self.apply_goal_unavailable_models(&mut queued_task)?;
+        if queued_task
+            .config
+            .unavailable_worker_models
+            .iter()
+            .any(|model| model == FREE_PROVIDER_COOLDOWN_MARKER)
+            && !has_available_paid_route(&queued_task.config)
+        {
+            bail!(
+                "free provider quota cooldown is active and no paid worker route is available"
+            );
+        }
         if queued_task.task.attempt > 1 {
             let selected_route = queued_task.config.selected_route_for_hint(
                 queued_task.route_attempt,
@@ -5099,6 +5739,26 @@ impl TaskManager {
             }
         });
     }
+}
+
+fn has_available_paid_route(config: &WorkerConfig) -> bool {
+    let configured_route_is_available = |route: &WorkerRoute| {
+        !is_free_model(route.worker_model.as_deref())
+            && !worker_model_is_unavailable(
+                route.worker_kind,
+                route.worker_model.as_deref(),
+                &config.unavailable_worker_models,
+            )
+    };
+    if config.worker_routes.is_empty() {
+        return !is_free_model(config.worker_model.as_deref())
+            && !worker_model_is_unavailable(
+                config.worker_kind,
+                config.worker_model.as_deref(),
+                &config.unavailable_worker_models,
+            );
+    }
+    config.worker_routes.iter().any(configured_route_is_available)
 }
 
 fn task_attempt_route_transform_path(
@@ -5889,7 +6549,11 @@ fn write_worker_evidence_gate_artifact(
     receipt_path: Option<&Path>,
     reason: Option<&str>,
 ) -> Result<PathBuf> {
-    let status = if reason.is_some() {
+    let status = if receipt_path.is_some() {
+        "accepted"
+    } else if reason.is_some_and(|reason| reason.starts_with("soft ")) {
+        "degraded"
+    } else if reason.is_some() {
         "rejected"
     } else {
         "accepted"
@@ -5907,6 +6571,62 @@ fn write_worker_evidence_gate_artifact(
         &format!("evidence-gate-attempt-{attempt}.json"),
         &format!("{}\n", serde_json::to_string_pretty(&artifact)?),
     )
+}
+
+fn should_soft_accept_worker_evidence_failure(reason: &str) -> bool {
+    reason.starts_with("missing EVIDENCE_RECORDED:")
+        || reason.starts_with("evidence root is unavailable")
+        || reason.starts_with("failed to resolve evidence root:")
+}
+
+fn write_generated_read_only_evidence_receipt(
+    workspace: &Path,
+    task_id: &str,
+    attempt: usize,
+    result: &WorkerResult,
+    outcome: &WorkerOutcome,
+    reason: &str,
+) -> Result<PathBuf> {
+    let evidence_root = workspace.join(".gear/evidence");
+    fs::create_dir_all(&evidence_root)
+        .with_context(|| format!("failed to create {}", evidence_root.display()))?;
+    let safe_task_id = task_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let path = evidence_root.join(format!(
+        "gear-read-only-{safe_task_id}-attempt-{attempt}.md"
+    ));
+    let contents = format!(
+        "# Gear-generated read-only evidence\n\n\
+Task: `{task_id}`\n\
+Attempt: `{attempt}`\n\
+Worker status: `{}`\n\
+Exit code: `{}`\n\
+Summary: {}\n\
+Outcome: {}\n\
+Format degradation: {}\n\n\
+This receipt was generated by Gear because the read-only worker did not\n\
+produce a fresh machine-readable receipt. It records transport degradation\n\
+only; it does not replace repository verification or reviewer judgment.\n",
+        result.status.as_str(),
+        result
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        result.summary,
+        outcome.summary,
+        reason,
+    );
+    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve {}", path.display()))
 }
 
 fn write_route_transform_artifact(
@@ -5998,6 +6718,63 @@ Task: `{task_id}`
         next_session_id = next_session_id,
     );
     store.write_worker_file(task_id, &file_name, &contents)
+}
+
+fn fallback_decision_file_name(attempt: usize) -> String {
+    format!("fallback-decision-{attempt}.json")
+}
+
+fn fallback_decision_path(worker_dir: &Path, attempt: usize) -> PathBuf {
+    worker_dir.join(fallback_decision_file_name(attempt))
+}
+
+fn read_fallback_decision_projection(
+    worker_dir: &Path,
+    attempt: usize,
+) -> (Option<PathBuf>, Option<FallbackDecisionSnapshot>) {
+    let path = fallback_decision_path(worker_dir, attempt);
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let Ok(decision) = serde_json::from_str::<FallbackDecisionSnapshot>(&contents) else {
+        return (Some(path), None);
+    };
+    (Some(path), Some(decision))
+}
+
+fn write_fallback_decision_artifact(
+    store: &StateStore,
+    task_id: &str,
+    previous_attempt: &TaskAttempt,
+    next_attempt: Option<&TaskAttempt>,
+    status: FallbackDecisionStatus,
+    raw_observation: Option<&str>,
+    reason: &str,
+    failure_kind: Option<&TaskFailureKind>,
+) -> Result<PathBuf> {
+    let decision = FallbackDecisionSnapshot {
+        task_id: task_id.to_string(),
+        attempt: previous_attempt.attempt,
+        status,
+        previous_worker_kind: previous_attempt.worker_kind.clone(),
+        previous_worker_model: previous_attempt.worker_model.clone(),
+        next_worker_kind: next_attempt.map(|attempt| attempt.worker_kind.clone()),
+        next_worker_model: next_attempt.and_then(|attempt| attempt.worker_model.clone()),
+        raw_observation: raw_observation.map(ToString::to_string),
+        reason: reason.to_string(),
+        failure_kind: failure_kind.cloned(),
+        recorded_at: timestamp(),
+    };
+    let contents = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&decision)
+            .context("failed to serialize fallback decision")?
+    );
+    store.write_worker_file(
+        task_id,
+        &fallback_decision_file_name(previous_attempt.attempt),
+        &contents,
+    )
 }
 
 fn queued_task_from_request(request: WorkerStartRequest<'_>) -> QueuedTask {
@@ -7491,7 +8268,7 @@ mod tests {
     }
 
     #[test]
-    fn task_manager_rejects_success_without_worker_evidence_receipt() -> Result<()> {
+    fn task_manager_soft_accepts_missing_worker_evidence_marker_for_write_task() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
@@ -7529,21 +8306,81 @@ mod tests {
             route_hint: None,
         })?;
 
-        assert_eq!(run.result.status, WorkerStatus::Failed);
-        assert_eq!(run.record.status, ManagedTaskStatus::Failed);
-        assert_eq!(run.record.attempts.len(), MAX_WORKER_EVIDENCE_ATTEMPTS);
-        assert!(run.record.summary.contains("evidence gate"));
-        for attempt in 1..=MAX_WORKER_EVIDENCE_ATTEMPTS {
-            let artifact = store
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 1);
+        assert!(
+            run.record
+                .summary
+                .contains("soft worker evidence degradation")
+        );
+        let artifact = fs::read_to_string(
+            store
                 .worker_dir(&task.id)
-                .join(format!("evidence-gate-attempt-{attempt}.json"));
-            assert!(
-                artifact.exists(),
-                "missing gate artifact for attempt {attempt}"
-            );
-        }
+                .join("evidence-gate-attempt-1.json"),
+        )?;
+        assert!(artifact.contains(r#""status": "degraded""#));
+        assert!(artifact.contains("soft worker evidence degradation"));
         let task_record = fs::read_to_string(store.worker_dir(&task.id).join("task-record.json"))?;
-        assert!(!task_record.contains(r#""status": "completed""#));
+        assert!(task_record.contains(r#""status": "completed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_soft_accepts_missing_receipt_for_read_only_task() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_read_only_task("task_read_only_missing_worker_evidence");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(
+                r#"printf 'verified without transport receipt\n' > "$GEARBOX_WORKER_LAST_MESSAGE""#
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "read-only evidence gate",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 1);
+        let receipt = fs::read_dir(temp_dir.path().join(".gear/evidence"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.to_string_lossy().contains("gear-read-only-"))
+            .context("missing generated read-only receipt")?;
+        assert!(fs::metadata(receipt)?.len() > 0);
+        let artifact = fs::read_to_string(
+            store
+                .worker_dir(&task.id)
+                .join("evidence-gate-attempt-1.json"),
+        )?;
+        assert!(artifact.contains(r#""status": "accepted""#));
+        assert!(artifact.contains("soft read-only evidence degradation"));
         Ok(())
     }
 
@@ -7834,6 +8671,36 @@ mod tests {
         let events = fs::read_to_string(store.worker_dir(&task.id).join("task-events.jsonl"))?;
         assert!(events.contains(r#""status":"failed""#));
         assert!(events.contains(r#"Worker fallback attempt 2 queued."#));
+
+        // A fallback must release the slot owned by the failed attempt. If
+        // the release is keyed by the incremented fallback epoch, this task
+        // remains counted as running and the next task never leaves pending.
+        let follow_up_task = test_task("task_after_fallback");
+        let mut follow_up_config = config.clone();
+        follow_up_config.worker_command = Some("printf after-fallback-ok".to_string());
+        follow_up_config.worker_routes.clear();
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &follow_up_task,
+            route_attempt: 1,
+            goal: "task after fallback",
+            verification_commands: &[],
+            config: &follow_up_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert!(
+            store
+                .worker_dir(&follow_up_task.id)
+                .join("packet.json")
+                .exists(),
+            "a task after fallback must acquire the released worker slot"
+        );
+        let follow_up_run = manager.wait_for(&follow_up_task.id)?;
+        assert_eq!(follow_up_run.record.status, ManagedTaskStatus::Completed);
         Ok(())
     }
 
@@ -7905,6 +8772,92 @@ mod tests {
             run.record.attempts[1].retry_reason.as_deref().is_some_and(
                 |reason| reason.contains("模型回退：zed_agent -> opencode/mimo-v2.5-free")
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hard_budget_overflow_releases_slot_after_start_failure() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let sentinel = temp_dir.path().join("opencode-overflow-route-ran");
+        let task = test_task("task_budget_overflow_fallback");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(format!("sh -c 'touch {}'", sentinel.display())),
+            worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
+        };
+        let previous_limit = std::env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
+        unsafe {
+            std::env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", "1");
+        }
+        let mut manager = TaskManager::new();
+        let run_result = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test budget overflow fallback",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        });
+        unsafe {
+            match previous_limit {
+                Some(value) => std::env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", value),
+                None => std::env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS"),
+            }
+        }
+        assert!(
+            run_result.is_err(),
+            "a single route with an overflowing hard contract must stop before spawn"
+        );
+        assert!(!sentinel.exists(), "overflow route must not spawn its command");
+        let overflow = store
+            .worker_dir(&task.id)
+            .join("prompt-budget-overflow.json");
+        assert!(overflow.is_file(), "overflow route must leave an admission receipt");
+
+        let follow_up_task = test_task("task_after_budget_overflow");
+        let mut follow_up_config = config.clone();
+        follow_up_config.worker_command = Some("printf after-budget-overflow".to_string());
+        follow_up_config.worker_model = None;
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &follow_up_task,
+            route_attempt: 1,
+            goal: "task after budget overflow",
+            verification_commands: &[],
+            config: &follow_up_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert!(
+            store
+                .worker_dir(&follow_up_task.id)
+                .join("packet.json")
+                .exists(),
+            "budget overflow start failure must release the worker slot"
+        );
+        assert_eq!(
+            manager.wait_for(&follow_up_task.id)?.record.status,
+            ManagedTaskStatus::Completed
         );
         Ok(())
     }
@@ -8011,8 +8964,8 @@ mod tests {
                 },
                 WorkerRoute {
                     worker_kind: WorkerKind::Opencode,
-                    worker_command: Some("printf fallback-provider-ok".to_string()),
-                    worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                    worker_command: Some("printf fallback-provider-paid-ok".to_string()),
+                    worker_model: Some("opencode-go/mimo-v2.5".to_string()),
                 },
             ],
             unavailable_worker_models: Vec::new(),
@@ -8051,7 +9004,7 @@ mod tests {
         );
         assert_eq!(
             run.record.attempts[1].worker_model.as_deref(),
-            Some("opencode/mimo-v2.5-free")
+            Some("opencode-go/mimo-v2.5")
         );
         assert_eq!(run.record.attempts[1].status, TaskAttemptStatus::Completed);
         assert!(
@@ -8065,7 +9018,7 @@ mod tests {
                 .retry_reason
                 .as_deref()
                 .is_some_and(|reason| {
-                    reason.contains("模型回退：opencode/hy3-free -> opencode/mimo-v2.5-free")
+                    reason.contains("模型回退：opencode/hy3-free -> opencode-go/mimo-v2.5")
                 })
         );
         Ok(())
@@ -8157,7 +9110,7 @@ mod tests {
             Some(TaskFailureKind::ProviderTemporarilyUnavailable);
         let mut manager = TaskManager::new();
         manager.set_goal_epoch_context("session_test", "goal_test", "epoch_test")?;
-        manager.remember_unavailable_model_for_goal("goal_test", &failed_record);
+        manager.remember_unavailable_model_for_goal("goal_test", &store, &failed_record)?;
 
         let next_task = test_task("task_repair_after_provider_failure");
         let mut queued_task = QueuedTask {
@@ -8200,7 +9153,7 @@ mod tests {
             route_hint: Some("repair".to_string()),
         };
 
-        manager.apply_goal_unavailable_models(&mut queued_task);
+        manager.apply_goal_unavailable_models(&mut queued_task)?;
 
         assert_eq!(
             queued_task
@@ -8219,7 +9172,7 @@ mod tests {
             .expect("failed model should be tracked for the active goal")
             .insert("opencode/hy3-free".to_string(), expired_at);
         queued_task.config.unavailable_worker_models.clear();
-        manager.apply_goal_unavailable_models(&mut queued_task);
+        manager.apply_goal_unavailable_models(&mut queued_task)?;
         assert!(queued_task.config.unavailable_worker_models.is_empty());
         assert_eq!(
             queued_task
@@ -8231,8 +9184,151 @@ mod tests {
 
         manager.set_goal_epoch_context("session_test", "goal_new", "epoch_new")?;
         queued_task.config.unavailable_worker_models.clear();
-        manager.apply_goal_unavailable_models(&mut queued_task);
+        manager.apply_goal_unavailable_models(&mut queued_task)?;
         assert!(queued_task.config.unavailable_worker_models.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn global_free_provider_cooldown_skips_free_routes_but_keeps_paid_route() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let now_ms = unix_timestamp_millis();
+        store.write_global_provider_cooldown(crate::state::GlobalProviderCooldown {
+            schema_version: crate::state::GLOBAL_PROVIDER_COOLDOWN_SCHEMA_VERSION,
+            provider_scope: "opencode-free-tier".to_string(),
+            failed_models: vec!["opencode/mimo-v2.5-free".to_string()],
+            reason: "provider quota exceeded".to_string(),
+            failed_at: timestamp(),
+            cooldown_until_ms: now_ms.saturating_add(86_400_000),
+            source_task: "goal_test::task_failed".to_string(),
+            source_attempt: 1,
+            recorded_at: timestamp(),
+            receipt_hash: String::new(),
+        })?;
+        let mut queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task("task_after_global_free_quota"),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config: WorkerConfig {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: None,
+                worker_model: None,
+                worker_routes: vec![
+                    WorkerRoute {
+                        worker_kind: WorkerKind::OpencodeSession,
+                        worker_command: Some("opencode run".to_string()),
+                        worker_model: Some("opencode/mimo-v2.5-free".to_string()),
+                    },
+                    WorkerRoute {
+                        worker_kind: WorkerKind::OpencodeSession,
+                        worker_command: Some("opencode run".to_string()),
+                        worker_model: Some("opencode-go/deepseek-v4-flash".to_string()),
+                    },
+                ],
+                unavailable_worker_models: Vec::new(),
+                premium_worker_budget: 1,
+                max_parallel_workers: 1,
+                max_parallel_per_key: 1,
+                stale_task_timeout_secs: 30,
+                skip_worker: false,
+                require_worker: true,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            },
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("deep".to_string()),
+        };
+        let mut manager = TaskManager::new();
+        manager.apply_goal_unavailable_models(&mut queued_task)?;
+        assert!(queued_task
+            .config
+            .unavailable_worker_models
+            .contains(&FREE_PROVIDER_COOLDOWN_MARKER.to_string()));
+        assert_eq!(
+            queued_task
+                .config
+                .selected_route_for_hint(1, Some("deep"))
+                .worker_model,
+            Some("opencode-go/deepseek-v4-flash")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_provider_recovery_restores_cooldown_and_session_after_restart() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let mut ledger = DurableProviderRecoveryLedger::new("goal_test");
+        ledger.provider_session_id = Some("provider-session-1".to_string());
+        ledger.failed_models.push(DurableProviderRecoveryEntry {
+            provider_model_key: route_identity_key(
+                WorkerKind::Opencode,
+                Some("opencode/hy3-free"),
+            ),
+            worker_kind: "opencode".to_string(),
+            worker_model: "opencode/hy3-free".to_string(),
+            task_id: "goal_test::task_003".to_string(),
+            attempt: 2,
+            failure_kind: TaskFailureKind::ProviderTemporarilyUnavailable,
+            failed_at: timestamp(),
+            cooldown_until_ms: unix_timestamp_millis()
+                .saturating_add(GOAL_WORKER_MODEL_COOLDOWN.as_millis() as u64),
+        });
+        TaskManager::write_provider_recovery_ledger(&store, ledger)?;
+
+        let mut manager = TaskManager::new();
+        manager.restore_goal_recovery_state(&store, "goal_test")?;
+        assert!(manager
+            .goal_unavailable_worker_models
+            .get("goal_test")
+            .is_some_and(|models| models.contains_key("opencode/hy3-free")));
+        assert_eq!(
+            manager.goal_provider_sessions.get("goal_test"),
+            Some(&"provider-session-1".to_string())
+        );
+        let projection = TaskManager::provider_recovery_snapshot(&store, "goal_test")?
+            .expect("durable provider recovery projection");
+        assert!(projection.cooldown_active);
+        assert_eq!(projection.failed_models, vec!["opencode/hy3-free"]);
+        assert_eq!(projection.provider_session_id.as_deref(), Some("provider-session-1"));
+        assert_eq!(projection.restored_from.as_deref(), Some("durable_ledger"));
+
+        let mut restarted = TaskManager::new();
+        restarted.restore_goal_recovery_state(&store, "goal_test")?;
+        assert!(restarted
+            .goal_unavailable_worker_models
+            .get("goal_test")
+            .is_some_and(|models| models.contains_key("opencode/hy3-free")));
+        assert_eq!(
+            restarted.goal_provider_sessions.get("goal_test"),
+            Some(&"provider-session-1".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_provider_recovery_rejects_tampered_ledger() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let ledger = DurableProviderRecoveryLedger::new("goal_test").seal()?;
+        let path = TaskManager::write_provider_recovery_ledger(&store, ledger)?;
+        let mut contents = fs::read_to_string(&path)?;
+        contents = contents.replace("\"ledger_hash\": \"", "\"ledger_hash\": \"0");
+        fs::write(&path, contents)?;
+
+        let mut manager = TaskManager::new();
+        let error = manager
+            .restore_goal_recovery_state(&store, "goal_test")
+            .expect_err("tampered provider recovery ledger must stop recovery");
+        assert!(error.to_string().contains("provider recovery ledger"));
         Ok(())
     }
 
@@ -10675,6 +11771,42 @@ mod tests {
     }
 
     #[test]
+    fn durable_snapshot_projects_typed_fallback_decision() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_fallback_decision";
+        let mut record = test_task_record(
+            task_id,
+            ManagedTaskStatus::Failed,
+            TaskAttemptStatus::Failed,
+        );
+        record.failure_kind = Some(TaskFailureKind::NoFallbackRoute);
+        record.retry_reason = Some("no-op fallback: equivalent provider/model".to_string());
+        write_task_record(&store, &record)?;
+        let previous_attempt = record.attempts[0].clone();
+        let path = write_fallback_decision_artifact(
+            &store,
+            task_id,
+            &previous_attempt,
+            None,
+            FallbackDecisionStatus::Unavailable,
+            Some("provider error; fallback route available"),
+            "no-op fallback: equivalent provider/model",
+            Some(&TaskFailureKind::NoFallbackRoute),
+        )?;
+
+        let snapshot = TaskManager::durable_snapshot(&store, None)?.expect("snapshot exists");
+        let attempt = &snapshot.tasks[0].attempts[0];
+        assert_eq!(attempt.fallback_decision_path.as_deref(), Some(path.as_path()));
+        let decision = attempt.fallback_decision.as_ref().expect("typed decision");
+        assert_eq!(decision.status, FallbackDecisionStatus::Unavailable);
+        assert_eq!(decision.raw_observation.as_deref(), Some("provider error; fallback route available"));
+        assert_eq!(decision.failure_kind, Some(TaskFailureKind::NoFallbackRoute));
+        Ok(())
+    }
+
+    #[test]
     fn task_manager_snapshot_includes_route_transform_artifacts() -> Result<()> {
         let mut manager = TaskManager::new();
         manager.records.insert(
@@ -10886,13 +12018,29 @@ mod tests {
     }
 
     #[test]
+    fn opencode_stale_sweep_is_provider_owned() {
+        assert!(TaskManager::worker_kind_owns_response_lifetime(
+            WorkerKind::Opencode
+        ));
+        assert!(TaskManager::worker_kind_owns_response_lifetime(
+            WorkerKind::OpencodeSession
+        ));
+        assert!(!TaskManager::worker_kind_owns_response_lifetime(
+            WorkerKind::Codex
+        ));
+        assert!(!TaskManager::worker_kind_owns_response_lifetime(
+            WorkerKind::Custom
+        ));
+    }
+
+    #[test]
     fn task_manager_wait_for_does_not_hang_on_stale_running_task() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
         let task = test_task("task_stale_running");
         let config = WorkerConfig {
-            worker_kind: WorkerKind::Opencode,
+            worker_kind: WorkerKind::Custom,
             worker_command: Some("printf noop".to_string()),
             worker_model: None,
             worker_routes: Vec::new(),
@@ -10924,7 +12072,7 @@ mod tests {
             task.id.clone(),
             TaskRecord {
                 task_id: task.id.clone(),
-                worker_kind: "opencode".to_string(),
+                worker_kind: "custom".to_string(),
                 worker_command: Some("printf noop".to_string()),
                 worker_model: None,
                 worker_category: "quick".to_string(),
@@ -10950,7 +12098,7 @@ mod tests {
                 error: None,
                 attempts: vec![TaskAttempt {
                     attempt: 1,
-                    worker_kind: "opencode".to_string(),
+                    worker_kind: "custom".to_string(),
                     worker_command: Some("printf noop".to_string()),
                     worker_model: None,
                     worker_category: "quick".to_string(),
@@ -11143,7 +12291,7 @@ mod tests {
         store.initialize()?;
         let task = test_task("task_non_free_model_stale");
         let config = WorkerConfig {
-            worker_kind: WorkerKind::OpencodeSession,
+            worker_kind: WorkerKind::Custom,
             worker_command: Some("printf noop".to_string()),
             worker_model: None,
             worker_routes: Vec::new(),
@@ -11154,7 +12302,7 @@ mod tests {
             stale_task_timeout_secs: 1,
             skip_worker: false,
             require_worker: true,
-            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+            default_worker_for_small_tasks: WorkerKind::Custom,
         };
         let queued_task = QueuedTask {
             store: store.clone(),
@@ -11177,6 +12325,7 @@ mod tests {
             ManagedTaskStatus::Running,
             TaskAttemptStatus::Running,
         );
+        record.worker_kind = "custom".to_string();
         record.worker_model = None; // non-free model
         record.session_id = handle.session_id();
         write_task_record(&store, &record)?;
