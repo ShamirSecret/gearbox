@@ -236,7 +236,10 @@ pub fn run() -> Result<()> {
                 .context(
                     "--opencode-phases requires --opencode-planner-model or GEARBOX_GEAR_OPENCODE_PLANNER_MODEL",
                 )?;
-                let routes = PhaseRouteTable::opencode_only(profiles)?;
+                let routes = PhaseRouteTable::opencode_only_with_premium_budget(
+                    profiles,
+                    worker.premium_worker_budget,
+                )?;
                 let broker_registry = Arc::new(WorkerRegistry::default());
                 let broker_factory = Arc::new(PhaseBrokerFactory::new(
                     broker_registry,

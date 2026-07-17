@@ -61,7 +61,7 @@ use crate::workers::{
     CategoryResolution, CategoryResolutionResult, FallbackRoute, Intensity, SelectedWorkerRoute,
     WorkerCategory, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult, WorkerStartRequest,
     WorkerStatus, category_resolution_for_route, worker_continuation_evidence_from_result,
-    worker_receipt_evidence_paths, worker_step_evidence_from_result,
+    worker_receipt_evidence_paths, worker_route_is_premium, worker_step_evidence_from_result,
 };
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
@@ -1021,6 +1021,8 @@ fn dispatch_parallel_plan_siblings(
         let effective_worker = phase_decision.overlay_worker_config(&options.worker)?;
         let selected_route =
             effective_worker.selected_route_for_hint(1, Some(phase_decision.category.as_str()));
+        let selected_route_is_premium =
+            worker_route_is_premium(selected_route.worker_kind, selected_route.worker_model);
         let route_change_type = if !phase_decision.rejected_candidates.is_empty()
             || selected_route.route_reason.contains("fell back to")
         {
@@ -1033,13 +1035,13 @@ fn dispatch_parallel_plan_siblings(
                 &BudgetSnapshot {
                     worker_call_count: worker_call_count.saturating_add(sibling_index),
                     premium_worker_call_count: premium_worker_call_count
-                        .saturating_add(usize::from(selected_route.worker_kind.is_premium())),
+                        .saturating_add(usize::from(selected_route_is_premium)),
                     attempt_count: attempt_count.saturating_add(sibling_index),
                     runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
                     context_risk_signals: Vec::new(),
                 },
                 route_change_type,
-                selected_route.worker_kind.is_premium(),
+                selected_route_is_premium,
             )
             .map_err(|reason| anyhow::anyhow!("parallel sibling dispatch blocked: {reason}"))?;
 
@@ -1052,7 +1054,7 @@ fn dispatch_parallel_plan_siblings(
             &budget_reservation_id,
             "worker",
             true,
-            selected_route.worker_kind.is_premium(),
+            selected_route_is_premium,
             &goal.budget,
         )?;
         store.append_goal_epoch_event(
@@ -1065,7 +1067,7 @@ fn dispatch_parallel_plan_siblings(
                 "phase": "worker",
                 "wave": true,
                 "task_id": plan_task_id,
-                "premium": selected_route.worker_kind.is_premium(),
+                "premium": selected_route_is_premium,
                 "reserved_tokens": goal.budget.max_tokens_per_call,
             }),
         )?;
@@ -2334,6 +2336,8 @@ impl Orchestrator {
             let resolved_worker_route_hint = Some(phase_decision.category.as_str());
             let selected_route =
                 effective_worker.selected_route_for_hint(1, resolved_worker_route_hint);
+            let selected_route_is_premium =
+                worker_route_is_premium(selected_route.worker_kind, selected_route.worker_model);
             let (category_resolution, category_resolution_result) = category_resolution_for_route(
                 &effective_worker,
                 1,
@@ -2359,7 +2363,7 @@ impl Orchestrator {
                         context_risk_signals: Vec::new(),
                     },
                     current_route_change_type.clone(),
-                    selected_route.worker_kind.is_premium(),
+                    selected_route_is_premium,
                 ) {
                     goal.status = GoalStatus::Limited;
                     goal.summary = format!("Worker dispatch blocked before launch: {reason}");
@@ -2429,7 +2433,7 @@ impl Orchestrator {
                     &budget_reservation_id,
                     "worker",
                     true,
-                    selected_route.worker_kind.is_premium(),
+                    selected_route_is_premium,
                     &goal.budget,
                 ) {
                     goal.status = GoalStatus::Limited;
@@ -2457,7 +2461,7 @@ impl Orchestrator {
                     json!({
                         "reservation_id": budget_reservation_id,
                         "phase": "worker",
-                        "premium": selected_route.worker_kind.is_premium(),
+                        "premium": selected_route_is_premium,
                         "reserved_tokens": goal.budget.max_tokens_per_call,
                     }),
                 )?;
@@ -3487,8 +3491,9 @@ impl Orchestrator {
                 .attempts
                 .iter()
                 .filter(|attempt| {
-                    WorkerKind::parse(&attempt.worker_kind)
-                        .is_some_and(|worker_kind| worker_kind.is_premium())
+                    WorkerKind::parse(&attempt.worker_kind).is_some_and(|worker_kind| {
+                        worker_route_is_premium(worker_kind, attempt.worker_model.as_deref())
+                    })
                 })
                 .count();
             let runtime_elapsed_minutes = run_started_at.elapsed().as_secs() as usize / 60;
@@ -6956,6 +6961,33 @@ fn objective_status_for_goal(status: &GoalStatus) -> ObjectiveStatus {
     }
 }
 
+fn provider_error_blocks_objective(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "provider error",
+        "provider rate limit",
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "quota exceeded",
+        "usage quota",
+        "free usage",
+        "limit exhausted",
+        "cooling down",
+        "temporarily unavailable",
+        "service unavailable",
+        "upstream error",
+        "http 429",
+        "http 503",
+        "http 529",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+        || message
+            .split(|character: char| !character.is_ascii_digit())
+            .any(|status_code| matches!(status_code, "429" | "503" | "529"))
+}
+
 fn settle_failed_objective_goal(
     store: &StateStore,
     event_sink: &Option<EventSink>,
@@ -6964,9 +6996,18 @@ fn settle_failed_objective_goal(
     active_node: &crate::state::GoalGraphNode,
     error: &anyhow::Error,
 ) -> Result<()> {
-    let reason = format!("active goal failed before producing a terminal outcome: {error:#}");
+    let status = if provider_error_blocks_objective(error) {
+        GoalStatus::Limited
+    } else {
+        GoalStatus::Failed
+    };
+    let reason = if status == GoalStatus::Limited {
+        format!("active goal was limited before producing a terminal outcome: {error:#}")
+    } else {
+        format!("active goal failed before producing a terminal outcome: {error:#}")
+    };
     if let Some(mut goal) = store.read_goal(&active_node.goal_id)? {
-        goal.status = GoalStatus::Failed;
+        goal.status = status.clone();
         goal.current_task_id = None;
         goal.summary = reason.clone();
         goal.updated_at = timestamp();
@@ -6987,7 +7028,7 @@ fn settle_failed_objective_goal(
         ),
         GoalEpochEventKind::Aborted,
         json!({
-            "status": GoalStatus::Failed.as_str(),
+            "status": status.as_str(),
             "reason": reason,
         }),
     )?;
@@ -6998,26 +7039,31 @@ fn settle_failed_objective_goal(
             &active_node.session_id,
             Some(&active_node.goal_id),
             None,
-            EventKind::GoalBlocked,
+            if status == GoalStatus::Limited {
+                EventKind::GoalLimited
+            } else {
+                EventKind::GoalBlocked
+            },
             reason.clone(),
-            json!({ "status": GoalStatus::Failed.as_str() }),
+            json!({ "status": status.as_str() }),
         ),
     )?;
     graph.update_active_node(
         &active_node.goal_id,
-        GoalStatus::Failed,
+        status.clone(),
         None,
         None,
         None,
         Some(reason.clone()),
     )?;
     graph.record_failure(graph.consecutive_failures.saturating_add(1))?;
-    graph.set_terminal(ObjectiveStatus::Failed, reason.clone())?;
+    let objective_status = objective_status_for_goal(&status);
+    graph.set_terminal(objective_status.clone(), reason.clone())?;
     store.write_objective_graph(graph)?;
     append_objective_terminal_event(
         store,
         objective_id,
-        &ObjectiveStatus::Failed,
+        &objective_status,
         &reason,
         &active_node.goal_id,
     )?;
@@ -7311,6 +7357,45 @@ fn reserve_planning_phase_budget(
     budget_context: Option<(&GoalRunLeaseGuard, &str)>,
     phase_key: &str,
 ) -> Result<Option<String>> {
+    reserve_planning_phase_budget_with_flags(goal, store, budget_context, phase_key, false, false)
+}
+
+fn reserve_planning_phase_budget_for_route(
+    goal: &mut Goal,
+    store: &StateStore,
+    budget_context: Option<(&GoalRunLeaseGuard, &str)>,
+    phase_key: &str,
+    route_decision: &PhaseRouteDecision,
+) -> Result<Option<String>> {
+    let (worker_call, premium) = planning_phase_budget_flags(route_decision);
+    reserve_planning_phase_budget_with_flags(
+        goal,
+        store,
+        budget_context,
+        phase_key,
+        worker_call,
+        premium,
+    )
+}
+
+fn planning_phase_budget_flags(route_decision: &PhaseRouteDecision) -> (bool, bool) {
+    let worker_call = route_decision.worker_kind.is_some();
+    let premium = worker_call
+        && matches!(
+            &route_decision.candidate.model,
+            PhaseModelBinding::BackendDeclared(model) if model.starts_with("opencode-go/")
+        );
+    (worker_call, premium)
+}
+
+fn reserve_planning_phase_budget_with_flags(
+    goal: &mut Goal,
+    store: &StateStore,
+    budget_context: Option<(&GoalRunLeaseGuard, &str)>,
+    phase_key: &str,
+    worker_call: bool,
+    premium: bool,
+) -> Result<Option<String>> {
     let Some((lease, epoch_id)) = budget_context else {
         return Ok(None);
     };
@@ -7319,8 +7404,8 @@ fn reserve_planning_phase_budget(
         lease,
         &reservation_id,
         phase_key,
-        false,
-        false,
+        worker_call,
+        premium,
         &goal.budget,
     ) {
         goal.status = GoalStatus::Limited;
@@ -7347,8 +7432,8 @@ fn reserve_planning_phase_budget(
         json!({
             "reservation_id": reservation_id,
             "phase": phase_key,
-            "worker_call": false,
-            "premium": false,
+            "worker_call": worker_call,
+            "premium": premium,
             "reserved_tokens": goal.budget.max_tokens_per_call,
         }),
     )?;
@@ -7415,8 +7500,13 @@ fn run_strategist_next_goal(
     check_phase_terminal_state(&route_decision)
         .context("strategist next-goal phase terminal state check failed")?;
     let phase_key = "strategist-next-goal";
-    let budget_reservation =
-        reserve_planning_phase_budget(goal, store, Some((lease, epoch_id)), phase_key)?;
+    let budget_reservation = reserve_planning_phase_budget_for_route(
+        goal,
+        store,
+        Some((lease, epoch_id)),
+        phase_key,
+        &route_decision,
+    )?;
     let submission_result = hook(StrategistNextGoalInput {
         goal_id: goal.id.clone(),
         epoch_id: epoch_id.to_string(),
@@ -7666,8 +7756,13 @@ fn build_approved_plan_graph_inner(
             )?;
             check_phase_terminal_state(&decision)
                 .context("intent fold phase terminal state check failed")?;
-            let budget_reservation =
-                reserve_planning_phase_budget(goal, store, budget_context, "intent-fold")?;
+            let budget_reservation = reserve_planning_phase_budget_for_route(
+                goal,
+                store,
+                budget_context,
+                "intent-fold",
+                &decision,
+            )?;
             let submission_result = intent_fold_hook(IntentFoldInput {
                 goal_id: goal.id.clone(),
                 request: goal.request.clone(),
@@ -7739,8 +7834,13 @@ fn build_approved_plan_graph_inner(
         )?;
         check_phase_terminal_state(&planner_decision)
             .context("planner phase terminal state check failed")?;
-        let budget_reservation =
-            reserve_planning_phase_budget(goal, store, budget_context, "planner")?;
+        let budget_reservation = reserve_planning_phase_budget_for_route(
+            goal,
+            store,
+            budget_context,
+            "planner",
+            &planner_decision,
+        )?;
         let submission_result = planner_hook(PlannerInput {
             goal_id: goal.id.clone(),
             request: goal.request.clone(),
@@ -8064,8 +8164,13 @@ fn build_approved_plan_graph_inner(
             actual_session_id: None,
         };
         let critic_budget_key = format!("plan-critic.{}", plan.revision);
-        let budget_reservation =
-            reserve_planning_phase_budget(goal, store, budget_context, &critic_budget_key)?;
+        let budget_reservation = reserve_planning_phase_budget_for_route(
+            goal,
+            store,
+            budget_context,
+            &critic_budget_key,
+            &critic_decision,
+        )?;
         let submission_result = run_phase_via_broker(
             broker,
             store,
@@ -8231,11 +8336,12 @@ fn build_approved_plan_graph_inner(
                         actual_session_id: None,
                     };
                     let oracle_budget_key = format!("plan-oracle.{}", plan.revision);
-                    let oracle_budget = reserve_planning_phase_budget(
+                    let oracle_budget = reserve_planning_phase_budget_for_route(
                         goal,
                         store,
                         budget_context,
                         &oracle_budget_key,
+                        &oracle_decision,
                     )?;
                     let oracle_hook = match phase_runtime.oracle_hook.as_ref() {
                         Some(oracle_hook) => oracle_hook,
@@ -8586,11 +8692,12 @@ fn build_approved_plan_graph_inner(
                 if let Some(path) = critic_receipt.artifact_path.clone() {
                     revision_evidence_refs.push(path);
                 }
-                let budget_reservation = reserve_planning_phase_budget(
+                let budget_reservation = reserve_planning_phase_budget_for_route(
                     goal,
                     store,
                     budget_context,
                     &revision_budget_key,
+                    &planner_decision,
                 )?;
                 let revision_result = run_phase_via_broker(
                     broker,
@@ -10111,9 +10218,9 @@ fn write_verification_evidence(
             "exit_code": result.exit_code,
             "stdout_path": stdout_path,
             "stderr_path": stderr_path,
-            "stdout_truncated": result.stdout.len() >= 12_000,
-            "stderr_truncated": result.stderr.len() >= 12_000,
-            "evidence_quality": if result.stdout.len() >= 12_000 || result.stderr.len() >= 12_000 {
+            "stdout_truncated": result.stdout_truncated,
+            "stderr_truncated": result.stderr_truncated,
+            "evidence_quality": if result.stdout_truncated || result.stderr_truncated {
                 "unknown_due_to_truncation"
             } else {
                 "complete"
@@ -15311,12 +15418,12 @@ mod tests {
         let mut config = WorkerConfig::default();
         config.worker_kind = WorkerKind::Opencode;
         config.worker_command = Some(
-            r###"sh -c 'task_id=$(grep -o "\"task_id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$GEARBOX_WORKER_PACKET" | head -1 | cut -d "\"" -f4); reviewed_id=$(grep -o '"'"'reviewed_execution_id\\":\\"[^\\"]*'"'"' "$GEARBOX_WORKER_PACKET" | head -1 | sed '"'"'s/.*\\"//'"'"'); if [ -z "$reviewed_id" ]; then reviewed_id=$task_id; fi; mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; printf "%s" "{\"schema_version\":1,\"reviewed_execution_id\":\"TASK_ID\",\"dimensions\":[{\"dimension\":\"goal_verification\",\"verdict\":\"pass\",\"findings\":[\"verification evidence inspected\"]},{\"dimension\":\"code_quality\",\"verdict\":\"pass\",\"findings\":[\"scope inspected\"]},{\"dimension\":\"security\",\"verdict\":\"pass\",\"findings\":[\"forbidden paths clean\"]},{\"dimension\":\"qa_execution\",\"verdict\":\"pass\",\"findings\":[\"verification passed\",\"EVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\"]}]}" | sed "s|TASK_ID|$reviewed_id|" > "$GEARBOX_WORKER_LAST_MESSAGE"'"###
+            r###"sh -c 'task_id=$(grep -o "\"task_id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$GEARBOX_WORKER_PACKET" | head -1 | cut -d "\"" -f4); reviewed_id=$(grep -o '"'"'reviewed_execution_id\\":\\"[^\\"]*'"'"' "$GEARBOX_WORKER_PACKET" | head -1 | sed '"'"'s/.*\\"//'"'"'); if [ -z "$reviewed_id" ]; then reviewed_id=$task_id; fi; evidence_path=".gear/evidence/$task_id/receipt.md"; mkdir -p "$(dirname "$evidence_path")"; printf verified > "$evidence_path"; printf "%s" "{\"schema_version\":1,\"reviewed_execution_id\":\"TASK_ID\",\"dimensions\":[{\"dimension\":\"goal_verification\",\"verdict\":\"pass\",\"findings\":[\"verification evidence inspected\"]},{\"dimension\":\"code_quality\",\"verdict\":\"pass\",\"findings\":[\"scope inspected\"]},{\"dimension\":\"security\",\"verdict\":\"pass\",\"findings\":[\"forbidden paths clean\"]},{\"dimension\":\"qa_execution\",\"verdict\":\"pass\",\"findings\":[\"verification passed\",\"EVIDENCE_RECORDED: $evidence_path\"]}]}" | sed "s|TASK_ID|$reviewed_id|" > "$GEARBOX_WORKER_LAST_MESSAGE"'"###
             .to_string(),
         );
         if let Some(command) = config.worker_command.as_mut() {
             command.push_str(
-                "; printf '\\n# completed_steps\\n- step-001\\n- step-002\\n- step-003\\n\\n# step_evidence\\nstep-001: .gearbox-agent/evidence/receipt.md\\nstep-002: .gearbox-agent/evidence/receipt.md\\nstep-003: .gearbox-agent/evidence/receipt.md\\n' >> \"$GEARBOX_WORKER_LAST_MESSAGE\"",
+                "; task_id=$(grep -o '\"task_id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' \"$GEARBOX_WORKER_PACKET\" | head -1 | cut -d '\"' -f4); printf '\\n# completed_steps\\n- step-001\\n- step-002\\n- step-003\\n\\n# step_evidence\\nstep-001: .gear/evidence/%s/receipt.md\\nstep-002: .gear/evidence/%s/receipt.md\\nstep-003: .gear/evidence/%s/receipt.md\\n' \"$task_id\" \"$task_id\" \"$task_id\" >> \"$GEARBOX_WORKER_LAST_MESSAGE\"",
             );
         }
         config.skip_worker = false;
@@ -15842,7 +15949,8 @@ mod tests {
         let budget_ledger = store.read_goal_budget_ledger(&goal.id)?;
         assert_eq!(budget_ledger.reservations.len(), 1);
         assert_eq!(budget_ledger.reservations[0].phase, "planner");
-        assert!(!budget_ledger.reservations[0].worker_call);
+        assert!(budget_ledger.reservations[0].worker_call);
+        assert!(!budget_ledger.reservations[0].premium);
         assert_eq!(
             budget_ledger.reservations[0].status,
             crate::state::BudgetReservationStatus::Settled
@@ -15982,6 +16090,76 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == ObjectiveEventKind::Failed)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn objective_provider_limit_settles_as_limited_and_persists_blocker() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = "Create one bounded artifact";
+        let session_id = "objective-provider-limit-session";
+        let mut phase_runtime = phase_runtime_for_test(None);
+        phase_runtime.intent_fold_hook = Some(Arc::new(|_| {
+            bail!("OpenCode Planner phase failed: provider rate limit (429)")
+        }));
+
+        let error = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: request.to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 1,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some(session_id.to_string()),
+                continuation: true,
+                intensity: None,
+            },
+            phase_runtime,
+            ObjectivePolicy::default(),
+        )
+        .expect_err("the injected provider limit must be returned");
+        assert!(format!("{error:#}").contains("provider rate limit"));
+
+        let objective_id = objective_id_for(session_id, temp_dir.path(), request)?;
+        let store = StateStore::new(temp_dir.path());
+        let graph = store
+            .read_objective_graph(&objective_id)?
+            .context("objective graph should remain auditable after provider limit")?;
+        assert_eq!(graph.status, ObjectiveStatus::Limited);
+        assert!(graph.active_goal_id.is_none());
+        assert_eq!(graph.nodes[0].status, GoalStatus::Limited);
+        assert!(graph.nodes[0]
+            .terminal_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("provider rate limit")));
+        assert!(store
+            .read_objective_events(&objective_id)?
+            .iter()
+            .any(|event| event.kind == ObjectiveEventKind::Limited));
+
+        let goal_id = format!("goal_{objective_id}_000");
+        let goal: Goal = serde_json::from_str(&fs::read_to_string(
+            temp_dir
+                .path()
+                .join(".gear/goals")
+                .join(format!("{goal_id}.json")),
+        )?)?;
+        assert_eq!(goal.status, GoalStatus::Limited);
         Ok(())
     }
 
@@ -20805,6 +20983,8 @@ mod tests {
             stdout: "fail".to_string(),
             stderr: "error".to_string(),
             duration_ms: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }];
         let v2 = vec![ShellCommandResult {
             command: "cargo test".to_string(),
@@ -20813,6 +20993,8 @@ mod tests {
             stdout: "fail".to_string(),
             stderr: "error".to_string(),
             duration_ms: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }];
         let signals = detect_stagnation(&[], &[v1, v2], &[], &[]);
         assert!(!signals.is_empty());
@@ -22886,5 +23068,43 @@ mod tests {
         assert!(is_destructive_command("git log --oneline -5").is_none());
         assert!(is_destructive_command("echo hello").is_none());
         assert!(is_destructive_command("ls -la").is_none());
+    }
+
+    #[test]
+    fn planning_phase_budget_flags_track_worker_and_paid_routes() -> Result<()> {
+        let paid_routes = PhaseRouteTable::opencode_only(crate::phase_routing::OpenCodeModelProfiles {
+            planner: "opencode-go/mimo-v2.5".to_string(),
+            executor: "opencode-go/deepseek-v4-flash".to_string(),
+            reviewer: "opencode-go/mimo-v2.5".to_string(),
+        })?;
+        let paid_decision = paid_routes.resolve(
+            &PhaseProfile::Planner,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(planning_phase_budget_flags(&paid_decision), (true, true));
+
+        let free_routes = PhaseRouteTable::opencode_only(crate::phase_routing::OpenCodeModelProfiles {
+            planner: "opencode/mimo-v2.5-free".to_string(),
+            executor: "opencode/deepseek-v4-flash-free".to_string(),
+            reviewer: "opencode/mimo-v2.5-free".to_string(),
+        })?;
+        let free_decision = free_routes.resolve(
+            &PhaseProfile::Planner,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(planning_phase_budget_flags(&free_decision), (true, false));
+
+        let deterministic_decision = PhaseRouteTable::legacy_defaults().resolve(
+            &PhaseProfile::Orchestrator,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(
+            planning_phase_budget_flags(&deterministic_decision),
+            (false, false)
+        );
+        Ok(())
     }
 }

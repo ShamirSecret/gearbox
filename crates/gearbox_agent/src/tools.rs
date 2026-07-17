@@ -55,6 +55,10 @@ pub struct ShellCommandResult {
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u128,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
 }
 
 impl ShellCommandResult {
@@ -339,6 +343,16 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
     cleanup_command_output(&stderr_path);
 
     let preserve_worker_tail = env.contains_key("GEARBOX_WORKER_SESSION_ID");
+    let stdout_truncated = if preserve_worker_tail {
+        stdout.len() > WORKER_OUTPUT_LIMIT
+    } else {
+        stdout.len() > OUTPUT_LIMIT
+    };
+    let stderr_truncated = if preserve_worker_tail {
+        stderr.len() > WORKER_OUTPUT_LIMIT
+    } else {
+        stderr.len() > OUTPUT_LIMIT
+    };
     Ok(ShellCommandResult {
         command: command.to_string(),
         exit_code: status.code(),
@@ -354,6 +368,8 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
             truncate(&stderr, OUTPUT_LIMIT)
         },
         duration_ms: started_at.elapsed().as_millis(),
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
@@ -593,6 +609,8 @@ fn run_raw_git(workspace: &Path, args: &[&str]) -> Result<ShellCommandResult> {
         stdout: truncate(&String::from_utf8_lossy(&output.stdout), OUTPUT_LIMIT),
         stderr: truncate(&String::from_utf8_lossy(&output.stderr), OUTPUT_LIMIT),
         duration_ms: started_at.elapsed().as_millis(),
+        stdout_truncated: output.stdout.len() > OUTPUT_LIMIT,
+        stderr_truncated: output.stderr.len() > OUTPUT_LIMIT,
     })
 }
 
@@ -1124,6 +1142,17 @@ mod tests {
         assert!(output.contains("UVWXYZ"), "tail should remain available");
         assert!(output.contains("[gearbox-agent output truncated]"));
         assert!(output.chars().count() <= 50);
+    }
+
+    #[test]
+    fn shell_command_result_records_output_truncation() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let result = run_shell_command(workspace.path(), "printf '%13000s' x")?;
+        assert!(result.success);
+        assert!(result.stdout_truncated);
+        assert!(!result.stderr_truncated);
+        assert!(result.stdout.contains("[gearbox-agent output truncated]"));
+        Ok(())
     }
 
     #[test]

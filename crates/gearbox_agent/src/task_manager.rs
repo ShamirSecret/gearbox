@@ -25,7 +25,7 @@ use crate::workers::{
     category_requires_worker_evidence, discard_resident_session_for_model_switch, is_free_model,
     provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
     snapshot_worker_evidence_paths, validate_worker_evidence_receipt_with_baseline,
-    worker_kind_supports_evidence_contract, worker_model_is_unavailable,
+    worker_kind_supports_evidence_contract, worker_model_is_unavailable, worker_route_is_premium,
     write_result_and_outcome_with_outcome, FREE_PROVIDER_COOLDOWN_MARKER,
 };
 
@@ -6908,13 +6908,16 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
             failure_kind: TaskFailureKind::NoFallbackRoute,
         };
     }
-    if selected_route.worker_kind.is_premium() {
+    let selected_route_is_premium =
+        worker_route_is_premium(selected_route.worker_kind, selected_route.worker_model);
+    if selected_route_is_premium {
         let used_premium_attempts = record
             .attempts
             .iter()
             .filter(|attempt| {
                 WorkerKind::parse(&attempt.worker_kind).is_some_and(|worker_kind| {
-                    worker_kind.is_premium() && attempt.status != TaskAttemptStatus::Pending
+                    worker_route_is_premium(worker_kind, attempt.worker_model.as_deref())
+                        && attempt.status != TaskAttemptStatus::Pending
                 })
             })
             .count();

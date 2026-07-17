@@ -974,6 +974,22 @@ pub(crate) fn is_free_model(worker_model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Return whether a selected worker route consumes the premium-call budget.
+///
+/// Worker kind alone is not sufficient for OpenCode: both free and paid
+/// OpenCode Go models use `WorkerKind::OpencodeSession`.  Keep the provider
+/// identity in the route model so paid OpenCode calls cannot bypass the
+/// durable premium budget accounting.
+pub(crate) fn worker_route_is_premium(
+    worker_kind: WorkerKind,
+    worker_model: Option<&str>,
+) -> bool {
+    worker_kind.is_premium()
+        || worker_model
+            .and_then(|model| model.split_once('/'))
+            .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("opencode-go"))
+}
+
 pub(crate) const FREE_PROVIDER_COOLDOWN_MARKER: &str = "gearbox:free-provider-cooldown";
 const FREE_PROVIDER_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
@@ -1822,6 +1838,12 @@ pub struct WorkerPacket {
     pub injected_rules: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_injection_path: Option<String>,
+    /// Project-scoped skills resolved for this task. Skills are soft prompt
+    /// context; the receipt records freshness, cache reuse, and omissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected_skills: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_injection_path: Option<String>,
     pub tools: WorkerToolPolicy,
     pub category_resolution: CategoryResolution,
     pub category_resolution_result: CategoryResolutionResult,
@@ -1870,6 +1892,55 @@ struct RuleInjectionReceipt {
     injected_content_hash: String,
     receipt_hash: String,
     created_at: String,
+}
+
+const SKILL_INJECTION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SkillInjectionEntry {
+    relative_path: String,
+    real_path: String,
+    content_hash: String,
+    bytes: usize,
+    modified_at_ms: u128,
+    distance: usize,
+    freshness: String,
+    injected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omission_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SkillInjectionReceipt {
+    schema_version: u32,
+    task_id: String,
+    workspace: String,
+    target_paths: Vec<String>,
+    cache_key: String,
+    cache_hit: bool,
+    entries: Vec<SkillInjectionEntry>,
+    errors: Vec<String>,
+    injected_content_hash: String,
+    receipt_hash: String,
+    created_at: String,
+}
+
+impl SkillInjectionReceipt {
+    fn expected_hash(&self) -> Result<String> {
+        let mut unsigned = self.clone();
+        unsigned.receipt_hash.clear();
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&unsigned)?)))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != SKILL_INJECTION_SCHEMA_VERSION {
+            bail!("unsupported skill injection receipt schema");
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("skill injection receipt hash mismatch");
+        }
+        Ok(())
+    }
 }
 
 impl RuleInjectionReceipt {
@@ -3455,7 +3526,7 @@ pub fn seed_provider_session_for_task(
 /// worker.  Gear resolves only project-local `AGENTS.md` and `.rules` files;
 /// the result is soft prompt context, while this receipt remains authoritative
 /// evidence of what was considered, injected, or deliberately omitted.
-fn discover_workspace_rules(
+pub fn discover_workspace_rules(
     store: &StateStore,
     workspace: &Path,
     task: &Task,
@@ -3680,6 +3751,341 @@ fn discover_workspace_rules(
     Ok((injected_rules, Some(receipt_path.to_string_lossy().to_string())))
 }
 
+fn skill_is_disabled(content: &str) -> bool {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if matches!(key.trim().to_ascii_lowercase().as_str(), "disabled" | "enabled") {
+            let value = value.trim().trim_matches(['"', '\'']);
+            if (key.trim().eq_ignore_ascii_case("disabled") && value.eq_ignore_ascii_case("true"))
+                || (key.trim().eq_ignore_ascii_case("enabled")
+                    && value.eq_ignore_ascii_case("false"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve project-local `.agents/skills/*/SKILL.md` files for the task scope.
+///
+/// Resolution is deliberately bounded to the workspace realpath and to the
+/// root-to-target ancestor chain. A small persistent cache records file
+/// hashes/mtimes so a dispatch can distinguish a reused entry from a changed
+/// or newly discovered skill without treating stale prompt text as current.
+pub fn discover_workspace_skills(
+    store: &StateStore,
+    workspace: &Path,
+    task: &Task,
+) -> Result<(Option<String>, Option<String>)> {
+    let workspace_real = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace_display = workspace_real.to_string_lossy().to_string();
+    let mut errors = Vec::new();
+    let mut target_paths = Vec::new();
+    let requested_targets = if task.scope.allowed_paths.is_empty() {
+        vec![".".to_string()]
+    } else {
+        task.scope.allowed_paths.clone()
+    };
+    let mut target_dirs = Vec::new();
+    for requested in requested_targets {
+        let candidate = if Path::new(&requested).is_absolute() {
+            PathBuf::from(&requested)
+        } else {
+            workspace.join(&requested)
+        };
+        let target = candidate.canonicalize().or_else(|_| {
+            candidate
+                .parent()
+                .filter(|parent| parent.exists())
+                .map(Path::to_path_buf)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "target missing"))
+        });
+        let target = match target {
+            Ok(target) => target,
+            Err(error) => {
+                errors.push(format!("target `{requested}` unavailable: {error}"));
+                continue;
+            }
+        };
+        if !target.starts_with(&workspace_real) {
+            errors.push(format!(
+                "target `{requested}` outside workspace realpath; skipped"
+            ));
+            continue;
+        }
+        let target_dir = if target.is_file() {
+            target.parent().unwrap_or(&target).to_path_buf()
+        } else {
+            target
+        };
+        let relative_target = target_dir
+            .strip_prefix(&workspace_real)
+            .map(|path| {
+                let value = path.to_string_lossy().replace('\\', "/");
+                if value.is_empty() { ".".to_string() } else { value }
+            })
+            .unwrap_or_else(|_| ".".to_string());
+        target_paths.push(relative_target);
+        if !target_dirs.contains(&target_dir) {
+            target_dirs.push(target_dir);
+        }
+    }
+    target_paths.sort();
+    target_paths.dedup();
+    let cache_key = prompt_content_hash(&format!(
+        "{}|{}",
+        workspace_display,
+        target_paths.join("|")
+    ));
+    // Scope the persistent cache by workspace and target set. Distinct
+    // parallel workers no longer overwrite unrelated target baselines, while
+    // later attempts for the same target set can still observe freshness.
+    let cache_path = store
+        .root()
+        .join(format!("skill-injection-cache-{cache_key}.json"));
+    let previous = fs::read(&cache_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SkillInjectionReceipt>(&bytes).ok())
+        .filter(|receipt| receipt.schema_version == SKILL_INJECTION_SCHEMA_VERSION);
+
+    let mut candidates = Vec::new();
+    for target_dir in target_dirs {
+        let mut ancestors = Vec::new();
+        let mut current = target_dir;
+        loop {
+            ancestors.push(current.clone());
+            if current == workspace_real {
+                break;
+            }
+            let Some(parent) = current.parent().map(Path::to_path_buf) else {
+                break;
+            };
+            if !parent.starts_with(&workspace_real) {
+                break;
+            }
+            current = parent;
+        }
+        ancestors.reverse();
+        for (distance, directory) in ancestors.iter().enumerate() {
+            let skills_dir = directory.join(".agents").join("skills");
+            let entries = match fs::read_dir(&skills_dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    errors.push(format!("failed to read {}: {error}", skills_dir.display()));
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let skill_file = entry.path().join("SKILL.md");
+                if !skill_file.exists() {
+                    continue;
+                }
+                match skill_file.canonicalize() {
+                    Ok(real_path) if real_path.starts_with(&workspace_real) => {
+                        candidates.push((skill_file, real_path, distance));
+                    }
+                    Ok(_) => errors.push(format!(
+                        "skill `{}` resolves outside workspace; skipped",
+                        skill_file.display()
+                    )),
+                    Err(error) => errors.push(format!(
+                        "skill `{}` realpath failed: {error}",
+                        skill_file.display()
+                    )),
+                }
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+
+    let previous_by_path = previous.as_ref().map(|receipt| {
+        receipt
+            .entries
+            .iter()
+            .map(|entry| (entry.relative_path.clone(), entry))
+            .collect::<HashMap<_, _>>()
+    });
+    let mut seen_real_paths = std::collections::HashSet::new();
+    let mut seen_content_hashes = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    let mut injected_sections = Vec::new();
+    let mut all_cached = previous
+        .as_ref()
+        .is_some_and(|receipt| receipt.cache_key == cache_key);
+    for (path, real_path, distance) in candidates {
+        let relative_path = path
+            .strip_prefix(&workspace_real)
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+        let real_path_string = real_path.to_string_lossy().to_string();
+        if !seen_real_paths.insert(real_path_string.clone()) {
+            entries.push(SkillInjectionEntry {
+                relative_path,
+                real_path: real_path_string,
+                content_hash: String::new(),
+                bytes: 0,
+                modified_at_ms: 0,
+                distance,
+                freshness: "duplicate_realpath".to_string(),
+                injected: false,
+                omission_reason: Some("duplicate realpath".to_string()),
+            });
+            continue;
+        }
+        let content = match fs::read_to_string(&real_path) {
+            Ok(content) => content,
+            Err(error) => {
+                all_cached = false;
+                errors.push(format!("failed to read {}: {error}", real_path.display()));
+                entries.push(SkillInjectionEntry {
+                    relative_path,
+                    real_path: real_path_string,
+                    content_hash: String::new(),
+                    bytes: 0,
+                    modified_at_ms: 0,
+                    distance,
+                    freshness: "unavailable".to_string(),
+                    injected: false,
+                    omission_reason: Some("read failed".to_string()),
+                });
+                continue;
+            }
+        };
+        if skill_is_disabled(&content) {
+            let content_hash = prompt_content_hash(&content);
+            let modified_at_ms = fs::metadata(&real_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_millis());
+            let previously_cached = previous_by_path
+                .as_ref()
+                .and_then(|entries| entries.get(&relative_path))
+                .is_some_and(|entry| {
+                    entry.content_hash == content_hash && entry.modified_at_ms == modified_at_ms
+                });
+            if !previously_cached {
+                all_cached = false;
+            }
+            entries.push(SkillInjectionEntry {
+                relative_path,
+                real_path: real_path_string,
+                content_hash,
+                bytes: content.len(),
+                modified_at_ms,
+                distance,
+                freshness: if previously_cached {
+                    "disabled_cached".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                injected: false,
+                omission_reason: Some("skill is disabled by frontmatter".to_string()),
+            });
+            continue;
+        }
+        let content_hash = prompt_content_hash(&content);
+        if !seen_content_hashes.insert(content_hash.clone()) {
+            all_cached = false;
+            entries.push(SkillInjectionEntry {
+                relative_path,
+                real_path: real_path_string,
+                content_hash,
+                bytes: content.len(),
+                modified_at_ms: 0,
+                distance,
+                freshness: "duplicate_content".to_string(),
+                injected: false,
+                omission_reason: Some("duplicate content".to_string()),
+            });
+            continue;
+        }
+        let modified_at_ms = fs::metadata(&real_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis());
+        let previous_entry = previous_by_path
+            .as_ref()
+            .and_then(|entries| entries.get(&relative_path));
+        let freshness = if previous_entry.is_some_and(|entry| {
+            entry.content_hash == content_hash && entry.modified_at_ms == modified_at_ms
+        }) {
+            "cached"
+        } else if previous_entry.is_some() {
+            all_cached = false;
+            "stale"
+        } else {
+            all_cached = false;
+            "new"
+        };
+        injected_sections.push(format!("### Skill: {relative_path}\n\n{}", content.trim()));
+        entries.push(SkillInjectionEntry {
+            relative_path,
+            real_path: real_path_string,
+            content_hash,
+            bytes: content.len(),
+            modified_at_ms,
+            distance,
+            freshness: freshness.to_string(),
+            injected: true,
+            omission_reason: None,
+        });
+    }
+    let injected_skills = if injected_sections.is_empty() {
+        None
+    } else {
+        Some(injected_sections.join("\n\n"))
+    };
+    if previous
+        .as_ref()
+        .is_some_and(|receipt| receipt.entries.len() != entries.len())
+    {
+        all_cached = false;
+    }
+    let mut receipt = SkillInjectionReceipt {
+        schema_version: SKILL_INJECTION_SCHEMA_VERSION,
+        task_id: task.id.clone(),
+        workspace: workspace_display,
+        target_paths,
+        cache_key,
+        cache_hit: all_cached,
+        entries,
+        errors,
+        injected_content_hash: prompt_content_hash(injected_skills.as_deref().unwrap_or_default()),
+        receipt_hash: String::new(),
+        created_at: timestamp(),
+    };
+    receipt.receipt_hash = receipt.expected_hash()?;
+    receipt.validate()?;
+    let receipt_path = store.write_worker_json_atomic(&task.id, "skills-injection.json", &receipt)?;
+    let cache_bytes = serde_json::to_vec_pretty(&receipt)?;
+    let cache_tmp = cache_path.with_file_name(format!(
+        "skill-injection-cache-{}.json.tmp",
+        prompt_content_hash(&task.id)
+    ));
+    fs::write(&cache_tmp, cache_bytes)
+        .with_context(|| format!("failed to write {}", cache_tmp.display()))?;
+    fs::rename(&cache_tmp, &cache_path)
+        .with_context(|| format!("failed to replace {}", cache_path.display()))?;
+    Ok((
+        injected_skills,
+        Some(receipt_path.to_string_lossy().to_string()),
+    ))
+}
+
 fn start_command_backed_worker(
     request: WorkerStartRequest<'_>,
     supports_interaction: bool,
@@ -3757,6 +4163,8 @@ fn start_command_backed_worker(
     let prompt_capsule_path = store.worker_dir(&task.id).join("prompt-capsule.json");
     let (injected_rules, rules_injection_path) =
         discover_workspace_rules(store, workspace, task)?;
+    let (injected_skills, skills_injection_path) =
+        discover_workspace_skills(store, workspace, task)?;
     let pending_reconcile_path = store
         .worker_dir(&task.id)
         .join("prompt-reconcile-pending.json");
@@ -3791,6 +4199,8 @@ fn start_command_backed_worker(
         prompt_append: route.prompt_append.clone(),
         injected_rules,
         rules_injection_path,
+        injected_skills,
+        skills_injection_path,
         tools: route.tools.clone(),
         category_resolution,
         category_resolution_result,
@@ -4997,6 +5407,13 @@ pub fn worker_prompt(packet: &WorkerPacket) -> Result<String> {
         .filter(|rules| !rules.is_empty())
         .map(|rules| format!("\n## Workspace rules\n\n{rules}\n"))
         .unwrap_or_default();
+    let workspace_skills = packet
+        .injected_skills
+        .as_deref()
+        .map(str::trim)
+        .filter(|skills| !skills.is_empty())
+        .map(|skills| format!("\n## Workspace skills\n\n{skills}\n"))
+        .unwrap_or_default();
     let model_metadata = worker_model_metadata(packet);
     let step_report = if packet
         .required_outputs
@@ -5028,6 +5445,8 @@ You are a `{}` phase worker controlled by Gearbox Gear. Treat this packet as the
 
 {}
 
+{}
+
 ## Phase request
 
 {}
@@ -5040,6 +5459,7 @@ Return only the response format required by the phase request. Do not add a gene
             model_metadata,
             packet.tools.to_markdown(),
             workspace_rules,
+            workspace_skills,
             packet.goal,
             prompt_append
         ));
@@ -5065,6 +5485,7 @@ You are a `{}` worker controlled by Gearbox Gear. Treat this packet as the contr
 {}
 {}
 {}
+{}
 Return a concise report with:
 
 - summary
@@ -5081,6 +5502,7 @@ Return a concise report with:
         model_metadata,
         packet.tools.to_markdown(),
         workspace_rules,
+        workspace_skills,
         prompt_append,
         step_report
     ))
@@ -5170,6 +5592,15 @@ pub fn worker_compiled_prompt(
         reduced.injected_rules = None;
     }
 
+    if !included_ids.contains("skills")
+        || capsule
+            .sections
+            .iter()
+            .any(|section| section.id == "skills" && section.clipped)
+    {
+        reduced.injected_skills = None;
+    }
+
     let mut compiled = worker_prompt(&reduced)?;
     for (section_id, bounded) in bounded_sections {
         compiled.push_str(&format!(
@@ -5221,6 +5652,12 @@ pub fn prompt_manifest_for_packet(
         .map(str::trim)
         .filter(|rules| !rules.is_empty())
         .map(str::to_string);
+    let skills = packet
+        .injected_skills
+        .as_deref()
+        .map(str::trim)
+        .filter(|skills| !skills.is_empty())
+        .map(str::to_string);
 
     let mut sections = vec![
         prompt_manifest_section(
@@ -5271,6 +5708,24 @@ pub fn prompt_manifest_for_packet(
             PromptManifestSectionKind::Soft,
             "runtime.workspace_rules",
             80,
+            "not discovered",
+        ));
+    }
+    if let Some(skills) = skills {
+        sections.push(prompt_manifest_section(
+            "skills",
+            PromptManifestSectionKind::Soft,
+            "runtime.workspace_skills",
+            skills,
+            75,
+            false,
+        ));
+    } else {
+        sections.push(prompt_manifest_omitted_section(
+            "skills",
+            PromptManifestSectionKind::Soft,
+            "runtime.workspace_skills",
+            75,
             "not discovered",
         ));
     }
@@ -5373,7 +5828,11 @@ pub const PROMPT_CAPSULE_SCHEMA_VERSION: u32 = 1;
 /// Conservative default context budget used when the worker model cannot
 /// advertise an exact context limit. The value is intentionally conservative
 /// and flagged `estimated` so downstream consumers know it is not authoritative.
-const DEFAULT_CONTEXT_LIMIT_TOKENS: usize = 8192;
+// The packet hard contract itself is larger than the historical 8k fallback
+// for real PlanGraph tasks. Keep an explicit override available for providers
+// with smaller contexts, but make the unknown-model default large enough to
+// admit the durable contract before soft sections are clipped.
+const DEFAULT_CONTEXT_LIMIT_TOKENS: usize = 12288;
 /// Output headroom is opt-in because providers expose different completion
 /// limits.  A caller that knows the provider's output contract can reserve
 /// space without changing the context limit itself.
@@ -6234,6 +6693,13 @@ fn prompt_section_content(packet: &WorkerPacket, section_id: &str) -> Result<Str
             .filter(|rules| !rules.is_empty())
             .unwrap_or_default()
             .to_string()),
+        "skills" => Ok(packet
+            .injected_skills
+            .as_deref()
+            .map(str::trim)
+            .filter(|skills| !skills.is_empty())
+            .unwrap_or_default()
+            .to_string()),
         _ => Ok(String::new()),
     }
 }
@@ -7076,6 +7542,19 @@ mod tests {
         assert!(!provider_error_is_free_quota("provider service unavailable"));
         assert!(is_free_model(Some("opencode/mimo-v2.5-free")));
         assert!(!is_free_model(Some("opencode-go/mimo-v2.5")));
+        assert!(worker_route_is_premium(
+            WorkerKind::OpencodeSession,
+            Some("opencode-go/mimo-v2.5")
+        ));
+        assert!(worker_route_is_premium(
+            WorkerKind::OpencodeSession,
+            Some("opencode-go/deepseek-v4-flash")
+        ));
+        assert!(!worker_route_is_premium(
+            WorkerKind::OpencodeSession,
+            Some("opencode/mimo-v2.5-free")
+        ));
+        assert!(worker_route_is_premium(WorkerKind::Claude, None));
     }
 
     #[test]
@@ -7514,6 +7993,8 @@ mod tests {
             prompt_append: Some("Focus on the current step only.".to_string()),
             injected_rules: None,
             rules_injection_path: None,
+            injected_skills: None,
+            skills_injection_path: None,
             tools: WorkerToolPolicy {
                 can_write: true,
                 can_explore: true,
@@ -7567,6 +8048,72 @@ mod tests {
         assert_eq!(receipt.entries.iter().filter(|entry| entry.injected).count(), 2);
         assert!(!receipt.receipt_hash.is_empty());
         assert_eq!(receipt.injected_content_hash, prompt_content_hash(&rules));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_skills_are_scoped_and_cache_freshness_is_explicit() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let source = workspace.path().join("src");
+        fs::create_dir_all(workspace.path().join(".agents/skills/root"))?;
+        fs::create_dir_all(source.join(".agents/skills/target"))?;
+        fs::create_dir_all(source.join(".agents/skills/disabled"))?;
+        fs::write(
+            workspace.path().join(".agents/skills/root/SKILL.md"),
+            "# Root skill\nUse the root workflow.\n",
+        )?;
+        fs::write(
+            source.join(".agents/skills/target/SKILL.md"),
+            "# Target skill\nUse the target workflow.\n",
+        )?;
+        fs::write(
+            source.join(".agents/skills/disabled/SKILL.md"),
+            "---\ndisabled: true\n---\n# Disabled\nDo not inject.\n",
+        )?;
+        let store = StateStore::new(workspace.path());
+        store.initialize()?;
+
+        let mut first_task = default_task_with_id("skills-first");
+        first_task.scope = Scope::new(vec!["src".to_string()], Vec::new(), 3);
+        let (skills, receipt_path) =
+            discover_workspace_skills(&store, workspace.path(), &first_task)?;
+        let skills = skills.context("skills should be injected")?;
+        assert!(skills.find("Root skill").unwrap() < skills.find("Target skill").unwrap());
+        let receipt_path = receipt_path.context("skills receipt path")?;
+        let receipt: SkillInjectionReceipt = serde_json::from_str(&fs::read_to_string(receipt_path)?)?;
+        receipt.validate()?;
+        assert!(!receipt.cache_hit);
+        assert_eq!(receipt.entries.iter().filter(|entry| entry.injected).count(), 2);
+        assert!(receipt
+            .entries
+            .iter()
+            .any(|entry| entry.freshness == "disabled" && !entry.injected));
+
+        let mut second_task = default_task_with_id("skills-second");
+        second_task.scope = Scope::new(vec!["src".to_string()], Vec::new(), 3);
+        let (_, receipt_path) = discover_workspace_skills(&store, workspace.path(), &second_task)?;
+        let receipt: SkillInjectionReceipt = serde_json::from_str(&fs::read_to_string(
+            receipt_path.context("second skills receipt path")?,
+        )?)?;
+        assert!(receipt.cache_hit);
+        assert!(receipt
+            .entries
+            .iter()
+            .filter(|entry| entry.injected)
+            .all(|entry| entry.freshness == "cached"));
+
+        fs::write(
+            source.join(".agents/skills/target/SKILL.md"),
+            "# Target skill\nChanged target workflow.\n",
+        )?;
+        let mut third_task = default_task_with_id("skills-third");
+        third_task.scope = Scope::new(vec!["src".to_string()], Vec::new(), 3);
+        let (_, receipt_path) = discover_workspace_skills(&store, workspace.path(), &third_task)?;
+        let receipt: SkillInjectionReceipt = serde_json::from_str(&fs::read_to_string(
+            receipt_path.context("third skills receipt path")?,
+        )?)?;
+        assert!(!receipt.cache_hit);
+        assert!(receipt.entries.iter().any(|entry| entry.freshness == "stale"));
         Ok(())
     }
 

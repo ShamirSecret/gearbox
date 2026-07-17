@@ -100,8 +100,9 @@ use gearbox_agent::workers::{
     Intensity, NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig,
     WorkerEvent, WorkerEventHub, WorkerKind, WorkerOutcome, WorkerPacket, WorkerRegistry,
     WorkerResult, WorkerRoute, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
-    category_resolution_for_route, sanitize_model_fields, worker_outcome_from_result,
-    worker_prompt, write_result_and_outcome,
+    category_resolution_for_route, discover_workspace_rules, discover_workspace_skills,
+    sanitize_model_fields,
+    worker_outcome_from_result, worker_prompt, write_result_and_outcome,
 };
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
@@ -6356,6 +6357,10 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
                     "The same verification fails twice.".to_string(),
                 ]
             });
+        let (injected_rules, rules_injection_path) =
+            discover_workspace_rules(request.store, request.workspace, request.task)?;
+        let (injected_skills, skills_injection_path) =
+            discover_workspace_skills(request.store, request.workspace, request.task)?;
         let packet = WorkerPacket {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
@@ -6363,6 +6368,10 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
             variant: route.variant.clone(),
             variant_applied: route.variant.clone(),
             prompt_append: route.prompt_append.clone(),
+            injected_rules,
+            rules_injection_path,
+            injected_skills,
+            skills_injection_path,
             tools: route.tools.clone(),
             category_resolution,
             category_resolution_result,
@@ -7101,6 +7110,10 @@ impl NativeWorkerBackend for GearAcpBrokerBackend {
                     "The same verification fails twice.".to_string(),
                 ]
             });
+        let (injected_rules, rules_injection_path) =
+            discover_workspace_rules(request.store, request.workspace, request.task)?;
+        let (injected_skills, skills_injection_path) =
+            discover_workspace_skills(request.store, request.workspace, request.task)?;
         let packet = WorkerPacket {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
@@ -7108,6 +7121,10 @@ impl NativeWorkerBackend for GearAcpBrokerBackend {
             variant: route.variant.clone(),
             variant_applied: route.variant.clone(),
             prompt_append: route.prompt_append.clone(),
+            injected_rules,
+            rules_injection_path,
+            injected_skills,
+            skills_injection_path,
             tools: route.tools.clone(),
             category_resolution: _category_resolution,
             category_resolution_result: _category_resolution_result,

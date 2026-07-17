@@ -299,6 +299,13 @@ pub struct PhaseRouteReceipt {
 
 impl PhaseRouteTable {
     pub fn opencode_only(models: OpenCodeModelProfiles) -> Result<Self> {
+        Self::opencode_only_with_premium_budget(models, usize::MAX)
+    }
+
+    pub fn opencode_only_with_premium_budget(
+        models: OpenCodeModelProfiles,
+        max_premium_worker_calls: usize,
+    ) -> Result<Self> {
         models.validate()?;
         let mut table = Self::legacy_defaults();
         for profile in &mut table.profiles {
@@ -318,19 +325,27 @@ impl PhaseRouteTable {
                 profile.source = PhaseRouteSource::BuiltIn;
                 continue;
             };
+            if max_premium_worker_calls == 0 && is_paid_opencode_model(model) {
+                bail!(
+                    "phase {:?} explicitly selects paid OpenCode model `{model}` but premium worker budget is zero",
+                    profile.phase
+                );
+            }
             profile.candidates = vec![PhaseRouteCandidate {
                 backend: PhaseBackend::Worker(WorkerKind::OpencodeSession),
                 model: PhaseModelBinding::BackendDeclared(model.to_string()),
                 command: None,
             }];
-            if let Some(fallback_model) =
-                opencode_paid_fallback_model(profile.phase.clone(), model)
-            {
-                profile.candidates.push(PhaseRouteCandidate {
-                    backend: PhaseBackend::Worker(WorkerKind::OpencodeSession),
-                    model: PhaseModelBinding::BackendDeclared(fallback_model.to_string()),
-                    command: None,
-                });
+            if max_premium_worker_calls > 0 {
+                if let Some(fallback_model) =
+                    opencode_paid_fallback_model(profile.phase.clone(), model)
+                {
+                    profile.candidates.push(PhaseRouteCandidate {
+                        backend: PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                        model: PhaseModelBinding::BackendDeclared(fallback_model.to_string()),
+                        command: None,
+                    });
+                }
             }
             profile.source = PhaseRouteSource::BuiltIn;
         }
@@ -376,6 +391,19 @@ impl PhaseRouteTable {
         }
         table.validate()?;
         Ok(table)
+    }
+
+    /// Remove paid OpenCode Go candidates from all profiles.  When
+    /// `max_premium_worker_calls` is zero the runtime must never dispatch
+    /// a paid model, so strip those candidates at table construction time
+    /// rather than relying on downstream budget checks.
+    pub fn strip_paid_candidates(mut self) -> Self {
+        for profile in &mut self.profiles {
+            profile
+                .candidates
+                .retain(|candidate| !is_paid_opencode_candidate(candidate));
+        }
+        self
     }
 
     pub fn legacy_defaults() -> Self {
@@ -667,6 +695,19 @@ pub(crate) fn opencode_paid_fallback_model(
         | PhaseProfile::Summarizer => Some("opencode-go/deepseek-v4-flash"),
         PhaseProfile::Orchestrator => None,
     }
+}
+
+fn is_paid_opencode_candidate(candidate: &PhaseRouteCandidate) -> bool {
+    matches!(
+        &candidate.backend,
+        PhaseBackend::Worker(WorkerKind::OpencodeSession)
+    ) && matches!(&candidate.model, PhaseModelBinding::BackendDeclared(model) if is_paid_opencode_model(model))
+}
+
+fn is_paid_opencode_model(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("opencode-go"))
 }
 
 impl PhaseRouteProfile {
@@ -1785,6 +1826,66 @@ mod tests {
             reviewer: "opencode-go/mimo-v2.5".to_string(),
         })?;
         assert_eq!(paid_table.profile(&PhaseProfile::Planner)?.candidates.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn premium_budget_zero_never_admits_paid_candidates() -> Result<()> {
+        let table = PhaseRouteTable::opencode_only_with_premium_budget(
+            OpenCodeModelProfiles {
+                planner: "opencode/mimo-v2.5-free".to_string(),
+                executor: "opencode/deepseek-v4-flash-free".to_string(),
+                reviewer: "opencode/mimo-v2.5-free".to_string(),
+            },
+            0,
+        )?;
+        for phase in [
+            PhaseProfile::Planner,
+            PhaseProfile::ExecutorDeep,
+            PhaseProfile::ReviewerFinal,
+        ] {
+            let candidates = &table.profile(&phase)?.candidates;
+            assert_eq!(candidates.len(), 1);
+            assert!(candidates.iter().all(|candidate| {
+                !matches!(
+                    &candidate.model,
+                    PhaseModelBinding::BackendDeclared(model)
+                        if model.starts_with("opencode-go/")
+                )
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn premium_budget_zero_rejects_explicit_paid_model() {
+        let error = PhaseRouteTable::opencode_only_with_premium_budget(
+            OpenCodeModelProfiles {
+                planner: "opencode-go/mimo-v2.5".to_string(),
+                executor: "opencode/deepseek-v4-flash-free".to_string(),
+                reviewer: "opencode/mimo-v2.5-free".to_string(),
+            },
+            0,
+        )
+        .expect_err("zero premium budget must reject an explicit paid route");
+        assert!(error.to_string().contains("premium worker budget is zero"));
+    }
+
+    #[test]
+    fn strip_paid_candidates_preserves_free_route_and_removes_only_paid_open_code() -> Result<()> {
+        let table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "opencode/mimo-v2.5-free".to_string(),
+            executor: "opencode/deepseek-v4-flash-free".to_string(),
+            reviewer: "opencode/mimo-v2.5-free".to_string(),
+        })?
+        .strip_paid_candidates();
+        for phase in [
+            PhaseProfile::Planner,
+            PhaseProfile::ExecutorDeep,
+            PhaseProfile::ReviewerFinal,
+        ] {
+            assert_eq!(table.profile(&phase)?.candidates.len(), 1);
+        }
         Ok(())
     }
 

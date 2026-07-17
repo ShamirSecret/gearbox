@@ -1001,14 +1001,16 @@ pub fn verification(results: &[ShellCommandResult]) -> String {
     let mut contents = String::from("# Verification\n\n");
     for result in results {
         contents.push_str(&format!(
-            "## `{}`\n\n- success: {}\n- exit_code: {}\n- duration_ms: {}\n\n",
+            "## `{}`\n\n- success: {}\n- exit_code: {}\n- duration_ms: {}\n- stdout_truncated: {}\n- stderr_truncated: {}\n\n",
             result.command,
             result.success,
             result
                 .exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-            result.duration_ms
+            result.duration_ms,
+            result.stdout_truncated,
+            result.stderr_truncated
         ));
         if !result.stdout.trim().is_empty() {
             contents.push_str("### stdout\n\n```text\n");
@@ -1678,6 +1680,8 @@ mod tests {
                 stdout: "ok".to_string(),
                 stderr: String::new(),
                 duration_ms: 12,
+                stdout_truncated: false,
+                stderr_truncated: false,
             }],
         );
 
