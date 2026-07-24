@@ -1356,6 +1356,12 @@ impl PlanTaskContract {
                 );
             }
         }
+        if let Some(red) = self.test.red.as_ref() {
+            validate_command_expectation(&self.task_id, "RED", red)?;
+        }
+        for (index, green) in self.test.green.iter().enumerate() {
+            validate_command_expectation(&self.task_id, &format!("GREEN[{index}]"), green)?;
+        }
         match self.test.strategy {
             TestStrategy::Tdd => {
                 let red = self.test.red.as_ref().with_context(|| {
@@ -1581,6 +1587,32 @@ impl PlanTaskContract {
             self.execution_steps.clone()
         }
     }
+}
+
+fn validate_command_expectation(
+    task_id: &str,
+    phase: &str,
+    expectation: &CommandExpectation,
+) -> Result<()> {
+    let command = expectation.command.trim();
+    if command.is_empty() {
+        bail!("PlanGraph task `{task_id}` {phase} command must not be empty");
+    }
+    // Commands are executed verbatim by the Gear-owned verification runner.
+    // Reject the common planner failure mode where a natural-language
+    // instruction (often containing full-width punctuation) is placed in the
+    // command field instead of a shell command such as `cargo check`.
+    if command
+        .chars()
+        .any(|character| matches!(character, '；' | '，' | '。' | '：'))
+        || command.contains("若仓库")
+        || command.contains("如果仓库")
+    {
+        bail!(
+            "PlanGraph task `{task_id}` {phase} command must be executable shell text, not a prose instruction"
+        );
+    }
+    Ok(())
 }
 
 fn execution_steps_from_must_do(must_do: &[String]) -> Vec<PlanExecutionStep> {

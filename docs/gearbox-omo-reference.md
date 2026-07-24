@@ -2,18 +2,33 @@
 
 > 基于对 omo（oh-my-openagent v4.16.0）源码的深度逆向分析。
 > 目标：将 omo 的核心编排、质量门禁、token 优化机制提取为 Gear 可直接复用的设计。
+>
+> 2026-07-24 路由政策覆盖：omo 的多模型 fallback 仅保留为历史参考，不能作为 Gear 实现目标。Gear 的 canonical ACP 路由固定为 Codex ACP `openai/gpt-5.6-luna` 只读规划/批评/审查，以及 OpenCode ACP `opencode-go/deepseek-v4-flash` 执行/修复；禁止 fallback、命令覆盖、模型切换与 native substitute。
 
-## 当前实现状态（2026-07-10）
+## ACP-only 运行契约
+
+- 生产 worker 只能经 ACP；不得用 `opencode run`、`codex exec`、`claude -p` 或 native backend 代替成功路径。
+- Provider 持有 context 和响应生命周期。Gear 不向 ACP 请求继承 goal lease 或 stale watchdog；瞬态流错误只在同一 provider/model/command 上重试，不能升级或替换模型。
+- Luna 的只读 ACP session 使用隔离配置，不能继承全局 MCP、plugin 或 LSP；OpenCode OMO 内部保持 background concurrency 为 1、team 和 LSP 关闭。
+- `.gear/**` 的 receipt 由 Gear 写入。worker 只报告变更、命令与结果，不能被要求写 marker；ACP session 结束后只清理已记录的精确 process-group/descendants，并保存 cleanup receipt。
+
+### ACP 资源预算归属
+
+- OpenCode/Codex ACP worker/provider 自己控制调用次数、context/token、费用、usage-unknown 和 premium 尝试策略。
+- Gear 的 `Budget`、`ObjectivePolicy` 和 reservation ledger 只保存 lineage、实际 usage 与审计 receipt；不得用本地计数阻断 worker dispatch 或 objective continuation。
+- Gear 仍可执行编排安全与验收门禁（迭代/文件范围/运行租约、重试、review、scope、verification），这些不是 provider 资源预算，也不能替代 provider 的预算策略。
+
+## 当前实现状态（2026-07-24）
 
 以下状态以当前 Gear 源码为准；本文件后文的“Gear 实现要点”是设计参考，不再代表未实现清单。
 
 | 能力 | 当前状态 | 代码证据 |
 |---|---|---|
-| Model fallback / category route | 已完成基础链路 | `crates/gearbox_agent/src/workers.rs`、`task_manager.rs` |
+| Model fallback / category route | canonical 路由已收敛，fallback 禁止 | `phase_routing.rs`、`cli.rs`、`workers.rs` |
 | TaskManager steering / terminal revive | 已完成主路径 | `task_manager.rs` 的 typed outcome、resident epoch revive |
 | Completion parent wake | 已完成基础缓冲与串行 flush | `task_manager.rs`、`runtime.rs` |
 | Review Gate | 部分完成 | 四维 hard gate；comment checker 为环境开关 |
-| Category tool policy / model variant | 部分完成 | category 环境覆盖与 WorkerPacket；provider variant 适配待补 |
+| Category tool policy / model variant | 仅保留工具策略 | category 不再选择 provider/model/variant；固定 canonical route |
 | Stop Continuation Guard | 部分完成 | continuation state、lifecycle event、GUI stop、GoalLoop guard |
 | Keyword mode / task reminder | 未完成 | 另立下一批计划 |
 | `init-deep` / handoff / plan validator | 未完成 | 另立下一批计划 |
@@ -142,7 +157,7 @@ omo 的 Ralph Loop 不是"在 agent 里写一个 for 循环"，而是**寄生在
 // 2. 在闲置时检查 state.goal 是否还需要继续
 // 3. 调用 worker.send_follow_up() 传入续跑 prompt
 // 4. 检测 worker 输出的 DONE 标记
-// 5. 持久化循环状态到 .gearbox-agent/loop/
+// 5. 持久化循环状态到 Gear runtime-owned `.gear/`
 
 // 关键：不在 Orchestrator::run() 里做循环，
 // 而是在 GUI/Server 层监听 session 事件做循环
@@ -243,7 +258,9 @@ tool.execute.after  → 读取实际写入的文件
 
 ---
 
-## 五、Model Fallback（模型降级）— P0
+## 五、Model Fallback（模型降级）— 历史设计，当前禁止实现
+
+> 本节描述 omo 的历史机制，不能转化为 Gear 的 `WorkerConfig`、`TaskManager` 或 provider-recovery 实现。Gear 遇到 provider error、429、配置回执漂移或模型不可用时必须保存证据并以原路由 fail closed/retry，不能改用其他模型。
 
 ### 5.1 架构
 
@@ -283,25 +300,15 @@ chat.message hook → getNextFallback() → 替换模型
 }
 ```
 
-### 5.3 Gear 实现要点
+### 5.3 Gear 的处置
 
-```rust
-// Gear 的 WorkerKind 已经有模型字段，但缺 fallback。
-// 在 workers.rs 中：
-// struct WorkerConfig {
-//     model: String,
-//     fallback_models: Vec<FallbackEntry>,  // 新增
-// }
-// 
-// TaskManager 在 worker 失败时：
-// 1. 检查 WorkerUnavailable / ModelUnavailable
-// 2. 迭代 fallback_models
-// 3. 用下一个模型重建 worker
-```
+Gear 不实现 `fallback_models`、模型升级或同任务模型切换。`ModelUnavailable` 结算为可见 blocker；`Streaming response failed` 等瞬态 ACP 失败仅允许保持同一 `opencode-go/deepseek-v4-flash` route 重试，并持久化原始错误与 attempt。
 
 ---
 
-## 六、Category → Model 映射（类别模型路由）— P0
+## 六、Category → Model 映射（类别模型路由）— 历史设计，按 canonical ACP 收敛
+
+> 当前 Gear 不按类别自由选择模型：Luna 仅用于只读规划/批评/审查，Flash 仅用于执行/修复。下文的多模型 category 映射与 fallback 字段仅作 omo 对照，不得作为配置入口。
 
 ### 6.1 omo 的实现
 
@@ -323,28 +330,17 @@ const CATEGORIES = {
 
 ### 6.2 Gear 已有基础
 
-Gear 的 `WorkerCategory` 已经有 9 个类别（Quick/Deep/Repair/Review/Explore/Librarian/Visual/ZedNative/Custom），但缺模型映射。
+Gear 的 `WorkerCategory` 已有 Quick/Deep/Repair/Review/Explore/Librarian/Visual/ZedNative/Custom，用于 scope、工具策略和 prompt；它们不再拥有模型选择权。
 
-### 6.3 Gear 实现要点
+### 6.3 Gear 固定角色映射
 
-```rust
-// 在 workers.rs 的 CategoryRouter 中增加 model 字段：
-struct CategoryConfig {
-    model: String,
-    variant: Option<String>,
-    fallback_models: Vec<FallbackEntry>,
-    tool_policy: WorkerToolPolicy,
-    prompt_append: String,
-}
+| 角色 | 固定 ACP route | 写权限 |
+|---|---|---|
+| Planner / PlanCritic / Oracle / Reviewer | Codex `openai/gpt-5.6-luna` | 只读 |
+| Executor / Repair | OpenCode `opencode-go/deepseek-v4-flash` | 按任务 scope |
+| Orchestrator / Summarizer | Gear deterministic | 无 |
 
-// 从配置加载（oh-my-openagent.jsonc 风格）：
-// {
-//   "categories": {
-//     "quick": { "model": "opencode-go/deepseek-v4-flash" },
-//     "deep":  { "model": "opencode-go/qwen3.7-max" }
-//   }
-// }
-```
+不得新增 category model、variant 或 fallback 配置入口。
 
 ---
 
@@ -352,7 +348,7 @@ struct CategoryConfig {
 
 ### 7.1 omo 的实现
 
-`review-work` skill 启动 5 个并行审查 agent：
+`review-work` skill 历史上启动 5 个并行审查 agent：
 
 | 审查维度 | Agent 类型 | 职责 |
 |---|---|---|
@@ -366,10 +362,7 @@ struct CategoryConfig {
 
 ### 7.2 Gear 已有基础
 
-Gear 有 `ROUTE_HINT=review` + `CoordinatorReview`，但缺少：
-- 多维度并行审查
-- 每个维度的独立 prompt 模板
-- 硬门禁（不通过不放行）
+Gear 有 `ROUTE_HINT=review`、四维 hard gate 和 `CoordinatorReview`。strict ACP 模式以串行独立 session 执行审查、修复和复审，不把多 worker 并行当成缺失能力。
 
 ### 7.3 Gear 实现要点
 
@@ -388,7 +381,7 @@ enum ReviewDimension {
     ContextMining,      // 上下文完整性
 }
 
-// 审查不通过时 → coordinator_review() → 通知 worker 修复
+// 审查不通过时 → coordinator_review() → 串行通知 Flash worker 修复，再由新 Luna session 复审
 ```
 
 ---
@@ -464,7 +457,7 @@ record progress with task(action=create/update).`
 // Gear 的 GoalLoop 需要支持用户主动终止：
 // 1. CLI: gear run --no-loop
 // 2. GUI: "Stop Continuation" 按钮
-// 3. 持久化 stop marker 到 .gearbox-agent/
+// 3. 持久化 stop marker 到 Gear runtime-owned `.gear/`
 ```
 
 ---
@@ -552,8 +545,8 @@ project/
 
 | Hook | 触发事件 | 功能 | Gear 需要 |
 |---|---|---|---|
-| `model-fallback` | `session.error` / `chat.message` | 模型降级 | P0 |
-| `runtime-fallback` | `session.error` | 运行时容错 | P0 |
+| `model-fallback` | `session.error` / `chat.message` | 模型降级 | 不吸收：strict ACP 禁止 |
+| `runtime-fallback` | `session.error` | 运行时容错 | 仅同 route 瞬态重试 / blocker receipt |
 | `compaction-todo-preserver` | `experimental.session.compacting` | 压缩时保留 todo | P2 |
 | `read-image-resizer` | `tool.execute.before` | 压缩图片 token | P3 |
 
@@ -592,8 +585,8 @@ project/
 
 | 优先级 | 功能 | 实现方式 | 预估工作量 |
 |---|---|---|---|
-| **P0** | Category → Model 映射 | `CategoryRouter` 加 `model` 字段 + 配置解析 | ~100 行 |
-| **P0** | Fallback Model Chain | `WorkerConfig.fallback_models` + `TaskManager` fallback 迭代 | ~150 行 |
+| — | Category → Model 映射 | strict ACP 固定角色 route，禁止配置入口 | 不实现 |
+| — | Fallback Model Chain | 仅同 route 瞬态重试，禁止模型替换 | 不实现 |
 | **P0** | Review Gate（多维度） | 扩展 `CoordinatorReview` 为多维度 | ~200 行 |
 | **P0** | Comment Checker（Review 阶段） | 在 `CoordinatorReview` 中加一个 check | ~100 行 |
 | **P0** | Keyword → Mode 映射 | 在 `Goal` 解析时检测关键词 | ~80 行 |
@@ -605,4 +598,4 @@ project/
 | **P2** | Task Reminder | 检测 worker 输出中的 task 使用 | ~50 行 |
 | **P2** | Plan Format Validator | 验证 Prometheus 输出的计划格式 | ~100 行 |
 | **P3** | 后台任务通知 | 通知缓冲 + 闲置时刷新 | ~80 行 |
-| **P3** | 模型 variant | 配置解析 variant 并传给 worker | ~50 行 |
+| — | 模型 variant | strict ACP 不暴露 variant 配置 | 不实现 |

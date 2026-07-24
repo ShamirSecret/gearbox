@@ -86,6 +86,10 @@ impl FakeNativeBackend {
 }
 
 impl NativeWorkerBackend for FakeNativeBackend {
+    fn allows_native_zed_agent_for_testing(&self) -> bool {
+        true
+    }
+
     fn start_zed_agent(
         &self,
         request: WorkerStartRequest<'_>,
@@ -505,6 +509,59 @@ async fn broker_e2e_wait_for_completion(model: &FakeLanguageModel, cx: &mut Test
     panic!("timed out waiting for fake model completion request");
 }
 
+fn initialize_broker_e2e_git_repository(workspace: &Path) {
+    std::fs::write(workspace.join(".gitignore"), ".gear/\n").expect("write broker e2e gitignore");
+    let run_git = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(workspace)
+            .output()
+            .expect("run git for broker e2e workspace");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init", "--quiet"]);
+    run_git(&["config", "user.email", "gearbox-tests@example.invalid"]);
+    run_git(&["config", "user.name", "Gearbox Tests"]);
+    run_git(&["add", "."]);
+    run_git(&["commit", "--quiet", "-m", "baseline"]);
+}
+
+fn broker_session_directories(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut session_directories = Vec::new();
+    collect_broker_session_directories(root, &mut session_directories);
+    session_directories
+}
+
+fn collect_broker_session_directories(
+    directory: &Path,
+    session_directories: &mut Vec<std::path::PathBuf>,
+) {
+    let entries = std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!(
+                "failed to read an entry under {}: {error}",
+                directory.display()
+            )
+        });
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join("session-identity.json").is_file() {
+            session_directories.push(path);
+        } else {
+            collect_broker_session_directories(&path, session_directories);
+        }
+    }
+}
+
 fn broker_e2e_respond_to_completions(
     model: Arc<dyn LanguageModel>,
     finished: Arc<AtomicBool>,
@@ -601,7 +658,7 @@ fn broker_e2e_respond_to_completions(
                 })
                 .to_string()
             } else {
-                "## Summary\nImplemented the bounded worker task.\n\n## Changed Files\n- none\n\n## Commands Run\n- npm run build\n\n## Known Failures\n- none"
+                "## Summary\nImplemented the bounded worker task.\n\n## Commands Run\n- npm run build\n\n## Known Failures\n- none"
                     .to_string()
             };
             model.send_completion_stream_text_chunk(&request, response);
@@ -625,6 +682,7 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
         r#"{"scripts":{"build":"echo build-ok"}}"#,
     )
     .unwrap();
+    initialize_broker_e2e_git_repository(workspace.path());
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/", json!({ "a": {} })).await;
@@ -646,6 +704,7 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
             require_worker: true,
             default_worker_for_small_tasks: WorkerKind::ZedAgent,
         });
+        agent.gear_phase_route_table_override = Some(PhaseRouteTable::legacy_defaults());
     });
     let connection = Rc::new(NativeAgentConnection::gear(agent.clone()));
 
@@ -691,7 +750,7 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
     );
     cx.run_until_parked();
 
-    let gearbox_root = workspace.path().join(".gearbox-agent");
+    let gearbox_root = workspace.path().join(".gear");
     assert!(
         gearbox_root.join("artifacts").is_dir(),
         "Orchestrator must have run and created artifacts directory"
@@ -711,123 +770,51 @@ async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
         "At least one goal-id directory must exist under artifacts/"
     );
 
-    assert!(
-        gearbox_root.join("broker-sessions").is_dir(),
-        "broker-sessions/ must exist under .gearbox-agent/ — the PhaseBrokerFactory \
-         creates per-phase brokers in send_gear_prompt and the orchestrator goes \
-         through broker lifecycle."
-    );
-
-    let broker_sessions_dir = gearbox_root.join("broker-sessions");
-    let phase_entries: Vec<_> = std::fs::read_dir(&broker_sessions_dir)
-        .unwrap_or_else(|e| panic!("failed to read broker-sessions dir: {e}"))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-
-    assert!(
-        !phase_entries.is_empty(),
-        "broker-sessions/ must contain at least one phase directory"
-    );
-
-    let mut validated_ledgers = 0;
+    let session_directories = broker_session_directories(&gearbox_root);
     let mut session_ids = Vec::new();
-    for entry in &phase_entries {
-        let phase_name = entry.file_name().to_string_lossy().to_string();
-
-        let goal_entries: Vec<_> = std::fs::read_dir(entry.path())
-            .unwrap_or_else(|e| panic!("failed to read phase dir {phase_name}: {e}"))
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-
+    for session_directory in &session_directories {
+        let validation = validate_session_ledger(session_directory);
         assert!(
-            !goal_entries.is_empty(),
-            "Phase {phase_name} should have at least one goal subdirectory"
+            validation.is_ok(),
+            "Session ledger validation failed for {}: {:?}",
+            session_directory.display(),
+            validation
         );
-
-        for goal_entry in &goal_entries {
-            let task_entries: Vec<_> = std::fs::read_dir(goal_entry.path())
-                .unwrap_or_else(|e| panic!("failed to read goal dir: {e}"))
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-
-            for task_entry in task_entries {
-                let rev_entries: Vec<_> = std::fs::read_dir(task_entry.path())
-                    .unwrap_or_else(|e| panic!("failed to read task dir: {e}"))
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .collect();
-
-                for rev_entry in &rev_entries {
-                    let nested_goal_entries: Vec<_> = std::fs::read_dir(rev_entry.path())
-                        .unwrap_or_else(|e| panic!("failed to read revision dir: {e}"))
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().is_dir())
-                        .collect();
-
-                    for nested_goal_entry in &nested_goal_entries {
-                        let bs_dir = nested_goal_entry.path().join("broker-sessions");
-                        if !bs_dir.is_dir() {
-                            continue;
-                        }
-                        for session_entry in std::fs::read_dir(&bs_dir)
-                            .unwrap_or_else(|e| panic!("failed to read broker-sessions dir: {e}"))
-                        {
-                            let session_entry = session_entry.unwrap();
-                            let session_dir = session_entry.path();
-                            if !session_dir.is_dir() {
-                                continue;
-                            }
-                            let validation = validate_session_ledger(&session_dir);
-                            assert!(
-                                validation.is_ok(),
-                                "Session ledger validation failed for {}: {:?}",
-                                session_dir.display(),
-                                validation
-                            );
-                            assert!(
-                                session_dir.join("session-identity.json").exists(),
-                                "Session identity file must exist at {}",
-                                session_dir.display()
-                            );
-                            let receipts_dir = session_dir.join("receipts");
-                            assert!(receipts_dir.is_dir(), "Receipts directory must exist");
-                            let receipt_count = std::fs::read_dir(&receipts_dir)
-                                .unwrap()
-                                .filter_map(|e| e.ok())
-                                .count();
-                            assert!(receipt_count >= 1, "At least one receipt must exist");
-                            assert!(
-                                session_dir.join("terminal-outcome.json").is_file(),
-                                "A production phase ledger must record its terminal outcome"
-                            );
-                            let identity_contents =
-                                std::fs::read_to_string(session_dir.join("session-identity.json"))
-                                    .unwrap_or_else(|error| {
-                                        panic!(
-                                            "failed to read session identity for {}: {error}",
-                                            session_dir.display()
-                                        )
-                                    });
-                            let identity: BrokerSessionIdentity =
-                                serde_json::from_str(&identity_contents).unwrap_or_else(|error| {
-                                    panic!(
-                                        "failed to parse session identity for {}: {error}",
-                                        session_dir.display()
-                                    )
-                                });
-                            session_ids.push(identity.session_id);
-                            validated_ledgers += 1;
-                        }
-                    }
-                }
-            }
-        }
+        assert!(
+            session_directory.join("session-identity.json").exists(),
+            "Session identity file must exist at {}",
+            session_directory.display()
+        );
+        let receipts_dir = session_directory.join("receipts");
+        assert!(receipts_dir.is_dir(), "Receipts directory must exist");
+        let receipt_count = std::fs::read_dir(&receipts_dir)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", receipts_dir.display()))
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert!(receipt_count >= 1, "At least one receipt must exist");
+        assert!(
+            session_directory.join("terminal-outcome.json").is_file(),
+            "A production phase ledger must record its terminal outcome"
+        );
+        let identity_contents =
+            std::fs::read_to_string(session_directory.join("session-identity.json"))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read session identity for {}: {error}",
+                        session_directory.display()
+                    )
+                });
+        let identity: BrokerSessionIdentity = serde_json::from_str(&identity_contents)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to parse session identity for {}: {error}",
+                    session_directory.display()
+                )
+            });
+        session_ids.push(identity.session_id);
     }
     assert!(
-        validated_ledgers >= 1,
+        !session_directories.is_empty(),
         "Production E2E must validate at least one terminal broker ledger; empty phase directories are not evidence of a lifecycle"
     );
     for (index, session_id) in session_ids.iter().enumerate() {

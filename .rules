@@ -11,6 +11,18 @@
 * 不要只为了去掉 `Zed` 字样就重命名内部上游标识，例如 Rust 类型名、action 名、enum variant、keymap context、协议名或测试 fixture；只有明确功能影响和上游合并成本后才允许修改。
 * 用户可见的 Gearbox UI、README、打包元数据和产品说明，应尽量使用 Gearbox 品牌和中文文本。
 
+## Gearbox agent / OMO 执行边界
+
+* Worker 的 context 上限和 ACP 的 `initialize`/`session/new`/`session/prompt` 响应生命周期由 OpenCode/Codex provider 负责。Gear 不得在没有显式配置时用 12K、32K、goal lease 或 stale watchdog 截断 ACP；只有 `GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS[_<MODEL>]` 明确设置、用户取消或 provider 明确错误时，才启用 Gear 侧处理。
+* ACP worker 的调用次数、token、费用、usage-unknown 和 premium 尝试次数由 provider/worker 自己控制；Gear 的 `Budget`/`ObjectivePolicy` 资源字段只用于 reservation、ledger 和 receipt 审计，不能作为 worker dispatch 或 objective continuation 的资源拒绝门禁。迭代、文件范围、运行租约、重试、review/scope/verification 属于编排安全，不得重新解释为 provider 预算。
+* ACP worker 的调用次数、token、费用、usage-unknown 和 premium 尝试次数由 provider/worker 自己控制；Gear 的 `Budget`/`ObjectivePolicy` 资源字段只用于 reservation、ledger 和 receipt 审计，不能作为 worker dispatch 或 objective continuation 的资源拒绝门禁。迭代、文件范围、运行租约、重试、review/scope/verification 属于编排安全，不得重新解释为 provider 预算。
+* 混合路由必须使用完整 canonical model id：Planner、PlanCritic、Oracle、Reviewer 只能走 `openai/gpt-5.6-luna` 的 Codex ACP read-only worker；Executor/repair 只能走 `opencode-go/deepseek-v4-flash` 的 OpenCode ACP worker。生产只能走 ACP，禁止 `opencode run`、`codex exec`、`claude -p`、命令覆盖、模型切换、fallback 或把 native substitute 当作成功；receipt 实际模型漂移必须 fail closed。Codex read-only session 必须使用隔离的私有配置/home，不得继承全局 MCP、plugin 或 LSP；OMO 内部同样串行：background concurrency 为 1、team 禁用、LSP 禁用。
+* OMO dogfood 每轮只处理一个 mechanism。Planner 不能假设功能不存在：先检查当前符号、测试、HEAD、dirty diff 和已有 runtime receipt，再写 residual delta。PlanCritic 必须能定位实现 references、dirty preimage、行为测试、QA 矩阵、typecheck 和可判定 acceptance；只写 prose 或“计划已安排”不能算完成。
+* `.gear/**` 是 Gear framework-owned runtime evidence，worker 只报告变更、命令和结果，不得编辑、伪造或被要求写 `EVIDENCE_RECORDED`；`.omo/**`、`.dogfood/**` 和 forbidden scope 不是 worker 写入目标。计划必须区分 framework receipt、subject diff 和外部 reviewer 报告，不能用禁止写入路径承载 task artifact。
+* 启动前记录 branch/HEAD、八路径（或实际）dirty baseline、目标文件 hash 和进程树；Gear 只能归因本轮新增 hunks，不得覆盖用户已有改动。`Streaming response failed` 等瞬态 ACP 错误要保存原始 route、attempt、retry/cooldown 和 cleanup，并仅以原 provider/model/command 重试；不能改写成 timeout、OOM、成功或模型升级。
+* 不要为了“保险”反复启动 rust-analyzer。若 worker 自己启动 analyzer，保持同一 worker 树中最多一个；几 GB RSS 或短时长不是 OOM 证据，只有达到本机明确资源阈值才停止。worker 退出后只可清理已退出 ACP session 的 exact process-group 和已记录 analyzer/proc-macro descendants，并保存 cleanup receipt；禁止 `pkill` 或按名字误杀。本机 128GB 内存默认以约 64GB 使用量作为资源风险线，同时保留可用内存检查。
+* 小 smoke 若未进入 Executor、没有 subject diff、测试和独立 review，只能记为 `Limited`/`Repair`；不得把 Discovery、Planner 或 provider 成功当作代码闭环 Accept。未经用户授权不得 commit/push。
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.

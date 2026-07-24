@@ -6,15 +6,15 @@ use anyhow::{Context as _, Result, bail};
 use sha2::{Digest as _, Sha256};
 
 use crate::phase_routing::{
-    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseModelBinding,
-    PhaseRouteDecision, PhaseRouteTable, RejectedPhaseCandidate, opencode_paid_fallback_model,
+    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseModelBinding, PhaseRouteDecision,
+    PhaseRouteTable, RejectedPhaseCandidate, opencode_paid_fallback_model,
 };
 #[cfg(test)]
 use crate::plan_graph::PhaseProfile;
 use crate::plan_graph::{
     PLAN_GRAPH_SCHEMA_EXEMPLAR, PlannerParseDiagnostic, TaskRiskTier, TaskSizeTier,
-    deterministic_fallback_draft, parse_planner_draft_diagnostic, parse_planner_draft_with_objective,
-    validate_planner_draft,
+    deterministic_fallback_draft, parse_planner_draft_diagnostic,
+    parse_planner_draft_with_objective, validate_planner_draft,
 };
 use crate::plan_review::{
     IntentFoldDecision, IntentFoldVerdict, IntentRisk, IntentRiskSeverity, PhaseExecutionIdentity,
@@ -109,6 +109,18 @@ impl OpenCodePhaseRuntimeFactory {
 
     /// Build a complete `PhaseRuntime` with all OpenCode phase hooks wired.
     pub fn build(self) -> Result<PhaseRuntime> {
+        self.phase_route_table.validate_with_luna_flash_contract()?;
+        if self.phase_route_table.requires_luna_flash_contract()
+            && (self.worker_config.max_parallel_workers != 1
+                || self.worker_config.max_parallel_per_key != 1)
+        {
+            bail!(
+                "strict Luna/Flash phase runtime requires max_parallel_workers=1 and max_parallel_per_key=1"
+            );
+        }
+        if self.phase_route_table.requires_luna_flash_contract() && self.worker_config.skip_worker {
+            bail!("strict Luna/Flash phase runtime cannot skip external workers");
+        }
         let workspace = self.workspace.clone();
         let worker_config = self.worker_config.clone();
         let broker_factory = self.broker_factory.clone();
@@ -179,7 +191,7 @@ impl OpenCodePhaseRuntimeFactory {
     }
 }
 
-/// Core runner that dispatches a single OpenCode phase through the broker
+/// Core runner that dispatches a single ACP planning or review phase through the broker
 /// factory and returns the parsed submission.
 #[derive(Clone)]
 pub struct OpenCodePhaseRunner {
@@ -235,7 +247,7 @@ fn read_phase_output(result: &WorkerResult) -> Result<(String, Option<String>)> 
     }
     let summary = result.summary.trim();
     if summary.is_empty() {
-        bail!("OpenCode phase returned an empty response");
+        bail!("Gear ACP phase returned an empty response");
     }
     Ok((summary.to_string(), None))
 }
@@ -360,8 +372,7 @@ impl OpenCodePhaseRunner {
             let cooldown_error = anyhow::anyhow!(
                 "free provider quota cooldown is active; paid phase route required"
             );
-            let Some(fallback_decision) = paid_fallback_decision(decision, &cooldown_error)?
-            else {
+            let Some(fallback_decision) = paid_fallback_decision(decision, &cooldown_error)? else {
                 bail!(
                     "free provider quota cooldown is active and phase {:?} has no paid route",
                     decision.phase
@@ -492,12 +503,12 @@ impl OpenCodePhaseRunner {
             bail!("Gear phase runner received a non-OpenCode/Codex route");
         }
         let config = decision.overlay_worker_config(&self.worker_config)?;
-        // Every OpenCode phase dispatched here is a planning/review role. Keep
-        // the route decision's model binding, but use the Explore policy so
-        // the worker cannot write while gathering context, folding intent,
-        // revising a plan, or producing an independent verdict. Writable
-        // Executor workers are dispatched by the task runtime, not this phase
-        // runner.
+        // Every planning/review phase dispatched here is read-only. Keep the
+        // route decision's model binding and preserve Review for reviewer
+        // receipts; the category policy itself prevents writes while the
+        // worker gathers context, revises a plan, or produces a verdict.
+        // Writable Executor workers are dispatched by the task runtime, not
+        // this phase runner.
         let phase_route_hint = Some(phase_worker_route_hint(
             &task_kind,
             decision.category.as_str(),
@@ -517,7 +528,7 @@ impl OpenCodePhaseRunner {
             title: format!("Gear {:?} phase", decision.phase),
             kind: task_kind,
             status: TaskStatus::Pending,
-            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+            assigned_worker: decision.worker_kind.map(|kind| kind.as_str().to_string()),
             attempt: 1,
             scope,
             inputs: TaskInputs {
@@ -528,10 +539,8 @@ impl OpenCodePhaseRunner {
         };
         let suffix = id_timestamp();
         let baseline_snapshot = crate::tools::git_snapshot(&self.workspace)?;
-        let baseline_fingerprints = fingerprint_paths(
-            &self.workspace,
-            &baseline_snapshot.changed_files,
-        );
+        let baseline_fingerprints =
+            fingerprint_paths(&self.workspace, &baseline_snapshot.changed_files);
         let execution_result = self.broker_factory.execute_worker_phase_with_follow_up(
             decision,
             goal_id,
@@ -594,7 +603,11 @@ impl OpenCodePhaseRunner {
                 &format!("{}\n", serde_json::to_string_pretty(&mutation_artifact)?),
             )?;
             bail!(
-                "OpenCode {:?} phase mutated the workspace in read-only role; paths: {}",
+                "{} {:?} phase mutated the workspace in read-only role; paths: {}",
+                decision
+                    .worker_kind
+                    .map(|kind| kind.as_str())
+                    .unwrap_or("external ACP"),
                 decision.phase,
                 read_only_mutations.join(", ")
             );
@@ -602,7 +615,11 @@ impl OpenCodePhaseRunner {
         let execution = execution_result?;
         if execution.result.status != WorkerStatus::Succeeded {
             bail!(
-                "OpenCode {:?} phase failed: {}",
+                "{} {:?} phase failed: {}",
+                decision
+                    .worker_kind
+                    .map(|kind| kind.as_str())
+                    .unwrap_or("external ACP"),
                 decision.phase,
                 execution.result.summary
             );
@@ -642,7 +659,7 @@ impl OpenCodePhaseRunner {
         let observation_path = store.write_repository_observation_receipt(&observation)?;
         let (raw_output, _) = read_phase_output(&execution.result).with_context(|| {
             format!(
-                "OpenCode {:?} phase returned an empty response",
+                "Gear ACP {:?} phase returned an empty response",
                 decision.phase
             )
         })?;
@@ -1485,8 +1502,14 @@ impl OpenCodePhaseRunner {
             };
             report_path.is_file()
         };
-        let (decision, next_objective, acceptance_signals, required_questions, evidence_refs,
-            answerable_now) = match input.status {
+        let (
+            decision,
+            next_objective,
+            acceptance_signals,
+            required_questions,
+            evidence_refs,
+            answerable_now,
+        ) = match input.status {
             GoalStatus::Complete if final_report_exists => (
                 StrategistNextGoalDecision::Complete,
                 None,
@@ -1505,9 +1528,7 @@ impl OpenCodePhaseRunner {
                 Vec::new(),
                 false,
             ),
-            GoalStatus::Running
-            | GoalStatus::Verifying
-            | GoalStatus::NeedsUser => (
+            GoalStatus::Running | GoalStatus::Verifying | GoalStatus::NeedsUser => (
                 StrategistNextGoalDecision::NeedsUser,
                 None,
                 Vec::new(),
@@ -1517,7 +1538,11 @@ impl OpenCodePhaseRunner {
                 Vec::new(),
                 false,
             ),
-            GoalStatus::Draft | GoalStatus::Planning | GoalStatus::Blocked | GoalStatus::Limited | GoalStatus::Failed => (
+            GoalStatus::Draft
+            | GoalStatus::Planning
+            | GoalStatus::Blocked
+            | GoalStatus::Limited
+            | GoalStatus::Failed => (
                 StrategistNextGoalDecision::Stop,
                 None,
                 Vec::new(),
@@ -1569,14 +1594,9 @@ impl OpenCodePhaseRunner {
     }
 }
 
-fn deterministic_planner_fallback_draft(
-    input: &PlannerInput,
-) -> crate::plan_graph::PlanGraphDraft {
-    let mut draft = deterministic_fallback_draft(
-        &input.request,
-        &input.scope,
-        &input.verification_commands,
-    );
+fn deterministic_planner_fallback_draft(input: &PlannerInput) -> crate::plan_graph::PlanGraphDraft {
+    let mut draft =
+        deterministic_fallback_draft(&input.request, &input.scope, &input.verification_commands);
     if !planner_request_requires_multiple_nodes(&input.request) {
         return draft;
     }
@@ -1621,9 +1641,8 @@ fn deterministic_planner_fallback_draft(
     observation.inputs = vec![
         "Read the repository baseline and the existing durable plan/review artifacts.".to_string(),
     ];
-    observation.preconditions = vec![
-        "The declared workspace and current goal artifacts are readable.".to_string(),
-    ];
+    observation.preconditions =
+        vec!["The declared workspace and current goal artifacts are readable.".to_string()];
     observation.must_do = vec![
         "Inspect the relevant repository seam and current artifacts.".to_string(),
         "Record the baseline and bounded evidence for the next work order.".to_string(),
@@ -1635,25 +1654,20 @@ fn deterministic_planner_fallback_draft(
             .to_string(),
         evidence_path: Some(".gear/artifacts/preflight.md".to_string()),
     }];
-    observation.must_not_do = vec![
-        "Do not edit, delete, reset, or otherwise mutate the working tree.".to_string(),
-    ];
+    observation.must_not_do =
+        vec!["Do not edit, delete, reset, or otherwise mutate the working tree.".to_string()];
     observation.test.strategy = crate::plan_graph::TestStrategy::None;
     observation.test.red = None;
     observation.test.green.clear();
     observation.test.no_test_reason = Some(
-        "Observation-only work order; implementation verification belongs to task_002."
-            .to_string(),
+        "Observation-only work order; implementation verification belongs to task_002.".to_string(),
     );
-    observation.evidence = vec![
-        "Persist the repository observation and baseline before implementation.".to_string(),
-    ];
-    observation.rollback = vec![
-        "No working-tree mutation is allowed in the observation work order.".to_string(),
-    ];
-    observation.completion_predicates = vec![
-        "Repository observation and baseline evidence are readable.".to_string(),
-    ];
+    observation.evidence =
+        vec!["Persist the repository observation and baseline before implementation.".to_string()];
+    observation.rollback =
+        vec!["No working-tree mutation is allowed in the observation work order.".to_string()];
+    observation.completion_predicates =
+        vec!["Repository observation and baseline evidence are readable.".to_string()];
     if let Some(artifact) = observation.artifacts.first_mut() {
         artifact.path = ".gear/artifacts/preflight.md".to_string();
         artifact.description = "Bounded repository observation and baseline evidence.".to_string();
@@ -1689,6 +1703,9 @@ fn paid_fallback_decision(
     decision: &PhaseRouteDecision,
     error: &anyhow::Error,
 ) -> Result<Option<PhaseRouteDecision>> {
+    if decision.requires_luna_flash_contract() {
+        return Ok(None);
+    }
     if decision.selected_candidate != 0
         || decision.candidate.backend != PhaseBackend::Worker(WorkerKind::OpencodeSession)
     {
@@ -1963,9 +1980,8 @@ fn phase_worker_route_hint<'a>(
     configured_category: &'a str,
 ) -> &'a str {
     match task_kind {
-        crate::state::TaskKind::Spec
-        | crate::state::TaskKind::Plan
-        | crate::state::TaskKind::Review => "explore",
+        crate::state::TaskKind::Spec | crate::state::TaskKind::Plan => "explore",
+        crate::state::TaskKind::Review => "review",
         _ => configured_category,
     }
 }
@@ -2031,21 +2047,20 @@ fn write_model_call_ledger_entry(
         observed_paths,
         observation_events,
         observed_call_ids,
-    ) =
-        if transcript_path.is_file() {
-            let contents = std::fs::read_to_string(&transcript_path)?;
-            let (tool_count, paths, events, call_ids) =
-                collect_transcript_observations(workspace, &contents, &finished_at);
-            (
-                Some(sha256_hex(&contents)),
-                tool_count,
-                paths,
-                events,
-                call_ids,
-            )
-        } else {
-            (None, 0, Vec::new(), Vec::new(), Vec::new())
-        };
+    ) = if transcript_path.is_file() {
+        let contents = std::fs::read_to_string(&transcript_path)?;
+        let (tool_count, paths, events, call_ids) =
+            collect_transcript_observations(workspace, &contents, &finished_at);
+        (
+            Some(sha256_hex(&contents)),
+            tool_count,
+            paths,
+            events,
+            call_ids,
+        )
+    } else {
+        (None, 0, Vec::new(), Vec::new(), Vec::new())
+    };
     let kind = if task_id.contains("review") || task_id.contains("oracle") {
         ModelCallKind::ReviewRetry
     } else if task_id.contains("repair") {
@@ -2198,7 +2213,12 @@ fn collect_transcript_observations(
         }
     }
 
-    (tool_count, paths.into_iter().collect(), events, call_ids.into_iter().collect())
+    (
+        tool_count,
+        paths.into_iter().collect(),
+        events,
+        call_ids.into_iter().collect(),
+    )
 }
 
 fn transcript_tool_events(value: &serde_json::Value, events: &mut Vec<serde_json::Value>) {
@@ -2437,7 +2457,7 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
         })
         .unwrap_or_else(|| "none".to_string());
     let prompt = format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, logical_task_id, title, goal, deliverable, rationale, approach, already_in_working_tree, still_needed, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, inputs, preconditions, must_do, execution_steps, must_not_do, references, test, qa, artifacts, evidence, evidence_obligations, rollback, budget, commit_boundary, commit_message, and completion_predicates. `evidence_obligations` must contain stable obligation_id values plus kind, producer, consumer, freshness, required_for, and either evidence_path or an explicit unavailable_reason. `logical_task_id` is the stable identity across revisions; `task_id` is only the current display/dispatch key. Keep logical IDs unique within the plan and preserve them when a task is revised or rekeyed. `rationale` is the concrete WHY from OMO; `approach` is an ordered bounded HOW, not a second list of generic must_do items. `already_in_working_tree` must state concrete facts already present before this work order; `still_needed` must contain only the independently verifiable remainder, matching OMO's work-order format. One task must represent one independently verifiable objective; split unrelated behavior, review, documentation, and cleanup into separate work orders even when they touch nearby files. `inputs` and `preconditions` are checked before editing; `execution_steps` must be ordered and each step must include step_id, action, expected_observation, and optional evidence_path; the executor must stop on an unmet step instead of skipping ahead or redesigning the plan. `evidence` remains a legacy-readable prose projection, while typed obligations are the completion contract. `rollback` describes the bounded recovery action and `budget` gives optional task limits; neither may be omitted when the task has irreversible or expensive work. `commit_message` is optional for no-commit tasks, but when present it must be a concrete OMO-style commit intent; Gear never commits or pushes automatically. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. For `test.strategy = \"tdd\"`, `red` MUST be one object with `command`, `expected_observation`, and `evidence_path`, and `green` MUST be an array of objects with the same three fields; never encode a command expectation as a bare string or one-element array. Include concrete happy, failure, and adversarial QA scenarios; when adversarial behavior does not apply, record an explicit not-applicable trigger check and evidence path. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. {} Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, logical_task_id, title, goal, deliverable, rationale, approach, already_in_working_tree, still_needed, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, inputs, preconditions, must_do, execution_steps, must_not_do, references, test, qa, artifacts, evidence, evidence_obligations, rollback, budget, commit_boundary, commit_message, and completion_predicates. `evidence_obligations` must contain stable obligation_id values plus kind, producer, consumer, freshness, required_for, and either evidence_path or an explicit unavailable_reason. `logical_task_id` is the stable identity across revisions; `task_id` is only the current display/dispatch key. Keep logical IDs unique within the plan and preserve them when a task is revised or rekeyed. `rationale` is the concrete WHY from OMO; `approach` is an ordered bounded HOW, not a second list of generic must_do items. `already_in_working_tree` must state concrete facts already present before this work order; `still_needed` must contain only the independently verifiable remainder, matching OMO's work-order format. One task must represent one independently verifiable objective; split unrelated behavior, review, documentation, and cleanup into separate work orders even when they touch nearby files. `inputs` and `preconditions` are checked before editing; `execution_steps` must be ordered and each step must include step_id, action, expected_observation, and optional evidence_path; the executor must stop on an unmet step instead of skipping ahead or redesigning the plan. `evidence` remains a legacy-readable prose projection, while typed obligations are the completion contract. `rollback` describes the bounded recovery action and `budget` gives optional task limits; neither may be omitted when the task has irreversible or expensive work. `commit_message` is optional for no-commit tasks, but when present it must be a concrete OMO-style commit intent; Gear never commits or pushes automatically. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. For `test.strategy = \"tdd\"`, `red` MUST be one object with `command`, `expected_observation`, and `evidence_path`, and `green` MUST be an array of objects with the same three fields; every `test.red.command` and `test.green[*].command` MUST be literal executable shell text (for example `cargo test` or `cargo check`), never a prose instruction such as `typecheck；若仓库无工具则执行替代检查`. When the request enumerates exact accepted or rejected input classes, include at least one concrete test value and a persisted evidence obligation for every class (including leading, trailing, and embedded whitespace when whitespace is rejected); do not rely on a broad prose claim alone. Include concrete happy, failure, and adversarial QA scenarios; when adversarial behavior does not apply, record an explicit not-applicable trigger check and evidence path. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. {} Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         PLAN_GRAPH_SCHEMA_EXEMPLAR,
         input.request,
         repository_discovery,
@@ -2448,7 +2468,10 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
     );
     Ok(prompt.replace(
         "Do not write code.",
-        &format!("{} Do not write code.", revision_reference_path_instructions()),
+        &format!(
+            "{} Do not write code.",
+            revision_reference_path_instructions()
+        ),
     ))
 }
 
@@ -2469,7 +2492,7 @@ fn gear_opencode_planner_repair_prompt(
         })
         .unwrap_or_else(|| "none".to_string());
     let prompt = format!(
-        "You are the same Gear planner on fresh repair turn {attempt}. Return a complete PlanGraphDraft JSON object only; never return a patch, prose, or markdown fence. Preserve the request, repository discovery findings, and IntentFold semantics. Correct only the schema errors identified by Rust and keep all valid semantic content. Use the exact nested shapes and enum values in the exemplar. The repair checklist is binding: `topology_lock` must be a non-empty array of decision-criteria strings, and every task `inputs` array must be non-empty with concrete paths, artifacts, or request facts that the executor can inspect. Do not leave either field empty. For `test.strategy = \"tdd\"`, `test.red` MUST be one object with `command`, `expected_observation`, and `evidence_path`, while `test.green` is an array of objects with those same three fields; do not use a bare string or one-element array. {}\n\nSchema exemplar:\n{PLAN_GRAPH_SCHEMA_EXEMPLAR}\n\nRust diagnostic:\n{}\n\nMalformed output to repair:\n{}\n\nOriginal goal:\n{}\n\nRepository discovery findings:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are the same Gear planner on fresh repair turn {attempt}. Return a complete PlanGraphDraft JSON object only; never return a patch, prose, or markdown fence. Preserve the request, repository discovery findings, and IntentFold semantics. Correct only the schema errors identified by Rust and keep all valid semantic content. Use the exact nested shapes and enum values in the exemplar. The repair checklist is binding: `topology_lock` must be a non-empty array of decision-criteria strings, and every task `inputs` array must be non-empty with concrete paths, artifacts, or request facts that the executor can inspect. Do not leave either field empty. For `test.strategy = \"tdd\"`, `test.red` MUST be one object with `command`, `expected_observation`, and `evidence_path`, while `test.green` is an array of objects with those same three fields; do not use a bare string or one-element array. Every `test.red.command` and `test.green[*].command` must remain literal executable shell text such as `cargo test` or `cargo check`, never a prose instruction. When the request enumerates exact accepted or rejected input classes, preserve a concrete test value and evidence obligation for every class, including leading, trailing, and embedded whitespace when whitespace is rejected. {}\n\nSchema exemplar:\n{PLAN_GRAPH_SCHEMA_EXEMPLAR}\n\nRust diagnostic:\n{}\n\nMalformed output to repair:\n{}\n\nOriginal goal:\n{}\n\nRepository discovery findings:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         serde_json::to_string_pretty(diagnostic)?,
         raw_output,
         input.request,
@@ -2708,7 +2731,7 @@ fn revision_reference_path_instructions() -> &'static str {
 }
 
 fn planner_baseline_and_evidence_instructions() -> &'static str {
-    "The workspace baseline may already contain framework-managed `.gear/` receipts and launcher stdout/stderr files. Never require `git status` to contain only the target file; compare the preimage/baseline observation with the final diff and reject only new unintended paths. Framework-managed evidence under `.gear/` is not an explicit task write and must not be counted against the user's `write_scope` or `max_files_changed`. For exact text, calculate UTF-8 byte length including the required newline instead of guessing. Every numeric byte claim in `still_needed`, `execution_steps`, tests, artifacts, and acceptance must agree with that calculation; distinguish source spelling from emitted bytes (for example, a shell `\\n` escape emits one LF byte, not two). Express the invariant as content bytes plus newline bytes equals total bytes, and never preserve contradictory totals just because they appear in an earlier draft. If the packet says a typecheck must not be skipped but the repository has no typecheck toolchain, acknowledge that constraint explicitly and use a bounded content/integrity check as the documented substitute; never silently claim that typecheck passed or silently omit the constraint."
+    "The workspace baseline may already contain framework-managed `.gear/` receipts and launcher stdout/stderr files. Never require `git status` to contain only the target file; compare the preimage/baseline observation with the final diff and reject only new unintended paths. Framework-managed evidence under `.gear/` is not an explicit task write and must not be counted against the user's `write_scope` or `max_files_changed`. For exact text, calculate UTF-8 byte length including the required newline instead of guessing. Every numeric byte claim in `still_needed`, `execution_steps`, tests, artifacts, and acceptance must agree with that calculation; distinguish source spelling from emitted bytes (for example, a shell `\\n` escape emits one LF byte, not two). Express the invariant as content bytes plus newline bytes equals total bytes, and never preserve contradictory totals just because they appear in an earlier draft. The runtime worker contract marks `typecheck` as `must_not_skip` for every task, so every plan must explicitly acknowledge it in `final_verification`, the task test contract, or completion predicates. If the supplied verification commands and repository discovery show no separate executable typecheck toolchain, include this exact bounded-substitute note in the plan: `typecheck: no separate executable typecheck is available; cargo test compilation plus source/integrity checks is the bounded substitute; do not claim a separate typecheck passed`. If a separate typecheck command exists, include that literal executable command instead. Never silently claim that typecheck passed or silently omit the constraint."
 }
 
 fn plan_critic_dimension_instructions() -> &'static str {
@@ -2774,7 +2797,10 @@ fn trimmed_env_value(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phase_routing::OpenCodeModelProfiles;
+    use crate::phase_routing::{
+        CodexAcpModelProfiles, GEAR_LUNA_MODEL, GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL,
+        OpenCodeModelProfiles,
+    };
     use crate::plan_graph::{PLAN_GRAPH_SCHEMA_EXEMPLAR, deterministic_fallback_draft};
     use crate::state::Scope;
     use crate::workers::WorkerRegistry;
@@ -2806,7 +2832,7 @@ mod tests {
         );
         assert_eq!(
             phase_worker_route_hint(&crate::state::TaskKind::Review, "deep"),
-            "explore"
+            "review"
         );
         assert_eq!(
             phase_worker_route_hint(&crate::state::TaskKind::Edit, "deep"),
@@ -2840,6 +2866,8 @@ mod tests {
         assert!(instructions.contains("emitted bytes"));
         assert!(instructions.contains("contradictory totals"));
         assert!(instructions.contains("typecheck toolchain"));
+        assert!(instructions.contains("must_not_skip"));
+        assert!(instructions.contains("bounded-substitute note"));
     }
 
     #[test]
@@ -2861,22 +2889,37 @@ mod tests {
             executor: "opencode/deepseek-v4-flash-free".to_string(),
             reviewer: "opencode/mimo-v2.5-free".to_string(),
         })?;
-        let decision = routes.resolve(
-            &PhaseProfile::Planner,
-            &LiveModelInventory::default(),
-            None,
-        )?;
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
         let provider_error = anyhow::anyhow!("OpenCode Planner phase failed: provider error");
         let fallback = paid_fallback_decision(&decision, &provider_error)?
             .context("free route should have a paid fallback")?;
         assert_eq!(fallback.selected_candidate, 1);
         assert_eq!(fallback.rejected_candidates.len(), 1);
         assert_eq!(fallback.rejected_candidates[0].candidate_index, 0);
-        assert_eq!(intent_fold_model_label(&fallback), "opencode_session/opencode-go/mimo-v2.5");
+        assert_eq!(
+            intent_fold_model_label(&fallback),
+            "opencode_session/opencode-go/mimo-v2.5"
+        );
         assert!(is_provider_recoverable_phase_error(&provider_error));
         assert!(!is_provider_recoverable_phase_error(&anyhow::anyhow!(
             "planner schema is malformed"
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_flash_executor_never_synthesizes_a_paid_fallback() -> Result<()> {
+        let routes = PhaseRouteTable::canonical_luna_flash()?;
+        let decision = routes.resolve(
+            &PhaseProfile::ExecutorDeep,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        let provider_error = anyhow::anyhow!("OpenCode Executor phase failed: provider error");
+
+        assert!(decision.requires_luna_flash_contract());
+        assert!(paid_fallback_decision(&decision, &provider_error)?.is_none());
         Ok(())
     }
 
@@ -2981,6 +3024,60 @@ mod tests {
         assert!(runtime.oracle_hook.is_some());
         assert!(runtime.plan_revision_hook.is_some());
         assert!(runtime.strategist_next_goal_hook.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn strict_luna_flash_factory_rejects_parallel_worker_config() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::luna_flash_strict(CodexAcpModelProfiles {
+            codex_planner: GEAR_LUNA_MODEL.to_string(),
+            opencode_executor: GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string(),
+            codex_reviewer: GEAR_LUNA_MODEL.to_string(),
+        })?;
+        let mut worker_config = test_worker_config();
+        worker_config.max_parallel_workers = 2;
+        let factory = OpenCodePhaseRuntimeFactory::new(
+            temp_dir.path().to_path_buf(),
+            worker_config,
+            broker_factory,
+            CancellationToken::new(),
+            routes,
+            LiveModelInventory::default(),
+        );
+
+        assert!(factory.build().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn strict_luna_flash_factory_rejects_skipped_worker_config() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::luna_flash_strict(CodexAcpModelProfiles {
+            codex_planner: GEAR_LUNA_MODEL.to_string(),
+            opencode_executor: GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string(),
+            codex_reviewer: GEAR_LUNA_MODEL.to_string(),
+        })?;
+        let mut worker_config = test_worker_config();
+        worker_config.skip_worker = true;
+        let factory = OpenCodePhaseRuntimeFactory::new(
+            temp_dir.path().to_path_buf(),
+            worker_config,
+            broker_factory,
+            CancellationToken::new(),
+            routes,
+            LiveModelInventory::default(),
+        );
+
+        assert!(factory.build().is_err());
         Ok(())
     }
 
@@ -3701,7 +3798,10 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
             &output,
             "strategist repeated the same malformed output",
         )?;
-        assert_eq!(submission.verdict.decision, StrategistNextGoalDecision::NeedsUser);
+        assert_eq!(
+            submission.verdict.decision,
+            StrategistNextGoalDecision::NeedsUser
+        );
         assert!(!submission.verdict.answerable_now);
         assert_eq!(submission.verdict.reviewed_status, GoalStatus::Running);
         let receipt = temp_dir
@@ -3826,7 +3926,8 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
             cancellation_token: CancellationToken::new(),
             call_budget: PhaseCallBudget::default(),
         };
-        let decision = routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
         let submission = runner.plan(PlannerInput {
             goal_id: goal_id.to_string(),
             request: "execute work orders in order; preserve multi-node PlanGraph".to_string(),
@@ -3838,7 +3939,10 @@ printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_o
         })?;
 
         assert_eq!(submission.draft.tasks.len(), 2);
-        assert_eq!(submission.artifact_path.as_deref(), historical_plan.to_str());
+        assert_eq!(
+            submission.artifact_path.as_deref(),
+            historical_plan.to_str()
+        );
         Ok(())
     }
 

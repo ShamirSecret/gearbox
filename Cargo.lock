@@ -7350,6 +7350,7 @@ dependencies = [
  "sha2",
  "smol",
  "tempfile",
+ "toml 0.8.23",
 ]
 
 [[package]]

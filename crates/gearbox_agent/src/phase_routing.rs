@@ -4,10 +4,14 @@ use sha2::{Digest as _, Sha256};
 
 use crate::plan_graph::PhaseProfile;
 use crate::workers::{
-    WorkerCategory, WorkerConfig, WorkerKind, WorkerRoute, worker_model_is_unavailable,
+    DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL, WorkerCategory, WorkerConfig, WorkerKind, WorkerRoute,
+    worker_model_is_unavailable,
 };
 
 pub const PHASE_ROUTE_SCHEMA_VERSION: u32 = 1;
+pub const GEAR_LUNA_MODEL: &str = "openai/gpt-5.6-luna";
+pub const GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL: &str = DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL;
+const GEAR_LUNA_MODEL_ID: &str = "gpt-5.6-luna";
 
 pub const ALL_PHASE_PROFILES: &[PhaseProfile] = &[
     PhaseProfile::Planner,
@@ -21,10 +25,11 @@ pub const ALL_PHASE_PROFILES: &[PhaseProfile] = &[
     PhaseProfile::Summarizer,
 ];
 
-/// OpenCode planning and review phases may deliberately dispatch through the
-/// Explore worker category so the external tool resolver is read-only. The
-/// phase's conceptual category remains part of the route decision; receipts
-/// record the effective Explore category as an explicit, bounded override.
+/// Planning phases may deliberately dispatch through the Explore worker
+/// category so the external tool resolver is read-only. Review phases retain
+/// the Review category so their independent verdicts are visible to the final
+/// review gate; receipts still allow an Explore category only as a bounded
+/// compatibility override for older route records.
 fn allows_read_only_explore_category(phase: &PhaseProfile) -> bool {
     matches!(
         phase,
@@ -89,6 +94,38 @@ pub enum PhaseModelBinding {
     CurrentSession,
     ExactLive(ModelSelectorId),
     BackendDeclared(String),
+}
+
+fn is_luna_flash_contract_candidate(candidate: &PhaseRouteCandidate) -> bool {
+    matches!(
+        &candidate.model,
+        PhaseModelBinding::BackendDeclared(model) if is_luna_model_reference(model)
+    ) || matches!(
+        &candidate.model,
+        PhaseModelBinding::ExactLive(model) if is_luna_model_selector(model)
+    ) || candidate
+        .command
+        .as_deref()
+        .is_some_and(command_mentions_luna_model)
+        || matches!(
+            (&candidate.backend, &candidate.model),
+            (
+                PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                PhaseModelBinding::BackendDeclared(model),
+            ) if model.trim() == GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL
+        )
+}
+
+fn is_luna_model_reference(model: &str) -> bool {
+    matches!(model.trim(), GEAR_LUNA_MODEL | GEAR_LUNA_MODEL_ID)
+}
+
+fn is_luna_model_selector(model: &ModelSelectorId) -> bool {
+    model.provider_id == "openai" && model.model_id == GEAR_LUNA_MODEL_ID
+}
+
+fn command_mentions_luna_model(command: &str) -> bool {
+    command.contains(GEAR_LUNA_MODEL) || command.contains(GEAR_LUNA_MODEL_ID)
 }
 
 impl PhaseModelBinding {
@@ -188,6 +225,24 @@ impl CodexAcpModelProfiles {
             .map_err(|error| anyhow::anyhow!("Codex ACP executor model is invalid: {error}"))?;
         ModelSelectorId::from_qualified("codex", &self.codex_reviewer)
             .map_err(|error| anyhow::anyhow!("Codex ACP reviewer model is invalid: {error}"))?;
+        Ok(())
+    }
+
+    pub fn validate_luna_flash(&self) -> Result<()> {
+        self.validate()?;
+        for (role, actual, expected) in [
+            ("planner", self.codex_planner.as_str(), GEAR_LUNA_MODEL),
+            (
+                "executor",
+                self.opencode_executor.as_str(),
+                GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL,
+            ),
+            ("reviewer", self.codex_reviewer.as_str(), GEAR_LUNA_MODEL),
+        ] {
+            if actual != expected {
+                bail!("strict Luna/Flash {role} model must be `{expected}`, received `{actual}`");
+            }
+        }
         Ok(())
     }
 }
@@ -318,6 +373,16 @@ impl PhaseRouteTable {
         Self::opencode_only_with_premium_budget(models, usize::MAX)
     }
 
+    /// Builds Gear's fixed ACP topology: Luna performs read-only planning and
+    /// review, while DeepSeek Flash performs execution and repair.
+    pub fn canonical_luna_flash() -> Result<Self> {
+        Self::luna_flash_strict(CodexAcpModelProfiles {
+            codex_planner: GEAR_LUNA_MODEL.to_string(),
+            opencode_executor: GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string(),
+            codex_reviewer: GEAR_LUNA_MODEL.to_string(),
+        })
+    }
+
     pub fn opencode_only_with_premium_budget(
         models: OpenCodeModelProfiles,
         max_premium_worker_calls: usize,
@@ -406,6 +471,29 @@ impl PhaseRouteTable {
             profile.source = PhaseRouteSource::BuiltIn;
         }
         table.validate()?;
+        Ok(table)
+    }
+
+    /// Build the fixed external-worker topology used by Gear's Luna/Flash
+    /// mode. Luna is confined to read-only planning and review phases, while
+    /// DeepSeek Flash is confined to executable worker phases.
+    pub fn luna_flash_strict(profiles: CodexAcpModelProfiles) -> Result<Self> {
+        profiles.validate_luna_flash()?;
+        let mut table = Self::codex_acp_opencode(profiles)?;
+        let summarizer = table
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.phase == PhaseProfile::Summarizer)
+            .ok_or_else(|| anyhow::anyhow!("strict Luna/Flash route is missing Summarizer"))?;
+        summarizer.candidates = vec![PhaseRouteCandidate {
+            backend: PhaseBackend::Deterministic,
+            model: PhaseModelBinding::None,
+            command: None,
+        }];
+        summarizer.can_write = false;
+        summarizer.can_review = false;
+        summarizer.source = PhaseRouteSource::BuiltIn;
+        table.validate_luna_flash_contract()?;
         Ok(table)
     }
 
@@ -588,6 +676,105 @@ impl PhaseRouteTable {
         Ok(())
     }
 
+    /// Returns true when a route table asks Gear to use Luna or a Codex ACP
+    /// worker. Such a table must satisfy the fixed Luna/Flash contract rather
+    /// than silently accepting a generic provider route.
+    pub fn requires_luna_flash_contract(&self) -> bool {
+        self.profiles
+            .iter()
+            .flat_map(|profile| &profile.candidates)
+            .any(|candidate| {
+                matches!(candidate.backend, PhaseBackend::CodexAcp)
+                    || matches!(
+                        &candidate.model,
+                        PhaseModelBinding::BackendDeclared(model) if is_luna_model_reference(model)
+                    )
+                    || matches!(
+                        &candidate.model,
+                        PhaseModelBinding::ExactLive(model) if is_luna_model_selector(model)
+                    )
+                    || candidate
+                        .command
+                        .as_deref()
+                        .is_some_and(command_mentions_luna_model)
+            })
+    }
+
+    pub fn validate_luna_flash_contract(&self) -> Result<()> {
+        self.validate()?;
+        if !self.requires_luna_flash_contract() {
+            bail!("route table does not request the strict Luna/Flash contract");
+        }
+
+        for profile in &self.profiles {
+            let (expected_backend, expected_model, expected_can_write, expected_can_review) =
+                match profile.phase {
+                    PhaseProfile::Planner => {
+                        (PhaseBackend::CodexAcp, Some(GEAR_LUNA_MODEL), false, false)
+                    }
+                    PhaseProfile::PlanCritic
+                    | PhaseProfile::ReviewerTask
+                    | PhaseProfile::ReviewerFinal
+                    | PhaseProfile::StrategistNextGoal => {
+                        (PhaseBackend::CodexAcp, Some(GEAR_LUNA_MODEL), false, true)
+                    }
+                    PhaseProfile::ExecutorQuick | PhaseProfile::ExecutorDeep => (
+                        PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                        Some(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL),
+                        true,
+                        false,
+                    ),
+                    PhaseProfile::Orchestrator | PhaseProfile::Summarizer => {
+                        (PhaseBackend::Deterministic, None, false, false)
+                    }
+                };
+            if profile.candidates.len() != 1 {
+                bail!(
+                    "strict Luna/Flash phase {:?} must define exactly one candidate",
+                    profile.phase
+                );
+            }
+            let candidate = &profile.candidates[0];
+            if candidate.backend != expected_backend {
+                bail!(
+                    "strict Luna/Flash phase {:?} has an invalid backend",
+                    profile.phase
+                );
+            }
+            let expected_binding = expected_model
+                .map(|model| PhaseModelBinding::BackendDeclared(model.to_string()))
+                .unwrap_or(PhaseModelBinding::None);
+            if candidate.model != expected_binding {
+                bail!(
+                    "strict Luna/Flash phase {:?} has an invalid model binding",
+                    profile.phase
+                );
+            }
+            if candidate.command.is_some() {
+                bail!(
+                    "strict Luna/Flash phase {:?} cannot override its external worker command",
+                    profile.phase
+                );
+            }
+            if profile.can_write != expected_can_write || profile.can_review != expected_can_review
+            {
+                bail!(
+                    "strict Luna/Flash phase {:?} has invalid write or review capabilities",
+                    profile.phase
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_with_luna_flash_contract(&self) -> Result<()> {
+        self.validate()?;
+        if self.requires_luna_flash_contract() {
+            self.validate_luna_flash_contract()?;
+        }
+        Ok(())
+    }
+
     pub fn hash(&self) -> Result<String> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
@@ -657,6 +844,18 @@ impl PhaseRouteTable {
                         profile_hash: profile_hash.clone(),
                         source: profile.source.clone(),
                     };
+                    if decision
+                        .requested_model
+                        .as_ref()
+                        .is_some_and(is_luna_model_selector)
+                        && let Err(error) = self.validate_luna_flash_contract()
+                    {
+                        rejected_candidates.push(RejectedPhaseCandidate {
+                            candidate_index,
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
                     if let Some(worker_config) = worker_config {
                         if let Err(error) = decision.overlay_worker_config(worker_config) {
                             rejected_candidates.push(RejectedPhaseCandidate {
@@ -706,13 +905,14 @@ pub(crate) fn opencode_paid_fallback_model(
         return Some("opencode-go/deepseek-v4-flash");
     }
     match phase {
-        PhaseProfile::Planner | PhaseProfile::PlanCritic | PhaseProfile::ReviewerTask
-        | PhaseProfile::ReviewerFinal | PhaseProfile::StrategistNextGoal => {
-            Some("opencode-go/mimo-v2.5")
+        PhaseProfile::Planner
+        | PhaseProfile::PlanCritic
+        | PhaseProfile::ReviewerTask
+        | PhaseProfile::ReviewerFinal
+        | PhaseProfile::StrategistNextGoal => Some("opencode-go/mimo-v2.5"),
+        PhaseProfile::ExecutorQuick | PhaseProfile::ExecutorDeep | PhaseProfile::Summarizer => {
+            Some("opencode-go/deepseek-v4-flash")
         }
-        PhaseProfile::ExecutorQuick
-        | PhaseProfile::ExecutorDeep
-        | PhaseProfile::Summarizer => Some("opencode-go/deepseek-v4-flash"),
         PhaseProfile::Orchestrator => None,
     }
 }
@@ -935,6 +1135,10 @@ impl PhaseRouteDecision {
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
+    pub fn requires_luna_flash_contract(&self) -> bool {
+        is_luna_flash_contract_candidate(&self.candidate)
+    }
+
     pub fn overlay_worker_config(&self, base: &WorkerConfig) -> Result<WorkerConfig> {
         let mut overlay = base.clone();
         match self.candidate.backend {
@@ -960,25 +1164,32 @@ impl PhaseRouteDecision {
                     .worker_routes
                     .iter()
                     .find(|route| route.worker_kind == worker_kind);
-                let worker_command = self
-                    .candidate
-                    .command
-                    .clone()
-                    .or_else(|| configured_route.and_then(|route| route.worker_command.clone()))
-                    .or_else(|| {
-                        (base.worker_kind == worker_kind)
+                let worker_command = if self.requires_luna_flash_contract() {
+                    if worker_kind == WorkerKind::Codex {
+                        worker_kind.default_read_only_command(declared_model.as_deref())
+                    } else {
+                        worker_kind.default_command(declared_model.as_deref())
+                    }
+                } else {
+                    self.candidate
+                        .command
+                        .clone()
+                        .or_else(|| configured_route.and_then(|route| route.worker_command.clone()))
+                        .or_else(|| {
+                            (base.worker_kind == worker_kind)
+                                .then(|| base.worker_command.clone())
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            matches!(
+                                base.worker_kind,
+                                WorkerKind::Opencode | WorkerKind::OpencodeSession
+                            )
                             .then(|| base.worker_command.clone())
                             .flatten()
-                    })
-                    .or_else(|| {
-                        matches!(
-                            base.worker_kind,
-                            WorkerKind::Opencode | WorkerKind::OpencodeSession
-                        )
-                        .then(|| base.worker_command.clone())
-                        .flatten()
-                    })
-                    .or_else(|| worker_kind.default_command(declared_model.as_deref()));
+                        })
+                        .or_else(|| worker_kind.default_command(declared_model.as_deref()))
+                };
                 let worker_command = worker_command
                     .map(|command| command.trim().to_string())
                     .filter(|command| !command.is_empty())
@@ -1033,17 +1244,20 @@ impl PhaseRouteDecision {
                     .worker_routes
                     .iter()
                     .find(|route| route.worker_kind == codex_kind);
-                let worker_command = self
-                    .candidate
-                    .command
-                    .clone()
-                    .or_else(|| configured_route.and_then(|route| route.worker_command.clone()))
-                    .or_else(|| {
-                        (base.worker_kind == codex_kind)
-                            .then(|| base.worker_command.clone())
-                            .flatten()
-                    })
-                    .or_else(|| codex_kind.default_command(command_model.as_deref()));
+                let worker_command = if self.requires_luna_flash_contract() {
+                    codex_kind.default_read_only_command(command_model.as_deref())
+                } else {
+                    self.candidate
+                        .command
+                        .clone()
+                        .or_else(|| configured_route.and_then(|route| route.worker_command.clone()))
+                        .or_else(|| {
+                            (base.worker_kind == codex_kind)
+                                .then(|| base.worker_command.clone())
+                                .flatten()
+                        })
+                        .or_else(|| codex_kind.default_command(command_model.as_deref()))
+                };
                 let worker_command = worker_command
                     .map(|command| command.trim().to_string())
                     .filter(|command| !command.is_empty())
@@ -1066,11 +1280,11 @@ impl PhaseRouteDecision {
                 }
                 overlay.worker_kind = codex_kind;
                 overlay.worker_command = Some(worker_command.clone());
-                overlay.worker_model = command_model.clone();
+                overlay.worker_model = declared_model.clone();
                 overlay.worker_routes = vec![WorkerRoute {
                     worker_kind: codex_kind,
                     worker_command: Some(worker_command),
-                    worker_model: command_model,
+                    worker_model: declared_model,
                 }];
                 overlay.require_worker = true;
                 overlay.default_worker_for_small_tasks = codex_kind;
@@ -1247,11 +1461,13 @@ impl PhaseRouteReceipt {
             ) => {
                 self.require_status(ModelBindingStatus::DeclaredUnverified)?;
                 self.require_no_applied_model()?;
-                // Backend-declared models are preferred routes.  A runtime
-                // fallback is valid evidence rather than a receipt failure;
-                // retain the actual model above so reviewers can see the
-                // drift and judge its quality impact.
-                let _model_changed = self.actual_worker_model.as_deref() != Some(model.as_str());
+                if self.decision.requires_luna_flash_contract()
+                    && self.actual_worker_model.as_deref() != Some(model.as_str())
+                {
+                    bail!(
+                        "strict Luna/Flash phase receipt actual worker model does not match its route"
+                    );
+                }
             }
             (PhaseBackend::Worker(_) | PhaseBackend::CodexAcp, PhaseModelBinding::None) => {
                 self.require_status(ModelBindingStatus::LegacyUnverified)?;
@@ -1323,6 +1539,14 @@ mod tests {
 
     fn live_model(qualified_id: &str) -> Result<ModelSelectorId> {
         ModelSelectorId::from_qualified("zed", qualified_id)
+    }
+
+    fn luna_flash_profiles() -> CodexAcpModelProfiles {
+        CodexAcpModelProfiles {
+            codex_planner: GEAR_LUNA_MODEL.to_string(),
+            opencode_executor: GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string(),
+            codex_reviewer: GEAR_LUNA_MODEL.to_string(),
+        }
     }
 
     #[test]
@@ -1453,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_opencode_phase_inherits_command_from_command_worker() -> Result<()> {
+    fn resident_opencode_phase_inherits_acp_server_command() -> Result<()> {
         let table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
             planner: "opencode-go/mimo-v2.5".to_string(),
             executor: "opencode-go/deepseek-v4-flash".to_string(),
@@ -1462,21 +1686,24 @@ mod tests {
         let decision =
             table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
         let mut base = WorkerConfig::default();
-        base.worker_command = Some("opencode run".to_string());
+        base.worker_command = Some("opencode acp --pure".to_string());
 
         let overlay = decision.overlay_worker_config(&base)?;
         assert_eq!(overlay.worker_kind, WorkerKind::OpencodeSession);
-        assert_eq!(overlay.worker_command.as_deref(), Some("opencode run"));
+        assert_eq!(
+            overlay.worker_command.as_deref(),
+            Some("opencode acp --pure")
+        );
         assert_eq!(overlay.worker_routes.len(), 1);
         assert_eq!(
             overlay.worker_routes[0].worker_command.as_deref(),
-            Some("opencode run")
+            Some("opencode acp --pure")
         );
         Ok(())
     }
 
     #[test]
-    fn worker_resolution_falls_back_when_the_first_backend_has_no_command() -> Result<()> {
+    fn worker_resolution_uses_the_first_backend_default_acp_server() -> Result<()> {
         let mut table = PhaseRouteTable::legacy_defaults();
         let profile = profile_mut(&mut table, PhaseProfile::ExecutorQuick)?;
         profile.source = PhaseRouteSource::Environment;
@@ -1499,11 +1726,11 @@ mod tests {
             None,
             &base,
         )?;
-        assert_eq!(decision.selected_candidate, 1);
-        assert_eq!(decision.rejected_candidates.len(), 1);
+        assert_eq!(decision.selected_candidate, 0);
+        assert!(decision.rejected_candidates.is_empty());
         let overlay = decision.overlay_worker_config(&base)?;
-        assert_eq!(overlay.worker_kind, WorkerKind::Codex);
-        assert_eq!(overlay.worker_model.as_deref(), Some("gpt-test"));
+        assert_eq!(overlay.worker_kind, WorkerKind::Opencode);
+        assert!(overlay.worker_model.is_none());
         assert_eq!(overlay.worker_routes.len(), 1);
         assert_eq!(base.worker_kind, WorkerKind::Opencode);
         assert!(base.worker_routes.is_empty());
@@ -1821,11 +2048,8 @@ mod tests {
             reviewer: "opencode/hy3-free".to_string(),
         })?;
 
-        let planner = table.resolve(
-            &PhaseProfile::Planner,
-            &LiveModelInventory::default(),
-            None,
-        )?;
+        let planner =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
         assert_eq!(
             planner.candidate.model,
             PhaseModelBinding::BackendDeclared("opencode/mimo-v2.5-free".to_string())
@@ -1850,7 +2074,10 @@ mod tests {
             executor: "opencode-go/deepseek-v4-flash".to_string(),
             reviewer: "opencode-go/mimo-v2.5".to_string(),
         })?;
-        assert_eq!(paid_table.profile(&PhaseProfile::Planner)?.candidates.len(), 1);
+        assert_eq!(
+            paid_table.profile(&PhaseProfile::Planner)?.candidates.len(),
+            1
+        );
         Ok(())
     }
 
@@ -1907,6 +2134,32 @@ mod tests {
     }
 
     #[test]
+    fn canonical_luna_flash_pins_every_phase_to_one_acp_role() -> Result<()> {
+        let table = PhaseRouteTable::canonical_luna_flash()?;
+        table.validate_with_luna_flash_contract()?;
+        assert_eq!(
+            GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL,
+            "opencode-go/deepseek-v4-flash"
+        );
+        for profile in &table.profiles {
+            assert_eq!(profile.candidates.len(), 1);
+        }
+        assert_eq!(
+            table.profile(&PhaseProfile::Planner)?.candidates[0].backend,
+            PhaseBackend::CodexAcp
+        );
+        assert_eq!(
+            table.profile(&PhaseProfile::ExecutorDeep)?.candidates[0].backend,
+            PhaseBackend::Worker(WorkerKind::OpencodeSession)
+        );
+        assert_eq!(
+            table.profile(&PhaseProfile::ExecutorDeep)?.candidates[0].model,
+            PhaseModelBinding::BackendDeclared(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn premium_budget_zero_rejects_explicit_paid_model() {
         let error = PhaseRouteTable::opencode_only_with_premium_budget(
             OpenCodeModelProfiles {
@@ -1952,6 +2205,140 @@ mod tests {
     // -----------------------------------------------------------------------
     // Codex ACP phase backend tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn luna_flash_strict_table_locks_every_phase_to_one_external_role() -> Result<()> {
+        let table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+
+        table.validate_with_luna_flash_contract()?;
+        for profile in &table.profiles {
+            assert_eq!(profile.candidates.len(), 1, "{:?}", profile.phase);
+        }
+
+        for phase in [
+            PhaseProfile::Planner,
+            PhaseProfile::PlanCritic,
+            PhaseProfile::ReviewerTask,
+            PhaseProfile::ReviewerFinal,
+            PhaseProfile::StrategistNextGoal,
+        ] {
+            let profile = table.profile(&phase)?;
+            assert_eq!(profile.candidates[0].backend, PhaseBackend::CodexAcp);
+            assert_eq!(
+                profile.candidates[0].model,
+                PhaseModelBinding::BackendDeclared(GEAR_LUNA_MODEL.to_string())
+            );
+            assert!(!profile.can_write);
+        }
+
+        for phase in [PhaseProfile::ExecutorQuick, PhaseProfile::ExecutorDeep] {
+            let profile = table.profile(&phase)?;
+            assert_eq!(
+                profile.candidates[0].backend,
+                PhaseBackend::Worker(WorkerKind::OpencodeSession)
+            );
+            assert_eq!(
+                profile.candidates[0].model,
+                PhaseModelBinding::BackendDeclared(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string())
+            );
+            assert!(profile.can_write);
+            assert!(!profile.can_review);
+        }
+
+        for phase in [PhaseProfile::Orchestrator, PhaseProfile::Summarizer] {
+            let profile = table.profile(&phase)?;
+            assert_eq!(profile.candidates[0].backend, PhaseBackend::Deterministic);
+            assert_eq!(profile.candidates[0].model, PhaseModelBinding::None);
+            assert!(!profile.can_write);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn luna_flash_strict_rejects_noncanonical_models_and_route_overrides() -> Result<()> {
+        let mut profiles = luna_flash_profiles();
+        profiles.opencode_executor = "opencode-go/deepseek-v4-flash".to_string();
+        assert!(PhaseRouteTable::luna_flash_strict(profiles).is_err());
+
+        let mut table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+        profile_mut(&mut table, PhaseProfile::Planner)?
+            .candidates
+            .push(PhaseRouteCandidate {
+                backend: PhaseBackend::CodexAcp,
+                model: PhaseModelBinding::BackendDeclared(GEAR_LUNA_MODEL.to_string()),
+                command: None,
+            });
+        assert!(table.validate_luna_flash_contract().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bare_luna_worker_route_cannot_bypass_the_strict_contract() -> Result<()> {
+        let mut table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+        let planner = profile_mut(&mut table, PhaseProfile::Planner)?;
+        planner.candidates[0] = PhaseRouteCandidate {
+            backend: PhaseBackend::Worker(WorkerKind::Codex),
+            model: PhaseModelBinding::BackendDeclared(GEAR_LUNA_MODEL_ID.to_string()),
+            command: None,
+        };
+
+        assert!(table.requires_luna_flash_contract());
+        assert!(table.validate_with_luna_flash_contract().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn luna_command_override_cannot_bypass_the_strict_contract() -> Result<()> {
+        let mut table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+        let planner = profile_mut(&mut table, PhaseProfile::Planner)?;
+        planner.candidates[0] = PhaseRouteCandidate {
+            backend: PhaseBackend::Worker(WorkerKind::Codex),
+            model: PhaseModelBinding::BackendDeclared("openai/other-model".to_string()),
+            command: Some("codex exec -m gpt-5.6-luna".to_string()),
+        };
+
+        assert!(table.requires_luna_flash_contract());
+        assert!(table.validate_with_luna_flash_contract().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_live_luna_route_cannot_bypass_the_strict_contract() -> Result<()> {
+        let mut table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+        let planner = profile_mut(&mut table, PhaseProfile::Planner)?;
+        planner.candidates[0] = PhaseRouteCandidate {
+            backend: PhaseBackend::NativeZed,
+            model: PhaseModelBinding::ExactLive(live_model(GEAR_LUNA_MODEL)?),
+            command: None,
+        };
+
+        assert!(table.requires_luna_flash_contract());
+        assert!(table.validate_with_luna_flash_contract().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn current_session_luna_route_cannot_bypass_the_strict_contract() -> Result<()> {
+        let mut table = PhaseRouteTable::legacy_defaults();
+        let planner = profile_mut(&mut table, PhaseProfile::Planner)?;
+        planner.candidates = vec![PhaseRouteCandidate {
+            backend: PhaseBackend::NativeZed,
+            model: PhaseModelBinding::CurrentSession,
+            command: None,
+        }];
+        let current_model = live_model(GEAR_LUNA_MODEL)?;
+
+        assert!(
+            table
+                .resolve(
+                    &PhaseProfile::Planner,
+                    &LiveModelInventory::default(),
+                    Some(&current_model),
+                )
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn codex_acp_table_defines_every_phase_with_mixed_backends() -> Result<()> {
@@ -2154,12 +2541,108 @@ mod tests {
         let base = WorkerConfig::default();
         let overlay = decision.overlay_worker_config(&base)?;
         assert_eq!(overlay.worker_kind, WorkerKind::Codex);
-        assert_eq!(overlay.worker_model.as_deref(), Some("gpt-4"));
-        assert!(overlay
-            .worker_command
-            .as_deref()
-            .is_some_and(|command| command.contains("-m 'gpt-4'")));
+        assert_eq!(overlay.worker_model.as_deref(), Some("openai/gpt-4"));
+        assert!(
+            overlay
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| command.contains("@agentclientprotocol/codex-acp"))
+        );
         assert_eq!(base.worker_kind, WorkerKind::Opencode);
+        Ok(())
+    }
+
+    #[test]
+    fn luna_flash_overlay_keeps_qualified_identity_and_uses_external_acp_servers() -> Result<()> {
+        let table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+        let mut base = WorkerConfig::default();
+        base.worker_kind = WorkerKind::Codex;
+        base.worker_command = Some("unexpected-wrapper".to_string());
+
+        let planner =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let planner_overlay = planner.overlay_worker_config(&base)?;
+        assert_eq!(
+            planner_overlay.worker_model.as_deref(),
+            Some(GEAR_LUNA_MODEL)
+        );
+        assert!(
+            planner_overlay
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| command.contains("@agentclientprotocol/codex-acp"))
+        );
+        assert!(
+            planner_overlay
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| !command.contains("gpt-5.6-luna"))
+        );
+        assert!(
+            planner_overlay
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| {
+                    !command.contains("--dangerously-bypass-approvals-and-sandbox")
+                })
+        );
+        assert!(
+            planner_overlay
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| !command.contains("unexpected-wrapper"))
+        );
+
+        let executor = table.resolve(
+            &PhaseProfile::ExecutorDeep,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        let executor_overlay = executor.overlay_worker_config(&base)?;
+        assert_eq!(
+            executor_overlay.worker_model.as_deref(),
+            Some(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL)
+        );
+        assert!(
+            executor_overlay
+                .worker_command
+                .as_deref()
+                .is_some_and(|command| {
+                    command.contains("opencode acp --pure")
+                        && command.contains("GEARBOX_ACP_WORKSPACE")
+                        && !command.contains("unexpected-wrapper")
+                })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn luna_flash_receipt_rejects_declared_model_drift() -> Result<()> {
+        let table = PhaseRouteTable::luna_flash_strict(luna_flash_profiles())?;
+        let decision =
+            table.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let decision_hash = decision.hash()?;
+        let receipt = PhaseRouteReceipt {
+            decision,
+            ordinal: 301,
+            plan_revision: 0,
+            decision_hash,
+            goal_id: Some("goal_luna_flash".to_string()),
+            plan_id: None,
+            plan_hash: None,
+            task_id: Some("task_plan".to_string()),
+            worker_session_id: None,
+            applied_model: None,
+            actual_worker_kind: Some(WorkerKind::Codex),
+            actual_category: Some(WorkerCategory::Deep),
+            actual_worker_model: Some("openai/other-model".to_string()),
+            actual_route_reason: Some("strict Luna planner".to_string()),
+            task_record_path: Some("task-record.json".to_string()),
+            task_record_sha256: Some("0".repeat(64)),
+            binding_status: ModelBindingStatus::DeclaredUnverified,
+            receipt_hash: String::new(),
+        };
+        assert!(receipt.seal().is_err());
         Ok(())
     }
 

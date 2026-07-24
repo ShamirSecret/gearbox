@@ -1,14 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::open_code_phase_runtime::{
-    OpenCodePhaseRuntimeFactory, open_code_model_profiles_from_env,
-    open_code_model_profiles_from_values,
-};
-use crate::phase_routing::{CodexAcpModelProfiles, PhaseRouteTable};
+use crate::open_code_phase_runtime::OpenCodePhaseRuntimeFactory;
+#[cfg(test)]
+use crate::phase_routing::GEAR_LUNA_MODEL;
+use crate::phase_routing::{GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL, PhaseRouteTable};
 use crate::runtime::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
     Orchestrator, PhaseRuntime, RunOptions,
@@ -16,9 +15,10 @@ use crate::runtime::{
 use crate::state::ObjectivePolicy;
 use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
-use crate::workers::{Intensity, WorkerConfig, WorkerKind, WorkerRegistry, WorkerRoute};
-
-const DEFAULT_OPENCODE_SESSION_COMMAND: &str = r#"sh -c 'if [ "$GEARBOX_WORKER_RESUME" = "true" ]; then opencode run --pure --print-logs --format json --session "$GEARBOX_WORKER_SESSION_ID" --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; else opencode run --pure --print-logs --format json --model "${GEARBOX_WORKER_MODEL:-opencode/mimo-v2.5-free}" < "$GEARBOX_WORKER_PROMPT"; fi'"#;
+use crate::workers::{
+    DEFAULT_OPENCODE_SESSION_COMMAND, Intensity, WorkerConfig, WorkerKind, WorkerRegistry,
+    WorkerRoute,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "gear")]
@@ -49,16 +49,16 @@ struct RunCommand {
     #[arg(long, default_value_t = 3)]
     max_epochs: usize,
 
-    #[arg(long, default_value_t = 96)]
+    #[arg(long, default_value_t = usize::MAX)]
     max_objective_calls: usize,
 
-    #[arg(long, default_value_t = 12_288_000)]
+    #[arg(long, default_value_t = u64::MAX)]
     max_objective_tokens: u64,
 
-    #[arg(long, default_value_t = 10_000_000)]
+    #[arg(long, default_value_t = u64::MAX)]
     max_objective_cost_micros: u64,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = usize::MAX)]
     max_unknown_usage_calls: usize,
 
     #[arg(long, default_value_t = 2)]
@@ -91,7 +91,7 @@ struct RunCommand {
     #[arg(long)]
     custom_command: Option<String>,
 
-    #[arg(long, default_value = "opencode")]
+    #[arg(long, default_value = "opencode_session")]
     worker: String,
 
     #[arg(long)]
@@ -112,7 +112,7 @@ struct RunCommand {
     #[arg(long = "unavailable-worker-model")]
     unavailable_worker_models: Vec<String>,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = usize::MAX)]
     premium_worker_budget: usize,
 
     #[arg(long, default_value_t = 1)]
@@ -126,9 +126,6 @@ struct RunCommand {
 
     #[arg(long)]
     skip_worker: bool,
-
-    #[arg(long)]
-    require_worker: bool,
 
     #[arg(long = "allowed-path")]
     allowed_paths: Vec<String>,
@@ -167,9 +164,6 @@ struct RunCommand {
     opencode_reviewer_model: Option<String>,
 
     #[arg(long)]
-    codex_acp: bool,
-
-    #[arg(long)]
     codex_acp_planner_model: Option<String>,
 
     #[arg(long)]
@@ -184,79 +178,9 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::Run(command) => {
+            validate_canonical_acp_command(&command)?;
             let worker = worker_config_from_command(&command)?;
-            let workspace = command.workspace.clone();
-            let phase_runtime = if command.objective && command.codex_acp {
-                let planner = command
-                    .codex_acp_planner_model
-                    .clone()
-                    .or_else(|| trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_PLANNER_MODEL"))
-                    .context(
-                        "--codex-acp requires --codex-acp-planner-model or GEARBOX_GEAR_CODEX_ACP_PLANNER_MODEL",
-                    )?;
-                let executor = command
-                    .codex_acp_executor_model
-                    .clone()
-                    .or_else(|| trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_EXECUTOR_MODEL"))
-                    .unwrap_or_else(|| planner.clone());
-                let reviewer = command
-                    .codex_acp_reviewer_model
-                    .clone()
-                    .or_else(|| trimmed_env_value("GEARBOX_GEAR_CODEX_ACP_REVIEWER_MODEL"))
-                    .unwrap_or_else(|| planner.clone());
-                let profiles = CodexAcpModelProfiles {
-                    codex_planner: planner,
-                    opencode_executor: executor,
-                    codex_reviewer: reviewer,
-                };
-                let routes = PhaseRouteTable::codex_acp_opencode(profiles)?;
-                let broker_registry = Arc::new(WorkerRegistry::default());
-                let broker_factory = Arc::new(PhaseBrokerFactory::new(
-                    broker_registry,
-                    workspace.join(".gear"),
-                ));
-                OpenCodePhaseRuntimeFactory::new(
-                    workspace,
-                    worker.clone(),
-                    broker_factory,
-                    CancellationToken::new(),
-                    routes,
-                    crate::phase_routing::LiveModelInventory::default(),
-                )
-                .build()?
-            } else if command.objective && command.opencode_phases {
-                let profiles = open_code_model_profiles_from_values(
-                    true,
-                    command.opencode_planner_model.clone(),
-                    command.opencode_executor_model.clone(),
-                    command.opencode_reviewer_model.clone(),
-                    None,
-                )?
-                .or_else(|| open_code_model_profiles_from_env().ok().flatten())
-                .context(
-                    "--opencode-phases requires --opencode-planner-model or GEARBOX_GEAR_OPENCODE_PLANNER_MODEL",
-                )?;
-                let routes = PhaseRouteTable::opencode_only_with_premium_budget(
-                    profiles,
-                    worker.premium_worker_budget,
-                )?;
-                let broker_registry = Arc::new(WorkerRegistry::default());
-                let broker_factory = Arc::new(PhaseBrokerFactory::new(
-                    broker_registry,
-                    workspace.join(".gear"),
-                ));
-                OpenCodePhaseRuntimeFactory::new(
-                    workspace,
-                    worker.clone(),
-                    broker_factory,
-                    CancellationToken::new(),
-                    routes,
-                    crate::phase_routing::LiveModelInventory::default(),
-                )
-                .build()?
-            } else {
-                PhaseRuntime::legacy()
-            };
+            let phase_runtime = phase_runtime_from_command(&command, worker.clone())?;
             let options = RunOptions {
                 request: command.prompt,
                 workspace: command.workspace,
@@ -317,7 +241,7 @@ pub fn run() -> Result<()> {
                 )?
                 .into_last_goal_outcome()?
             } else {
-                Orchestrator::run(options)?
+                Orchestrator::run_with_phase_runtime(options, phase_runtime)?
             };
 
             println!("Gear goal: {}", outcome.goal_id);
@@ -331,210 +255,107 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn trimmed_env_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn validate_canonical_acp_command(command: &RunCommand) -> Result<()> {
+    if command.max_parallel_workers != 1 || command.max_parallel_per_key != 1 {
+        bail!(
+            "Gear canonical Luna/Flash ACP mode requires --max-parallel-workers=1 and --max-parallel-per-key=1"
+        );
+    }
+    if command.opencode_free_fallbacks {
+        bail!("Gear canonical Luna/Flash ACP mode does not allow --opencode-free-fallbacks");
+    }
+    if command.skip_worker {
+        bail!("Gear canonical Luna/Flash ACP mode cannot use --skip-worker");
+    }
+    for (flag, configured) in [
+        ("--worker-sequence", command.worker_sequence.as_ref()),
+        ("--worker-command", command.worker_command.as_ref()),
+        ("--opencode-command", command.opencode_command.as_ref()),
+        ("--codex-command", command.codex_command.as_ref()),
+        ("--claude-command", command.claude_command.as_ref()),
+        ("--zed-agent-command", command.zed_agent_command.as_ref()),
+        ("--custom-command", command.custom_command.as_ref()),
+    ] {
+        if configured.is_some() {
+            bail!("Gear canonical Luna/Flash ACP mode does not allow {flag}");
+        }
+    }
+    let worker_kind = WorkerKind::parse(&command.worker)
+        .ok_or_else(|| anyhow!("unknown Gear worker kind `{}`", command.worker))?;
+    if worker_kind != WorkerKind::OpencodeSession {
+        bail!(
+            "Gear canonical Luna/Flash ACP mode uses `opencode_session` as its Flash executor base, not `{}`",
+            worker_kind.as_str()
+        );
+    }
+    if command.opencode_phases
+        || command.opencode_planner_model.is_some()
+        || command.opencode_executor_model.is_some()
+        || command.opencode_reviewer_model.is_some()
+        || command.codex_acp_planner_model.is_some()
+        || command.codex_acp_executor_model.is_some()
+        || command.codex_acp_reviewer_model.is_some()
+    {
+        bail!(
+            "Gear canonical Luna/Flash ACP mode fixes Luna planning/review and `{GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL}` execution; model overrides are disabled"
+        );
+    }
+    if let Some(model) = command.worker_model.as_deref().map(str::trim)
+        && !model.is_empty()
+        && model != GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL
+    {
+        bail!(
+            "Gear canonical Luna/Flash ACP mode requires --worker-model `{GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL}` for execution"
+        );
+    }
+    Ok(())
+}
+
+fn phase_runtime_from_command(command: &RunCommand, worker: WorkerConfig) -> Result<PhaseRuntime> {
+    let routes = PhaseRouteTable::canonical_luna_flash()?;
+    let workspace = command.workspace.clone();
+    let broker_registry = Arc::new(WorkerRegistry::default());
+    let broker_factory = Arc::new(PhaseBrokerFactory::new(
+        broker_registry,
+        workspace.join(".gear"),
+    ));
+    OpenCodePhaseRuntimeFactory::new(
+        workspace,
+        worker,
+        broker_factory,
+        CancellationToken::new(),
+        routes,
+        crate::phase_routing::LiveModelInventory::default(),
+    )
+    .build()
 }
 
 fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
-    let worker_kind = WorkerKind::parse(&command.worker)
-        .ok_or_else(|| anyhow!("unknown Gear worker kind `{}`", command.worker))?;
-    let worker_model = command
-        .worker_model
-        .clone()
-        .filter(|model| !model.trim().is_empty());
-    let worker_command = command
-        .worker_command
-        .clone()
-        .or_else(|| worker_command_for_kind(worker_kind, command))
-        .or_else(|| {
-            matches!(
-                worker_kind,
-                WorkerKind::Opencode | WorkerKind::OpencodeSession
-            )
-            .then(|| DEFAULT_OPENCODE_SESSION_COMMAND.to_string())
-        })
-        .or_else(|| worker_kind.default_command(worker_model.as_deref()))
-        .filter(|command| !command.trim().is_empty());
-    let worker_routes = if command.worker_sequence.is_some() {
-        worker_routes_from_sequence(
-            command.worker_sequence.as_deref(),
-            worker_kind,
-            &worker_command,
-            &worker_model,
-            command,
-        )?
-    } else if command.opencode_free_fallbacks
-        || matches!(worker_kind, WorkerKind::Opencode | WorkerKind::OpencodeSession)
-    {
-        opencode_free_fallback_routes_with_precedence(
-            worker_kind,
-            worker_command.as_deref(),
-            worker_model.as_deref(),
-        )
-    } else {
-        Vec::new()
-    };
-    let require_worker = command.require_worker
-        || worker_command.is_some()
-        || worker_routes
-            .iter()
-            .any(|route| route.worker_command.is_some());
+    let worker_command = DEFAULT_OPENCODE_SESSION_COMMAND.to_string();
 
     Ok(WorkerConfig {
-        worker_kind,
-        worker_command,
-        worker_model,
-        worker_routes,
+        worker_kind: WorkerKind::OpencodeSession,
+        worker_command: Some(worker_command.clone()),
+        worker_model: Some(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string()),
+        worker_routes: vec![WorkerRoute {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(worker_command),
+            worker_model: Some(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string()),
+        }],
         unavailable_worker_models: command
             .unavailable_worker_models
             .iter()
             .map(|model| model.trim().to_string())
             .filter(|model| !model.is_empty())
             .collect(),
-        premium_worker_budget: command.premium_worker_budget,
-        max_parallel_workers: command.max_parallel_workers.max(1),
-        max_parallel_per_key: command.max_parallel_per_key.max(1),
+        premium_worker_budget: usize::MAX,
+        max_parallel_workers: 1,
+        max_parallel_per_key: 1,
         stale_task_timeout_secs: command.stale_task_timeout_secs.max(1),
-        skip_worker: command.skip_worker,
-        require_worker,
-        default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        skip_worker: false,
+        require_worker: true,
+        default_worker_for_small_tasks: WorkerKind::OpencodeSession,
     })
-}
-
-fn opencode_free_fallback_routes() -> Vec<WorkerRoute> {
-    [
-        "opencode/hy3-free",
-        "opencode/mimo-v2.5-free",
-        "opencode/deepseek-v4-flash-free",
-    ]
-    .into_iter()
-    .map(|worker_model| WorkerRoute {
-        worker_kind: WorkerKind::OpencodeSession,
-        worker_command: Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string()),
-        worker_model: Some(worker_model.to_string()),
-    })
-    .collect()
-}
-
-fn opencode_paid_fallback_routes() -> Vec<WorkerRoute> {
-    [
-        "opencode-go/mimo-v2.5",
-        "opencode-go/deepseek-v4-flash",
-    ]
-    .into_iter()
-    .map(|worker_model| WorkerRoute {
-        worker_kind: WorkerKind::OpencodeSession,
-        worker_command: Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string()),
-        worker_model: Some(worker_model.to_string()),
-    })
-    .collect()
-}
-
-/// Build the free-first fallback route list while preserving explicit-model precedence.
-///
-/// When an explicit `worker_model` is provided, it becomes the first actual
-/// route so that the user's requested model is the first dispatch attempt. The
-/// verified free routes are then followed by the explicitly allowed paid
-/// OpenCode Go routes. A paid route is never selected before all free routes
-/// have been attempted, and duplicates are removed.
-fn opencode_free_fallback_routes_with_precedence(
-    worker_kind: WorkerKind,
-    worker_command: Option<&str>,
-    worker_model: Option<&str>,
-) -> Vec<WorkerRoute> {
-    let explicit = worker_model
-        .filter(|model| !model.trim().is_empty())
-        .map(|model| model.trim().to_string());
-    let mut routes = Vec::new();
-    if let Some(explicit_model) = explicit {
-        routes.push(WorkerRoute {
-            worker_kind,
-            worker_command: worker_command
-                .filter(|command| !command.trim().is_empty())
-                .map(|command| command.to_string())
-                .or_else(|| Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string())),
-            worker_model: Some(explicit_model.clone()),
-        });
-        routes.extend(
-            opencode_free_fallback_routes()
-                .into_iter()
-                .chain(opencode_paid_fallback_routes())
-                .filter(|route| route.worker_model.as_deref() != Some(explicit_model.as_str())),
-        );
-    } else {
-        routes.extend(opencode_free_fallback_routes());
-        routes.extend(opencode_paid_fallback_routes());
-    }
-    routes
-}
-
-fn worker_routes_from_sequence(
-    worker_sequence: Option<&str>,
-    default_worker_kind: WorkerKind,
-    default_worker_command: &Option<String>,
-    default_worker_model: &Option<String>,
-    command: &RunCommand,
-) -> Result<Vec<WorkerRoute>> {
-    let Some(worker_sequence) = worker_sequence else {
-        return Ok(Vec::new());
-    };
-
-    worker_sequence
-        .split(',')
-        .filter_map(|worker| {
-            let worker = worker.trim();
-            (!worker.is_empty()).then_some(worker)
-        })
-        .map(|worker| {
-            let (worker_kind, worker_model) = worker_route_from_sequence_entry(worker)?;
-            let worker_command = worker_command_for_kind(worker_kind, command)
-                .or_else(|| {
-                    (worker_kind == default_worker_kind)
-                        .then(|| default_worker_command.clone())
-                        .flatten()
-                })
-                .or_else(|| worker_kind.default_command(worker_model.as_deref()));
-            let worker_model = worker_model.or_else(|| {
-                (worker_kind == default_worker_kind)
-                    .then(|| default_worker_model.clone())
-                    .flatten()
-            });
-            Ok(WorkerRoute {
-                worker_kind,
-                worker_command,
-                worker_model,
-            })
-        })
-        .collect()
-}
-
-fn worker_route_from_sequence_entry(worker: &str) -> Result<(WorkerKind, Option<String>)> {
-    let (worker, worker_model) = worker
-        .split_once(':')
-        .map(|(worker, worker_model)| {
-            (
-                worker.trim(),
-                Some(worker_model.trim().to_string()).filter(|model| !model.is_empty()),
-            )
-        })
-        .unwrap_or((worker.trim(), None));
-    let worker_kind = WorkerKind::parse(worker)
-        .ok_or_else(|| anyhow!("unknown Gear worker kind in sequence `{worker}`"))?;
-    Ok((worker_kind, worker_model))
-}
-
-fn worker_command_for_kind(worker_kind: WorkerKind, command: &RunCommand) -> Option<String> {
-    match worker_kind {
-        WorkerKind::Opencode | WorkerKind::OpencodeSession => command.opencode_command.clone(),
-        WorkerKind::Codex => command.codex_command.clone(),
-        WorkerKind::Claude => command.claude_command.clone(),
-        WorkerKind::ZedAgent => command.zed_agent_command.clone(),
-        WorkerKind::Custom => command.custom_command.clone(),
-    }
-    .filter(|command| !command.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -562,18 +383,17 @@ mod tests {
             claude_command: None,
             zed_agent_command: None,
             custom_command: None,
-            worker: "opencode".to_string(),
+            worker: "opencode_session".to_string(),
             worker_command: None,
             worker_model: None,
             worker_sequence: None,
             opencode_free_fallbacks: false,
             unavailable_worker_models: Vec::new(),
-            premium_worker_budget: 1,
+            premium_worker_budget: 0,
             max_parallel_workers: 1,
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
-            require_worker: false,
             allowed_paths: Vec::new(),
             forbidden_paths: Vec::new(),
             max_files_changed: 40,
@@ -586,7 +406,6 @@ mod tests {
             opencode_planner_model: None,
             opencode_executor_model: None,
             opencode_reviewer_model: None,
-            codex_acp: false,
             codex_acp_planner_model: None,
             codex_acp_executor_model: None,
             codex_acp_reviewer_model: None,
@@ -595,229 +414,118 @@ mod tests {
     }
 
     #[test]
-    fn cli_worker_config_builds_sequence_with_kind_commands() -> Result<()> {
+    fn canonical_cli_rejects_parallelism_fallbacks_and_command_overrides() {
         let mut command = run_command();
-        command.worker_sequence = Some("opencode,codex:gpt-5.4,claude".to_string());
-        command.opencode_command = Some("opencode run".to_string());
+        command.max_parallel_workers = 2;
+        assert!(validate_canonical_acp_command(&command).is_err());
+
+        command.max_parallel_workers = 1;
+        command.opencode_free_fallbacks = true;
+        assert!(validate_canonical_acp_command(&command).is_err());
+
+        command.opencode_free_fallbacks = false;
         command.codex_command = Some("codex exec".to_string());
-        command.claude_command = Some("claude -p".to_string());
+        assert!(validate_canonical_acp_command(&command).is_err());
 
-        let config = worker_config_from_command(&command)?;
+        command.codex_command = None;
+        command.skip_worker = true;
+        assert!(validate_canonical_acp_command(&command).is_err());
 
-        assert_eq!(config.worker_routes.len(), 3);
-        assert_eq!(config.worker_routes[0].worker_kind, WorkerKind::Opencode);
-        assert_eq!(
-            config.worker_routes[1].worker_command.as_deref(),
-            Some("codex exec")
-        );
-        assert_eq!(
-            config.worker_routes[1].worker_model.as_deref(),
-            Some("gpt-5.4")
-        );
-        assert_eq!(
-            config.worker_routes[2].worker_command.as_deref(),
-            Some("claude -p")
-        );
-        assert_eq!(config.max_parallel_workers, 1);
-        assert_eq!(config.max_parallel_per_key, 1);
-        assert_eq!(config.premium_worker_budget, 1);
-        assert!(config.require_worker);
-        Ok(())
+        command.skip_worker = false;
+        command.codex_acp_planner_model = Some(GEAR_LUNA_MODEL.to_string());
+        assert!(validate_canonical_acp_command(&command).is_err());
+
+        command.codex_acp_planner_model = None;
+        command.worker_sequence = Some("opencode_session".to_string());
+        assert!(validate_canonical_acp_command(&command).is_err());
+
+        command.worker_sequence = None;
+        command.worker = "zed_agent".to_string();
+        assert!(validate_canonical_acp_command(&command).is_err());
     }
 
     #[test]
     fn default_opencode_worker_has_a_session_command() -> Result<()> {
         let config = worker_config_from_command(&run_command())?;
-        assert_eq!(config.worker_kind, WorkerKind::Opencode);
+        assert_eq!(config.worker_kind, WorkerKind::OpencodeSession);
         assert!(config.require_worker);
         assert_eq!(
             config.worker_command.as_deref(),
             Some(DEFAULT_OPENCODE_SESSION_COMMAND)
         );
         assert_eq!(
-            config
-                .worker_routes
-                .iter()
-                .map(|route| route.worker_model.as_deref())
-                .collect::<Vec<_>>(),
-            vec![
-                Some("opencode/hy3-free"),
-                Some("opencode/mimo-v2.5-free"),
-                Some("opencode/deepseek-v4-flash-free"),
-                Some("opencode-go/mimo-v2.5"),
-                Some("opencode-go/deepseek-v4-flash"),
-            ]
+            config.worker_model.as_deref(),
+            Some(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn cli_worker_config_enables_verified_opencode_free_fallbacks_without_overriding_sequence()
-    -> Result<()> {
-        let mut command = run_command();
-        command.opencode_free_fallbacks = true;
-
-        let config = worker_config_from_command(&command)?;
-
-        assert_eq!(
-            config
-                .worker_routes
-                .iter()
-                .map(|route| route.worker_model.as_deref())
-                .collect::<Vec<_>>(),
-            vec![
-                Some("opencode/hy3-free"),
-                Some("opencode/mimo-v2.5-free"),
-                Some("opencode/deepseek-v4-flash-free"),
-                Some("opencode-go/mimo-v2.5"),
-                Some("opencode-go/deepseek-v4-flash"),
-            ]
-        );
-        assert!(config.worker_routes.iter().all(|route| {
-            route.worker_kind == WorkerKind::OpencodeSession
-                && route.worker_command.as_deref().is_some_and(|command| {
-                    command.contains("--session \"$GEARBOX_WORKER_SESSION_ID\"")
-                        && command.contains("< \"$GEARBOX_WORKER_PROMPT\"")
-                })
-        }));
-
-        command.worker_sequence = Some("opencode:opencode/custom-free".to_string());
-        let explicit_config = worker_config_from_command(&command)?;
-        assert_eq!(explicit_config.worker_routes.len(), 1);
-        assert_eq!(
-            explicit_config.worker_routes[0].worker_model.as_deref(),
-            Some("opencode/custom-free")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cli_worker_config_explicit_model_precedes_free_fallbacks() -> Result<()> {
-        let mut command = run_command();
-        command.opencode_free_fallbacks = true;
-        command.worker_model = Some("opencode/deepseek-v4-flash-free".to_string());
-
-        let config = worker_config_from_command(&command)?;
-
+        assert_eq!(config.worker_routes.len(), 1);
         assert_eq!(
             config.worker_routes[0].worker_model.as_deref(),
-            Some("opencode/deepseek-v4-flash-free")
-        );
-        assert_eq!(config.worker_routes[0].worker_kind, WorkerKind::Opencode);
-        assert_eq!(
-            config.worker_routes[0].worker_command.as_deref(),
-            Some(DEFAULT_OPENCODE_SESSION_COMMAND)
-        );
-        assert_eq!(
-            config.worker_routes.len(),
-            5,
-            "explicit model plus free and paid fallbacks (deduplicated)"
-        );
-        assert!(
-            config
-                .worker_routes
-                .iter()
-                .filter(|route| {
-                    route.worker_model.as_deref() == Some("opencode/deepseek-v4-flash-free")
-                })
-                .count()
-                == 1,
-            "explicit model must not be duplicated in the fallback list"
-        );
-        assert_eq!(
-            config.worker_routes[3].worker_model.as_deref(),
-            Some("opencode-go/mimo-v2.5")
-        );
-        assert_eq!(
-            config.worker_routes[4].worker_model.as_deref(),
-            Some("opencode-go/deepseek-v4-flash")
+            Some(GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL)
         );
         Ok(())
     }
 
     #[test]
-    fn cli_worker_config_free_fallbacks_default_order_without_explicit_model() -> Result<()> {
+    fn canonical_cli_rejects_model_routing_knobs() {
         let mut command = run_command();
-        command.opencode_free_fallbacks = true;
+        command.worker_model = Some("opencode/mimo-v2.5-free".to_string());
+        assert!(validate_canonical_acp_command(&command).is_err());
 
+        command.worker_model = None;
+        command.opencode_phases = true;
+        assert!(validate_canonical_acp_command(&command).is_err());
+    }
+
+    #[test]
+    fn canonical_cli_builds_provider_backed_phase_runtime() -> Result<()> {
+        let mut command = run_command();
+        command.workspace = PathBuf::from(".");
         let config = worker_config_from_command(&command)?;
+        let runtime = phase_runtime_from_command(&command, config)?;
 
-        assert_eq!(
-            config
-                .worker_routes
-                .iter()
-                .map(|route| route.worker_model.as_deref())
-                .collect::<Vec<_>>(),
-            vec![
-                Some("opencode/hy3-free"),
-                Some("opencode/mimo-v2.5-free"),
-                Some("opencode/deepseek-v4-flash-free"),
-                Some("opencode-go/mimo-v2.5"),
-                Some("opencode-go/deepseek-v4-flash"),
-            ]
-        );
-        assert_eq!(config.worker_routes[0].worker_kind, WorkerKind::OpencodeSession);
+        assert!(runtime.broker_factory.is_some());
+        for profile in &runtime.routes.profiles {
+            assert_eq!(profile.candidates.len(), 1);
+            let candidate = &profile.candidates[0];
+            match profile.phase {
+                crate::plan_graph::PhaseProfile::Planner
+                | crate::plan_graph::PhaseProfile::PlanCritic
+                | crate::plan_graph::PhaseProfile::ReviewerTask
+                | crate::plan_graph::PhaseProfile::ReviewerFinal
+                | crate::plan_graph::PhaseProfile::StrategistNextGoal => {
+                    assert_eq!(
+                        candidate.backend,
+                        crate::phase_routing::PhaseBackend::CodexAcp
+                    );
+                    assert_eq!(
+                        candidate.model,
+                        crate::phase_routing::PhaseModelBinding::BackendDeclared(
+                            GEAR_LUNA_MODEL.to_string()
+                        )
+                    );
+                }
+                crate::plan_graph::PhaseProfile::ExecutorQuick
+                | crate::plan_graph::PhaseProfile::ExecutorDeep => {
+                    assert_eq!(
+                        candidate.backend,
+                        crate::phase_routing::PhaseBackend::Worker(WorkerKind::OpencodeSession)
+                    );
+                    assert_eq!(
+                        candidate.model,
+                        crate::phase_routing::PhaseModelBinding::BackendDeclared(
+                            GEAR_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string()
+                        )
+                    );
+                }
+                crate::plan_graph::PhaseProfile::Orchestrator
+                | crate::plan_graph::PhaseProfile::Summarizer => {
+                    assert_eq!(
+                        candidate.backend,
+                        crate::phase_routing::PhaseBackend::Deterministic
+                    );
+                }
+            }
+        }
         Ok(())
-    }
-
-    #[test]
-    fn cli_worker_config_keeps_parallelism_limits() -> Result<()> {
-        let mut command = run_command();
-        command.max_parallel_workers = 3;
-        command.max_parallel_per_key = 2;
-        command.premium_worker_budget = 4;
-
-        let config = worker_config_from_command(&command)?;
-
-        assert_eq!(config.premium_worker_budget, 4);
-        assert_eq!(config.max_parallel_workers, 3);
-        assert_eq!(config.max_parallel_per_key, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn cli_worker_config_uses_default_codex_command_when_unspecified() -> Result<()> {
-        let mut command = run_command();
-        command.worker = "codex".to_string();
-        command.worker_model = Some("gpt-5".to_string());
-
-        let config = worker_config_from_command(&command)?;
-
-        assert_eq!(config.worker_kind, WorkerKind::Codex);
-        assert!(
-            config
-                .worker_command
-                .as_deref()
-                .is_some_and(|command| command.contains("codex exec"))
-        );
-        assert!(
-            config
-                .worker_command
-                .as_deref()
-                .is_some_and(|command| command.contains("-m 'gpt-5'"))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cli_worker_config_uses_primary_kind_command_for_non_opencode_worker() -> Result<()> {
-        let mut command = run_command();
-        command.worker = "codex".to_string();
-        command.codex_command = Some("codex exec".to_string());
-
-        let config = worker_config_from_command(&command)?;
-
-        assert_eq!(config.worker_kind, WorkerKind::Codex);
-        assert_eq!(config.worker_command.as_deref(), Some("codex exec"));
-        assert!(config.require_worker);
-        Ok(())
-    }
-
-    #[test]
-    fn cli_worker_config_rejects_unknown_sequence_worker() {
-        let mut command = run_command();
-        command.worker_sequence = Some("opencode,unknown".to_string());
-
-        assert!(worker_config_from_command(&command).is_err());
     }
 }

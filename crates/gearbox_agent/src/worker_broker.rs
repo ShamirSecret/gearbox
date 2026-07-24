@@ -484,6 +484,24 @@ fn declared_model_usage_evidence(
     }
 }
 
+fn usage_evidence_for_session(
+    identity: &BrokerSessionIdentity,
+    request: &BrokerPhaseRequest,
+    reported_usage: Option<BrokerUsage>,
+) -> (Option<BrokerUsage>, Option<ModelSelectorId>) {
+    let (declared_usage, actual_model) = declared_model_usage_evidence(request);
+
+    // ACP can apply a model without exposing provider-usage telemetry. Do not
+    // turn Gear's declaration into telemetry the session did not advertise.
+    let usage = if identity.supports(&BrokerCapability::Usage) {
+        reported_usage.or(declared_usage)
+    } else {
+        None
+    };
+
+    (usage, actual_model)
+}
+
 impl BrokerLifecycleReceipt {
     /// Seal the receipt by computing and setting its cryptographic hash.
     ///
@@ -1256,7 +1274,7 @@ impl WorkerBroker {
         // Determine binding status from the identity's backend kind before
         // identity is consumed by the receipt struct.
         let backend_kind = identity.backend_kind;
-        let (usage, actual_model) = declared_model_usage_evidence(&phase_request);
+        let (usage, actual_model) = usage_evidence_for_session(&identity, &phase_request, None);
 
         // Seal and write the first receipt.
         let receipt = BrokerLifecycleReceipt {
@@ -1759,15 +1777,8 @@ impl WorkerBroker {
 
         // Write final receipt.
         if let (Some(identity), Some(phase_request)) = (&identity, &phase_request) {
-            let (usage, actual_model) = if let Some(usage) = handle.usage() {
-                let actual_model = match &phase_request.requested_model {
-                    ModelAvailability::Available(model) => Some(model.clone()),
-                    ModelAvailability::Unavailable(_) => None,
-                };
-                (Some(usage), actual_model)
-            } else {
-                declared_model_usage_evidence(phase_request)
-            };
+            let (usage, actual_model) =
+                usage_evidence_for_session(identity, phase_request, handle.usage());
             let receipt = BrokerLifecycleReceipt {
                 schema_version: BROKER_SCHEMA_VERSION,
                 interaction_ordinal: ordinal,
@@ -1961,18 +1972,12 @@ impl WorkerBroker {
             .session_identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no session identity"))?;
-        let (usage, actual_model) = inner
+        let reported_usage = inner
             .session_handle
             .as_ref()
-            .and_then(|handle| handle.usage())
-            .map(|usage| {
-                let actual_model = match &phase_request.requested_model {
-                    ModelAvailability::Available(model) => Some(model.clone()),
-                    ModelAvailability::Unavailable(_) => None,
-                };
-                (Some(usage), actual_model)
-            })
-            .unwrap_or_else(|| declared_model_usage_evidence(phase_request));
+            .and_then(|handle| handle.usage());
+        let (usage, actual_model) =
+            usage_evidence_for_session(identity, phase_request, reported_usage);
 
         BrokerLifecycleReceipt {
             schema_version: BROKER_SCHEMA_VERSION,
@@ -2511,6 +2516,36 @@ impl PhaseBrokerFactory {
     where
         F: FnMut(&WorkerResult, usize) -> Result<Option<String>>,
     {
+        self.execute_worker_phase_with_follow_up_inner(
+            phase_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            execution_id,
+            phase_session_id,
+            request,
+            0,
+            &mut follow_up,
+        )
+    }
+
+    fn execute_worker_phase_with_follow_up_inner<F>(
+        &self,
+        phase_decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+        execution_id: &str,
+        phase_session_id: &str,
+        request: WorkerStartRequest<'_>,
+        initial_follow_up_index: usize,
+        follow_up: &mut F,
+    ) -> Result<PhaseWorkerExecution>
+    where
+        F: FnMut(&WorkerResult, usize) -> Result<Option<String>>,
+    {
         if phase_decision.worker_kind.is_none() {
             bail!(
                 "phase {:?} is not configured for a worker session",
@@ -2546,11 +2581,24 @@ impl PhaseBrokerFactory {
             task_id,
             &execution_identity,
         )?;
+        let request_store = request.store;
+        let request_workspace = request.workspace;
+        let request_task = request.task.clone();
+        let request_route_attempt = request.route_attempt;
+        let request_verification_commands = request.verification_commands;
+        let request_config = request.config;
+        let request_cancellation_token = request.cancellation_token.clone();
+        let request_coordinator_model = request.coordinator_model;
+        let request_coordinator_brief = request.coordinator_brief;
+        let request_route_hint = request.route_hint;
 
         let execution = (|| -> Result<PhaseWorkerExecution> {
             broker.resolve(phase_request)?;
             let handle = broker.start_via_broker(request)?;
-            let mut follow_up_index = 0;
+            let supports_follow_up = broker
+                .session_identity()?
+                .supports(&BrokerCapability::FollowUp);
+            let mut follow_up_index = initial_follow_up_index;
             let result = loop {
                 broker.wait()?;
                 let result = handle.wait_for_result()?;
@@ -2558,7 +2606,49 @@ impl PhaseBrokerFactory {
                     break result;
                 };
                 follow_up_index = follow_up_index.saturating_add(1);
-                broker.follow_up_from_idle(prompt)?;
+                if supports_follow_up {
+                    broker.follow_up_from_idle(prompt)?;
+                    continue;
+                }
+
+                broker.wait_for_outcome()?;
+                self.finalize_session(
+                    &broker,
+                    &execution_identity,
+                    goal_id,
+                    task_id,
+                    plan_revision,
+                )?;
+                let repair_task_id = format!("{task_id}_repair_{follow_up_index}");
+                let mut repair_task = request_task.clone();
+                repair_task.id = repair_task_id.clone();
+                let repair_execution_id = format!("{execution_id}_repair_{follow_up_index}");
+                let repair_phase_session_id =
+                    format!("{phase_session_id}_repair_{follow_up_index}");
+                return self.execute_worker_phase_with_follow_up_inner(
+                    phase_decision,
+                    goal_id,
+                    plan_id,
+                    plan_revision,
+                    &repair_task_id,
+                    &repair_execution_id,
+                    &repair_phase_session_id,
+                    WorkerStartRequest {
+                        store: request_store,
+                        workspace: request_workspace,
+                        task: &repair_task,
+                        route_attempt: request_route_attempt,
+                        goal: &prompt,
+                        verification_commands: request_verification_commands,
+                        config: request_config,
+                        cancellation_token: request_cancellation_token.clone(),
+                        coordinator_model: request_coordinator_model,
+                        coordinator_brief: request_coordinator_brief,
+                        route_hint: request_route_hint,
+                    },
+                    follow_up_index,
+                    follow_up,
+                );
             };
             broker.wait_for_outcome()?;
             let usage = broker.latest_receipt()?.and_then(|receipt| receipt.usage);
@@ -2993,6 +3083,57 @@ mod tests {
             sealed.usage.is_none(),
             "receipt with unknown usage must have usage=None"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn acp_session_without_usage_capability_omits_declared_usage_evidence() -> Result<()> {
+        use crate::test_support::test_support::{
+            FakeWorkerSessionHandle, FakeWorkerState, fake_worker_outcome, worker_registry_for_test,
+        };
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let temporary_directory = tempdir()?;
+        let broker = WorkerBroker::new(
+            Arc::new(worker_registry_for_test()),
+            temporary_directory.path().to_path_buf(),
+        );
+        let model = test_model("provider/model");
+        broker.resolve(basic_request(ModelAvailability::Available(model.clone())))?;
+
+        let fake_state = Arc::new(Mutex::new(
+            FakeWorkerState::new("ses-test-acp-no-usage")
+                .with_outcome(fake_worker_outcome(crate::workers::WorkerStatus::Succeeded)),
+        ));
+        let handle = Arc::new(FakeWorkerSessionHandle::new(fake_state));
+        let identity = BrokerSessionIdentity {
+            backend_kind: WorkerKind::OpencodeSession,
+            session_id: "ses-test-acp-no-usage".to_string(),
+            started_at: valid_timestamp(),
+            capabilities: Some(vec![
+                BrokerCapability::DiscoverAgents,
+                BrokerCapability::ModelSelection,
+                BrokerCapability::Start,
+                BrokerCapability::Cancel,
+                BrokerCapability::Wait,
+            ]),
+        };
+
+        broker.start(handle, identity)?;
+        let initial_receipt = broker
+            .latest_receipt()?
+            .context("initial ACP receipt should exist")?;
+        assert!(initial_receipt.usage.is_none());
+        assert_eq!(initial_receipt.actual_model, Some(model.clone()));
+
+        broker.wait_for_outcome()?;
+        let terminal_receipt = broker
+            .latest_receipt()?
+            .context("terminal ACP receipt should exist")?;
+        assert!(terminal_receipt.usage.is_none());
+        assert_eq!(terminal_receipt.actual_model, Some(model));
 
         Ok(())
     }
@@ -4016,6 +4157,123 @@ mod tests {
                 .is_file()
         );
         validate_session_ledger(&execution.session_dir)?;
+        factory.validate_goal_receipts(&task.goal_id, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn factory_restarts_non_follow_up_codex_phase_for_repair() -> Result<()> {
+        use crate::phase_routing::{
+            CodexAcpModelProfiles, LiveModelInventory, PhaseRouteTable,
+        };
+        use crate::state::{
+            Scope, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+        };
+        use crate::workers::{WorkerConfig, WorkerRoute};
+
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "phase_codex".to_string(),
+            goal_id: "goal_codex".to_string(),
+            parent_task_id: None,
+            title: "Codex planner phase".to_string(),
+            kind: TaskKind::Plan,
+            status: TaskStatus::Pending,
+            assigned_worker: Some(WorkerKind::Codex.as_str().to_string()),
+            attempt: 1,
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            inputs: TaskInputs {
+                phase_route_locked: true,
+                ..TaskInputs::default()
+            },
+            outputs: TaskOutputs::default(),
+        };
+        let script_path = temp_dir.path().join("codex-phase-worker.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nif grep -q __CODEX_REPAIR_TURN__ \"$GEARBOX_WORKER_PROMPT\"; then\n  printf 'repair-response\\n' > \"$GEARBOX_WORKER_LAST_MESSAGE\"\nelse\n  printf 'initial-response\\n' > \"$GEARBOX_WORKER_LAST_MESSAGE\"\nfi\nprintf '{\"sessionID\":\"codex-provider-session\"}\\n'\n",
+        )?;
+        let command = format!("sh {}", script_path.display());
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Codex,
+            worker_command: Some(command.clone()),
+            worker_model: Some("openai/gpt-codex-test".to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::Codex,
+                worker_command: Some(command),
+                worker_model: Some("openai/gpt-codex-test".to_string()),
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Codex,
+        };
+        let routes = PhaseRouteTable::codex_acp_opencode(CodexAcpModelProfiles {
+            codex_planner: "openai/gpt-codex-test".to_string(),
+            opencode_executor: "opencode/deepseek-v4-flash-free".to_string(),
+            codex_reviewer: "openai/gpt-codex-test".to_string(),
+        })?;
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let factory = PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        );
+        let mut repair_count = 0_usize;
+
+        let execution = factory.execute_worker_phase_with_follow_up(
+            &decision,
+            &task.goal_id,
+            "plan_codex",
+            0,
+            &task.id,
+            "codex_execution_1",
+            "codex_session_1",
+            WorkerStartRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "Return a typed plan",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+            |result, follow_up_index| {
+                let output_path = result
+                    .last_message_path
+                    .as_ref()
+                    .context("Codex result has no last message path")?;
+                let output = std::fs::read_to_string(output_path)?;
+                if follow_up_index == 0 {
+                    assert!(output.contains("initial-response"));
+                    repair_count = repair_count.saturating_add(1);
+                    Ok(Some("__CODEX_REPAIR_TURN__".to_string()))
+                } else {
+                    assert!(output.contains("repair-response"));
+                    Ok(None)
+                }
+            },
+        )?;
+
+        assert_eq!(repair_count, 1);
+        assert_eq!(execution.session_identity.backend_kind, WorkerKind::Codex);
+        assert!(execution.execution_identity.execution_id.contains("repair_1"));
+        let output_path = execution
+            .result
+            .last_message_path
+            .as_ref()
+            .context("final Codex result has no last message path")?;
+        assert!(std::fs::read_to_string(output_path)?.contains("repair-response"));
         factory.validate_goal_receipts(&task.goal_id, true)?;
         Ok(())
     }

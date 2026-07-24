@@ -158,6 +158,8 @@ New runtime crate.  Functions as the orchestration engine for the `Gear` agent.
 
 ### Key modules
 
+> **历史库存，不是当前生产 worker contract。** 本表保留 GBX-257/285 之前的兼容实现和迁移背景；严格生产路径以本文件末尾的 GBX-257、GBX-285 及后续 ACP-only 记录为准，不能据此恢复 command transport、模型 fallback、native substitute、`.gearbox-agent` receipt 或 stale timeout 对 ACP 的本地截断。
+
 | Module | Purpose |
 |--------|---------|
 | `runtime.rs` | `Orchestrator::run()` — goal-pursuit loop: spec→plan→worker session→verify→provider review→repair/replan. Sync, runs on `background_spawn`. `DEFAULT_MAX_ITERATIONS=5` and `DEFAULT_MAX_RUNTIME_MINUTES=60`, aligned with the Gear runtime MVP budget in `docs/gearbox-gear-agent-plan.md`, and the runtime now also wires explicit `max_child_depth=1` and `max_provider_unknown_streak=2` budgets for child-loop nesting and inconclusive provider-review streaks. Context-risk signals are now collected from worker stdout/stderr/last_message/result/outcome artifacts and per-attempt history as well as summary strings, and repeated worker output summaries now count as a no-progress signal, so token/context guard is no longer limited to heuristic review text alone. The final completion branch now also checks `context_guard_reason()` so token-limit/context-compaction/session-reliability warnings prevent a premature completion claim. `append_completion_notification()` now also records `notification_failed_epoch` on delivery failure via `record_completion_notification_failed_epoch()`, so a failed popup/ledger write leaves a durable retry marker. Accepts `coordinator_model`/`coordinator_brief`. `CoordinatorReviewInput` includes task id, worker kind/model/category/route reason, attempt index/count, failure kind, retry reason, fallback history, worker outcome, commands, failures, outcome path, iteration budget summary, and `no_progress_signals`. `CoordinatorReview` records optional `route_hint` and `stop_reason`; `STOP_REASON` can conservatively stop as needs_user/blocked/limited but cannot override failed verification as complete. Runtime events and goal review artifacts include worker model when configured, and goal review artifacts now surface a dedicated no-progress section so stagnation evidence stays visible in the recorded loop history. `evaluate_goal()` consumes TaskManager terminal metadata: `NoFallbackRoute` / `RepeatedFailureLimit` / `PremiumBudgetExceeded` -> limited, required worker unavailable/start failure -> needs_user. When provider review returns `ROUTE_HINT=review` without affirming completion, GoalLoop now schedules an independent review iteration instead of auto-completing after verification passes; the next worker prompt switches from repair wording to independent-review wording. Verification-passed `GOAL_SATISFIED=unknown` no longer auto-completes: the first inconclusive review continues the loop, and repeated inconclusive reviews escalate to `review` or `needs_user`. Repeated same `failure_kind` also escalates route selection (`repair/explore -> deep -> review`) before the loop gives up. Repair/review task creation now stamps `parent_task_id` so TaskManager can walk descendant trees for cancel/interrupt. Final report generation also now depends on the runtime-collected task evidence chain, not only summary strings. |
@@ -229,6 +231,21 @@ to the existing response contract. Objective mode also preserves a user
 continuation stop instead of clearing it automatically. Upstream merges must
 keep this branch conditional and must not make ObjectiveGraph a dependency of
 the non-Gear agent path.
+
+### 2026-07-23 External Luna/Flash phase contract
+
+`crates/agent/src/agent.rs` now treats the explicit Gear Luna/Flash phase
+profile as a strict external-worker contract. The three role models must all
+be present and match the fixed route: `openai/gpt-5.6-luna` for read-only
+planning/review and `opencode/deepseek-v4-flash-free` for execution/repair.
+The GUI refuses incomplete or invalid profiles instead of silently falling
+back to legacy routing, requires serial worker limits, and does not require a
+placeholder Zed host model when every selected phase is external. `Codex` and
+`OpencodeSession` provider workers go through their command adapters rather
+than creating a Zed-native subagent; Luna uses the read-only Codex sandbox.
+Workers without follow-up support receive a fresh repair session instead of a
+protocol-invalid follow-up request. This is intentionally Gear-only behavior;
+upstream non-Gear native-agent routing must remain unchanged.
 
 ### `[NEW]` `crates/agent/Cargo.toml`
 - `+dep: gearbox_agent`
@@ -913,3 +930,24 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - `fd013f7f56` 与本 fork 的既有 git graph 上下文菜单实现发生上游/上游语义冲突；仅移除行悬停预览并删除不存在的上游 `commit_context_menu` 导入，保留 Gearbox 现有菜单边界，修复提交为 `1f88ce3191`。
 - 验证：`cargo check -p git_ui --lib`、git graph 长提交回归测试、GPUI EXIF 回归测试、GPUI prompt 回归测试、`cargo check -p languages`、`cargo check -p search`、编辑器焦点光标回归测试均通过；主题 JSON 通过 `jq empty`。
 - 其余上游提交继续保留在候选队列，涉及 Gearbox 覆盖层或依赖未吸收的上游重构时不自动合入；下一轮应从新的 clean worktree 和本节记录继续逐项验证。
+
+### 2026-07-23 GBX-257 — External worker ACP transport boundary
+
+- `crates/gearbox_agent/src/workers.rs` 将 Codex、OpenCode、Claude 和 Custom 的生产 worker 统一为外部 ACP stdio session：依次完成 `initialize`、`session/new`、模型配置和 `session/prompt`，并保存协议 receipt。遗留 `codex exec`、`opencode run`、`claude -p` 与任意未声明 ACP server 的 Custom command 均在启动前 fail closed；ZedAgent 保持原生 ACP。
+- `crates/agent/src/agent.rs` 的 Gear route 默认命令改为 ACP server，并让所有外部 provider 都不能被 host-native broker 替代。共享 Agent 的普通对话路径、上游模型选择和 `.omo/**` 不变；新增的 route-table override 仅限测试，用于隔离本机严格模型环境。
+
+### 2026-07-24 GBX-285 — Canonical Luna/Flash ACP default route
+
+- `crates/gearbox_agent/src/{cli.rs,phase_routing.rs,open_code_phase_runtime.rs,workers.rs}`：产品默认 phase route 固定为 Luna 的 Codex ACP 只读规划/批评/审查与 DeepSeek Flash 的 OpenCode ACP 执行/修复；并发固定为每 worker/key 一条，不允许 CLI worker 序列、命令覆盖、模型覆盖、skip 或 paid/free fallback。模型 `session/set_config_option` 回包必须确认实际 `currentValue`，漂移立即 fail closed；生产 `ZedAgent` native dispatch 只保留显式测试后端入口。
+- `crates/agent/src/agent.rs`：Gear GUI 在无配置时使用同一 canonical route，旧的 phase、worker、命令、模型与 fallback 环境变量在进入运行时前拒绝；执行基线只保留 OpenCode Flash ACP，由 phase overlay 为 Luna 只读角色生成 Codex ACP command。普通上游 Agent 对话路径不变。
+- `crates/gearbox_agent/src/runtime.rs` 的外部 evidence-marker 诊断改为同时检查 worker-kind contract，只有外部 ACP 的 OpenCode session/Codex 需要该 marker；原生 Zed ACP 不再被错误送入 repair loop。
+- `crates/agent/src/tests/gearbox_e2e_tests.rs` 与 `crates/agent/src/agent.rs` 的测试 fixture 建立 git baseline、忽略 `.gear/`，并按内容而非目录遍历顺序定位 planner PlanGraph，避免环境/文件顺序造成假失败。
+
+### 2026-07-24 GBX-286 — Go DeepSeek Flash ACP self-dogfood hardening
+
+- `crates/gearbox_agent/src/{workers.rs,phase_routing.rs,cli.rs}`：canonical executor/repair model 固定为 OpenCode Go `opencode-go/deepseek-v4-flash`，不再选择免费 selector。生产合同仍只有 Luna Codex ACP 只读角色和 Flash OpenCode ACP 可写角色；任何 CLI、command、model、fallback 或 native substitute override 继续 fail closed。
+- `crates/gearbox_agent/src/{workers.rs,tools.rs}`：ACP 子进程通过独立 process group 和记录的 owned descendants 运行；session 结束时仅终止该 tree，并把结果写入 `acp-process-cleanup.json`。这覆盖可能由 ACP worker 派生的 rust-analyzer/proc-macro，不使用名称匹配或全局 `pkill`。
+- `crates/gearbox_agent/src/task_manager.rs`：Codex/OpenCode/Claude ACP session 的响应生命周期不再受 stale sweep 或 goal lease 请求 deadline 截断；`Streaming response failed` 只允许原 provider/model/command 的有界同路由重试。缺少 worker receipt 时由 Gear 在 `.gear/evidence` 生成 runtime receipt，worker prompt 不再要求修改受保护目录；step 回执可带 `step-002 — explanation` 说明而不会丢失 ID。
+- `crates/gearbox_agent/src/workers.rs`：OMO 内部 background concurrency 固定为 1，team 与 LSP 保持关闭，避免内部 fan-out 或语言服务器残留。Codex read-only ACP 使用隔离私有配置，不继承全局 MCP/plugin/LSP。
+- `crates/gearbox_agent/src/runtime.rs`：测试 PhaseRuntime 采用独立确定性 Oracle identity，避免单元测试在缺 hook 时意外向真实 ACP provider 发请求；这仅改变测试隔离，不改变生产 strict route。
+- 这些改动只收紧 Gearbox runtime 的 ACP 路径、资源边界和证据归属；上游普通 Agent 行为与 `.omo/**` 不变。

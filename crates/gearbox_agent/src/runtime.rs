@@ -62,8 +62,9 @@ use crate::workers::{
     CategoryResolution, CategoryResolutionResult, FallbackRoute, Intensity, SelectedWorkerRoute,
     WorkerCategory, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult, WorkerStartRequest,
     WorkerStatus, category_resolution_for_route, worker_continuation_evidence_from_result,
-    worker_claim_reconciliation_path, worker_receipt_evidence_paths, worker_route_is_premium,
-    worker_step_evidence_from_result, team_session_reconciliation_path,
+    worker_claim_reconciliation_path, worker_kind_supports_evidence_contract,
+    worker_receipt_evidence_paths, worker_route_is_premium, worker_step_evidence_from_result,
+    team_session_reconciliation_path,
 };
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
@@ -508,6 +509,14 @@ impl Default for PhaseRuntime {
     }
 }
 
+#[cfg(not(test))]
+fn validate_production_phase_runtime(phase_runtime: &PhaseRuntime) -> Result<()> {
+    phase_runtime
+        .routes
+        .validate_luna_flash_contract()
+        .context("Gear production execution requires the canonical Luna/Flash ACP phase contract")
+}
+
 fn build_broker_phase_request(
     phase_decision: &PhaseRouteDecision,
     goal_id: &str,
@@ -920,6 +929,21 @@ struct FinalReviewInputEvidence {
     execution_id: String,
     result_path: PathBuf,
     outcome_path: PathBuf,
+}
+
+fn resolve_worker_execution_id(
+    worker_session_id: Option<&str>,
+    attempts: &[TaskAttempt],
+) -> Option<String> {
+    worker_session_id
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.session_id.clone())
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -1438,6 +1462,9 @@ impl Orchestrator {
         options: RunOptions,
         phase_runtime: PhaseRuntime,
     ) -> Result<RunOutcome> {
+        #[cfg(not(test))]
+        validate_production_phase_runtime(&phase_runtime)?;
+
         Self::run_single_goal_with_phase_runtime(options, phase_runtime, None, None, None)
     }
 
@@ -1446,6 +1473,9 @@ impl Orchestrator {
         phase_runtime: PhaseRuntime,
         policy: ObjectivePolicy,
     ) -> Result<ObjectiveRunOutcome> {
+        #[cfg(not(test))]
+        validate_production_phase_runtime(&phase_runtime)?;
+
         run_objective_controller(options, phase_runtime, policy)
     }
 
@@ -2062,6 +2092,11 @@ impl Orchestrator {
         let mut diff_history: Vec<DiffSnapshot> = Vec::new();
         let mut verification_history: Vec<Vec<ShellCommandResult>> = Vec::new();
         let mut repair_request_history: Vec<String> = Vec::new();
+        // A worker-response warning is transport-quality feedback, not a
+        // repository defect.  Give the current task one bounded chance to
+        // improve its receipt, then carry any remaining warning as degraded
+        // evidence so it cannot consume the whole worker-call budget.
+        let mut worker_response_repair_requested = false;
         let mut worker_output_history: Vec<String> = Vec::new();
         let mut context_pressure_seen = false;
         let run_started_at = Instant::now();
@@ -2071,8 +2106,11 @@ impl Orchestrator {
         let budget_controller = BudgetController {
             max_iterations,
             max_files_changed: options.max_files_changed,
-            max_worker_calls: goal.budget.max_worker_calls,
-            max_premium_worker_calls: goal.budget.max_premium_worker_calls,
+            // ACP owns worker/provider resource budgets. Keep these
+            // counters for telemetry, but never use Gear's copy to block a
+            // worker dispatch.
+            max_worker_calls: usize::MAX,
+            max_premium_worker_calls: usize::MAX,
             max_same_failure_retries: 2,
             max_provider_unknown_streak: goal.budget.max_provider_unknown_streak,
             max_child_depth: options.max_child_depth,
@@ -3225,6 +3263,14 @@ impl Orchestrator {
             let worker_task_record = managed_worker_run.record;
             let iteration_worker_outcome = managed_worker_run.outcome;
             let iteration_worker_result = managed_worker_run.result;
+            // ACP adapters may persist the provider session on the task
+            // attempt before the normalized WorkerOutcome is written. Keep
+            // the real provider execution identity for the later Luna
+            // review binding instead of falling back to the Gear task id.
+            let worker_execution_id = resolve_worker_execution_id(
+                worker_session_id.as_deref(),
+                &worker_task_record.attempts,
+            );
             let iteration_worker_result_for_risk = iteration_worker_result.clone();
             if let Some(session_id) = worker_session_id.clone() {
                 let binding = crate::state::PlanNodeSessionBinding {
@@ -3499,7 +3545,7 @@ impl Orchestrator {
             )?;
             if worker_route_hint != Some("review") {
                 last_executor_evidence = Some(FinalReviewInputEvidence {
-                    execution_id: worker_session_id
+                    execution_id: worker_execution_id
                         .clone()
                         .unwrap_or_else(|| worker_task_id.clone()),
                     result_path: iteration_worker_result.result_path.clone(),
@@ -3861,9 +3907,20 @@ impl Orchestrator {
                 &iteration_worker_result,
                 &iteration_worker_outcome,
                 selected_route.category,
+                selected_route.worker_kind,
                 &observed_diff_hash,
                 route_attempt,
             )?);
+            if worker_response_repair_requested {
+                for diagnostic in post_write_diagnostics
+                    .iter_mut()
+                    .filter(|diagnostic| diagnostic.checker == "worker_response")
+                {
+                    diagnostic.origin = "degraded".to_string();
+                    diagnostic.status = "degraded".to_string();
+                    diagnostic.fresh = false;
+                }
+            }
             let diagnostic_status = if post_write_diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.fresh)
@@ -3880,6 +3937,11 @@ impl Orchestrator {
                 } else {
                     "disabled"
                 }
+            } else if post_write_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.origin == "degraded")
+            {
+                "degraded"
             } else {
                 "pre_existing"
             };
@@ -4488,6 +4550,12 @@ impl Orchestrator {
                     ),
                 )?;
                 repair_request_history.extend(fresh_soft_diagnostic_signatures);
+                if post_write_diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.checker == "worker_response")
+                {
+                    worker_response_repair_requested = true;
+                }
                 append_event(
                     &store,
                     &options.event_sink,
@@ -4939,26 +5007,6 @@ impl Orchestrator {
                 "plan_checks_path": final_verification_plan_path.to_string_lossy(),
             }),
         )?;
-        let final_report_path = store.artifact_dir(&goal_id).join("final-report.md");
-        complete_task(&mut tasks, &report_task_id, |task| {
-            task.outputs.summary = "Final report artifact created.".to_string();
-            task.outputs
-                .evidence
-                .push(final_report_path.to_string_lossy().to_string());
-        });
-        let final_report = format!(
-            "{}\n\n{}",
-            product::final_report(
-                &goal,
-                &tasks,
-                &worker_result,
-                &after_diff,
-                &scope_check,
-                &verification_results,
-            ),
-            final_verification_wave_markdown(&final_wave_receipt),
-        );
-        let final_report_path = store.write_artifact(&goal_id, "final-report.md", &final_report)?;
         let mut strategist_prior_execution_ids = Vec::new();
         if let Some(planner_session_id) = plan_graph
             .planner
@@ -4982,10 +5030,31 @@ impl Orchestrator {
         {
             // Final verification is the hard completion boundary consumed by
             // StrategistNextGoal. Normalize an intermediate loop status before
-            // validating Complete/NeedsUser strategist decisions.
+            // writing the final report and validating Complete/NeedsUser
+            // strategist decisions.
             goal.status = GoalStatus::Complete;
             goal.updated_at = timestamp();
         }
+        let final_report_path = store.artifact_dir(&goal_id).join("final-report.md");
+        complete_task(&mut tasks, &report_task_id, |task| {
+            task.outputs.summary = "Final report artifact created.".to_string();
+            task.outputs
+                .evidence
+                .push(final_report_path.to_string_lossy().to_string());
+        });
+        let final_report = format!(
+            "{}\n\n{}",
+            product::final_report(
+                &goal,
+                &tasks,
+                &worker_result,
+                &after_diff,
+                &scope_check,
+                &verification_results,
+            ),
+            final_verification_wave_markdown(&final_wave_receipt),
+        );
+        let final_report_path = store.write_artifact(&goal_id, "final-report.md", &final_report)?;
         let strategist_receipt = if goal.status.is_terminal() {
             run_strategist_next_goal(
                 &mut goal,
@@ -5015,6 +5084,22 @@ impl Orchestrator {
             // parent of the user-answer epoch.
             goal.status = GoalStatus::Complete;
             goal.updated_at = timestamp();
+            // Strategist receives the pre-decision report, but the terminal
+            // normalization above changes the authoritative goal status. Keep
+            // the persisted report aligned with that final status.
+            let final_report = format!(
+                "{}\n\n{}",
+                product::final_report(
+                    &goal,
+                    &tasks,
+                    &worker_result,
+                    &after_diff,
+                    &scope_check,
+                    &verification_results,
+                ),
+                final_verification_wave_markdown(&final_wave_receipt),
+            );
+            store.write_artifact(&goal_id, "final-report.md", &final_report)?;
         }
         lineage.active_task_ids.clear();
         if goal.status == GoalStatus::Complete {
@@ -5600,7 +5685,6 @@ fn run_objective_controller(
         ensure_objective_epoch_reservation(
             &store,
             &objective_lease,
-            &graph,
             &active_node,
             &policy,
             &options.budget.clone().unwrap_or_default(),
@@ -5947,26 +6031,6 @@ fn run_objective_controller(
                     )?;
                     break;
                 }
-                let (calls, tokens, cost, unknown_calls) = objective_budget_totals(&store, &graph)?;
-                if calls >= policy.max_calls
-                    || tokens >= policy.max_tokens
-                    || (policy.max_cost_micros != u64::MAX && cost >= policy.max_cost_micros)
-                    || unknown_calls >= policy.max_unknown_usage_calls
-                {
-                    let reason = format!(
-                        "objective budget exhausted: calls={calls}, tokens={tokens}, cost_micros={cost}, unknown_calls={unknown_calls}"
-                    );
-                    graph.set_terminal(ObjectiveStatus::Limited, reason.to_string())?;
-                    store.write_objective_graph(&graph)?;
-                    append_objective_terminal_event(
-                        &store,
-                        &objective_id,
-                        &ObjectiveStatus::Limited,
-                        &reason,
-                        &outcome.goal_id,
-                    )?;
-                    break;
-                }
                 if policy.cooldown_seconds > 0
                     && cooldown_remaining_seconds(&graph.updated_at, policy.cooldown_seconds)? > 0
                 {
@@ -6022,20 +6086,10 @@ fn run_objective_controller(
                 let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
                 let child_session_id = format!("{root_session_id}.epoch{child_index}");
                 let child_budget = options.budget.clone().unwrap_or_default();
-                let reserved_calls = child_budget
-                    .max_calls_per_epoch
-                    .min(policy.max_calls.saturating_sub(calls));
-                let reserved_tokens = child_budget
-                    .max_tokens_per_epoch
-                    .min(policy.max_tokens.saturating_sub(tokens));
-                let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
-                    u64::MAX
-                } else {
-                    policy.max_cost_micros.saturating_sub(cost)
-                };
-                let reserved_unknown_calls = child_budget
-                    .max_usage_unknown_calls
-                    .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+                let reserved_calls = child_budget.max_calls_per_epoch;
+                let reserved_tokens = child_budget.max_tokens_per_epoch;
+                let reserved_cost_micros = child_budget.max_cost_micros_per_epoch;
+                let reserved_unknown_calls = child_budget.max_usage_unknown_calls;
                 let reservation_id = format!("epoch:{child_epoch_id}");
                 store.reserve_objective_epoch(
                     &objective_lease,
@@ -6583,23 +6637,10 @@ fn reconcile_objective_frontier(
     )?;
     let objective_lease = objective_lease
         .context("objective recovery requires a live objective lease before child reservation")?;
-    let (calls, tokens, cost, unknown_calls) = objective_budget_totals(store, graph)?;
-    let reserved_calls = budget
-        .max_calls_per_epoch
-        .min(policy.max_calls.saturating_sub(calls));
-    let reserved_tokens = budget
-        .max_tokens_per_epoch
-        .min(policy.max_tokens.saturating_sub(tokens));
-    let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
-        budget.max_cost_micros_per_epoch
-    } else {
-        budget
-            .max_cost_micros_per_epoch
-            .min(policy.max_cost_micros.saturating_sub(cost))
-    };
-    let reserved_unknown_calls = budget
-        .max_usage_unknown_calls
-        .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+    let reserved_calls = budget.max_calls_per_epoch;
+    let reserved_tokens = budget.max_tokens_per_epoch;
+    let reserved_cost_micros = budget.max_cost_micros_per_epoch;
+    let reserved_unknown_calls = budget.max_usage_unknown_calls;
     let reservation_id = format!("epoch:{child_epoch_id}");
     store.reserve_objective_epoch(
         objective_lease,
@@ -6847,35 +6888,14 @@ fn promote_final_review_blocker_child(
     }) {
         return Ok(FinalReviewBlockerDecision::Promoted);
     }
-    let (calls, tokens, cost, unknown_calls) = objective_budget_totals(store, graph)?;
-    if calls >= policy.max_calls
-        || tokens >= policy.max_tokens
-        || (policy.max_cost_micros != u64::MAX && cost >= policy.max_cost_micros)
-        || unknown_calls >= policy.max_unknown_usage_calls
-    {
-        return Ok(FinalReviewBlockerDecision::NotPromoted);
-    }
     let child_index = graph.nodes.len();
     let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
     let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
     let child_session_id = format!("{root_session_id}.epoch{child_index}");
-    let reserved_calls = budget
-        .max_calls_per_epoch
-        .min(policy.max_calls.saturating_sub(calls));
-    let reserved_tokens = budget
-        .max_tokens_per_epoch
-        .min(policy.max_tokens.saturating_sub(tokens));
-    let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
-        u64::MAX
-    } else {
-        policy.max_cost_micros.saturating_sub(cost)
-    };
-    let reserved_unknown_calls = budget
-        .max_usage_unknown_calls
-        .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
-    if reserved_calls == 0 || reserved_tokens == 0 || reserved_unknown_calls == 0 {
-        return Ok(FinalReviewBlockerDecision::NotPromoted);
-    }
+    let reserved_calls = budget.max_calls_per_epoch;
+    let reserved_tokens = budget.max_tokens_per_epoch;
+    let reserved_cost_micros = budget.max_cost_micros_per_epoch;
+    let reserved_unknown_calls = budget.max_usage_unknown_calls;
     let reservation_id = format!("epoch:{child_epoch_id}");
     store.reserve_objective_epoch(
         objective_lease,
@@ -7593,6 +7613,7 @@ fn status_name(status: &ObjectiveStatus) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn objective_budget_totals(
     store: &StateStore,
     graph: &ObjectiveGraph,
@@ -7640,6 +7661,7 @@ fn objective_budget_totals(
     objective_budget_totals_from_goal_ledgers(store, graph)
 }
 
+#[cfg(test)]
 fn objective_budget_totals_from_goal_ledgers(
     store: &StateStore,
     graph: &ObjectiveGraph,
@@ -7685,29 +7707,15 @@ fn objective_budget_totals_from_goal_ledgers(
 fn ensure_objective_epoch_reservation(
     store: &StateStore,
     lease: &crate::state::ObjectiveLeaseGuard,
-    graph: &ObjectiveGraph,
     active_node: &GoalGraphNode,
     policy: &ObjectivePolicy,
     budget: &Budget,
     reservation_id: &str,
 ) -> Result<()> {
-    let (calls, tokens, cost, unknown_calls) = objective_budget_totals(store, graph)?;
-    let reserved_calls = budget
-        .max_calls_per_epoch
-        .min(policy.max_calls.saturating_sub(calls));
-    let reserved_tokens = budget
-        .max_tokens_per_epoch
-        .min(policy.max_tokens.saturating_sub(tokens));
-    let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
-        budget.max_cost_micros_per_epoch
-    } else {
-        budget
-            .max_cost_micros_per_epoch
-            .min(policy.max_cost_micros.saturating_sub(cost))
-    };
-    let reserved_unknown_calls = budget
-        .max_usage_unknown_calls
-        .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+    let reserved_calls = budget.max_calls_per_epoch;
+    let reserved_tokens = budget.max_tokens_per_epoch;
+    let reserved_cost_micros = budget.max_cost_micros_per_epoch;
+    let reserved_unknown_calls = budget.max_usage_unknown_calls;
     store.reserve_objective_epoch(
         lease,
         reservation_id,
@@ -11179,17 +11187,29 @@ fn phase_route_receipt_for_worker(
             (PhaseBackend::LegacyCategory, PhaseModelBinding::None) => {
                 (ModelBindingStatus::LegacyUnverified, None)
             }
-            (PhaseBackend::Worker(_), PhaseModelBinding::None) => {
+            (PhaseBackend::Worker(_) | PhaseBackend::CodexAcp, PhaseModelBinding::None) => {
                 (ModelBindingStatus::LegacyUnverified, None)
             }
             (PhaseBackend::Worker(_), PhaseModelBinding::BackendDeclared(model)) => {
-                // The declared model is the preferred route, not an
-                // invariant that may block recovery.  OpenCode/OMO may move
-                // a worker to a configured fallback (or a repaired session
-                // may be resumed by another available model).  Preserve the
-                // actual model in the receipt for audit, but let review decide
-                // whether the fallback affected quality.
-                let _model_changed = last_attempt.worker_model.as_deref() != Some(model.as_str());
+                if decision.requires_luna_flash_contract()
+                    && last_attempt.worker_model.as_deref() != Some(model.as_str())
+                {
+                    bail!(
+                        "strict Luna/Flash worker model drifted from `{model}` to `{}`",
+                        last_attempt.worker_model.as_deref().unwrap_or("missing")
+                    );
+                }
+                (ModelBindingStatus::DeclaredUnverified, None)
+            }
+            (PhaseBackend::CodexAcp, PhaseModelBinding::BackendDeclared(model)) => {
+                if decision.requires_luna_flash_contract()
+                    && last_attempt.worker_model.as_deref() != Some(model.as_str())
+                {
+                    bail!(
+                        "strict Luna/Flash worker model drifted from `{model}` to `{}`",
+                        last_attempt.worker_model.as_deref().unwrap_or("missing")
+                    );
+                }
                 (ModelBindingStatus::DeclaredUnverified, None)
             }
             (
@@ -13707,9 +13727,15 @@ fn parse_review_receipt(output: &str) -> Option<ReviewReceiptPayload> {
     if let Ok(receipt) = serde_json::from_str(json) {
         return Some(receipt);
     }
+    if let Some(receipt) = parse_review_receipt_fragment(json) {
+        return Some(receipt);
+    }
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         if let Ok(receipt) = serde_json::from_str::<ReviewReceiptPayload>(line) {
+            return Some(receipt);
+        }
+        if let Some(receipt) = parse_review_receipt_fragment(line) {
             return Some(receipt);
         }
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -13720,6 +13746,12 @@ fn parse_review_receipt(output: &str) -> Option<ReviewReceiptPayload> {
         }
     }
     None
+}
+
+fn parse_review_receipt_fragment(output: &str) -> Option<ReviewReceiptPayload> {
+    output
+        .match_indices('{')
+        .find_map(|(offset, _)| serde_json::from_str(&output[offset..]).ok())
 }
 
 fn parse_review_receipt_value(value: &serde_json::Value) -> Option<ReviewReceiptPayload> {
@@ -13809,7 +13841,10 @@ impl Default for BudgetController {
         Self {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_files_changed: usize::MAX,
-            max_worker_calls: DEFAULT_MAX_ITERATIONS,
+            // ACP workers own provider-side call/token/cost limits. Gear's
+            // controller only keeps the counter for telemetry unless an
+            // explicit test or embedding supplies a finite guard.
+            max_worker_calls: usize::MAX,
             max_premium_worker_calls: usize::MAX,
             max_same_failure_retries: 2,
             max_provider_unknown_streak: 2,
@@ -14843,7 +14878,10 @@ struct PostWriteFeedbackReceipt {
 }
 
 const MAX_POST_WRITE_DIAGNOSTICS: usize = 64;
-const MAX_WORKER_RESPONSE_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+// ACP providers own response/context lifetime.  This bound is only for the
+// diagnostic snapshot, so keep it well above ordinary model reports and do
+// not mistake a locally truncated diagnostic read for a provider truncation.
+const MAX_WORKER_RESPONSE_DIAGNOSTIC_BYTES: usize = 256 * 1024;
 
 fn comment_check(
     workspace: &std::path::Path,
@@ -15321,6 +15359,11 @@ fn diagnostic_delta_status(
         .any(|diagnostic| diagnostic.origin == "resolved")
     {
         "resolved"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.origin == "degraded")
+    {
+        "degraded"
     } else if baseline.status == "unavailable" {
         "degraded"
     } else {
@@ -15467,6 +15510,7 @@ fn worker_response_diagnostics(
     result: &WorkerResult,
     outcome: &WorkerOutcome,
     category: WorkerCategory,
+    worker_kind: WorkerKind,
     diff_hash: &str,
     attempt: usize,
 ) -> Result<Vec<PostWriteDiagnostic>> {
@@ -15564,6 +15608,7 @@ fn worker_response_diagnostics(
         && text.contains("reviewed_execution_id")
         && text.contains("dimensions");
     if category.requires_evidence_receipt()
+        && worker_kind_supports_evidence_contract(worker_kind.as_str())
         && !review_response_shape
         && !text.lines().any(|line| {
             line.split_once("EVIDENCE_RECORDED:")
@@ -15659,6 +15704,15 @@ fn worker_claim_reconciliation_diagnostic(
     // review into a fresh repair blocker.  A real claim/observation mismatch
     // remains an error and is handled below.
     if receipt.status == "unverified" && receipt.claimed_changed_files.is_empty() {
+        return None;
+    }
+    // Temporary dogfood workspaces are often deliberately created without a
+    // Git repository.  Their scope is still checked by Gear's immutable
+    // baseline/per-file attribution, so the absence of `git status` is not a
+    // fresh worker defect that should trigger a repair loop.
+    if receipt.status == "unverified"
+        && receipt.reason.as_deref() == Some("workspace is not a Git repository")
+    {
         return None;
     }
     let reason = receipt
@@ -16774,6 +16828,38 @@ mod tests {
     use crate::workers::{WorkerKind, WorkerResult, WorkerStatus};
 
     #[test]
+    fn worker_execution_id_uses_acp_attempt_when_outcome_session_is_missing() {
+        let attempts = vec![TaskAttempt {
+            attempt: 1,
+            worker_kind: "opencode_session".to_string(),
+            worker_command: Some("opencode acp".to_string()),
+            worker_model: Some("opencode-go/deepseek-v4-flash".to_string()),
+            worker_category: "deep".to_string(),
+            route_hint: Some("deep".to_string()),
+            route_reason: "ACP executor".to_string(),
+            status: TaskAttemptStatus::Completed,
+            started_at: "now".to_string(),
+            finished_at: Some("now".to_string()),
+            session_id: Some("ses_executor".to_string()),
+            result_path: None,
+            outcome_path: None,
+            summary: "completed".to_string(),
+            failure_kind: None,
+            retry_reason: None,
+            error: None,
+        }];
+
+        assert_eq!(
+            resolve_worker_execution_id(None, &attempts).as_deref(),
+            Some("ses_executor")
+        );
+        assert_eq!(
+            resolve_worker_execution_id(Some("ses_outcome"), &attempts).as_deref(),
+            Some("ses_outcome")
+        );
+    }
+
+    #[test]
     fn plan_revision_evidence_refs_are_bounded_and_keep_required_bindings() {
         let mut references = vec![
             "critic-receipt:required".to_string(),
@@ -17472,8 +17558,12 @@ mod tests {
             planner: Some(phase_identity("planner")),
             intent_fold_hook: None,
             planner_hook: None,
-            plan_critic_hook: critic_hook,
-            oracle_hook: None,
+            plan_critic_hook: critic_hook.clone(),
+            oracle_hook: critic_hook.as_ref().map(|_| {
+                Arc::new(|input: PlanCriticInput| {
+                    plan_critic_submission(&input, 2, PlanCriticDecision::Approve)
+                }) as PlanCriticHook
+            }),
             plan_revision_hook: None,
             strategist_next_goal_hook: None,
             require_plan_approval: true,
@@ -20326,10 +20416,10 @@ mod tests {
         });
         blocked_options.worker.worker_command =
             Some(format!("touch {}", blocked_marker.to_string_lossy()));
-        let budget_error = Orchestrator::run(blocked_options)
-            .expect_err("token reservation must block before worker launch");
-        assert!(budget_error.to_string().contains("token budget"));
-        assert!(!blocked_marker.exists());
+        let blocked_outcome = Orchestrator::run(blocked_options)
+            .expect("provider-owned worker budget must not block dispatch");
+        assert_eq!(blocked_outcome.status, GoalStatus::Complete);
+        assert!(blocked_marker.exists());
         let store = StateStore::new(temp_dir.path());
         let mut persisted_route_receipt = None;
         for entry in fs::read_dir(store.phase_routes_dir(&outcome.goal_id))? {
@@ -21325,6 +21415,7 @@ mod tests {
             &result,
             &outcome,
             WorkerCategory::Deep,
+            WorkerKind::OpencodeSession,
             "diff-hash",
             1,
         )?;
@@ -21389,6 +21480,7 @@ mod tests {
             &result,
             &outcome,
             WorkerCategory::Deep,
+            WorkerKind::OpencodeSession,
             "diff-hash",
             3,
         )?;
@@ -21434,6 +21526,7 @@ mod tests {
             &result,
             &outcome,
             WorkerCategory::Deep,
+            WorkerKind::ZedAgent,
             "diff-hash",
             2,
         )?;
@@ -21476,7 +21569,58 @@ mod tests {
             command: None,
             exit_code: Some(0),
         };
-        assert!(worker_response_diagnostics(&result, &outcome, WorkerCategory::Deep, "diff", 1)?.is_empty());
+        assert!(worker_response_diagnostics(
+            &result,
+            &outcome,
+            WorkerCategory::Deep,
+            WorkerKind::OpencodeSession,
+            "diff",
+            1,
+        )?
+        .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn native_zed_worker_response_does_not_require_external_evidence_marker() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let last_message_path = temp_dir.path().join("last-message.md");
+        std_fs::write(&last_message_path, "Summary\n\nCompleted the requested work.\n")?;
+        let result = WorkerResult {
+            status: WorkerStatus::Succeeded,
+            command: Some("zed-agent-native".to_string()),
+            exit_code: None,
+            summary: "done".to_string(),
+            packet_path: temp_dir.path().join("packet.json"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: Some(last_message_path),
+            result_path: temp_dir.path().join("result.json"),
+            outcome_path: temp_dir.path().join("outcome.json"),
+        };
+        let outcome = WorkerOutcome {
+            status: WorkerStatus::Succeeded,
+            session_id: Some("native-session".to_string()),
+            session_capability: None,
+            summary: "done".to_string(),
+            changed_files: Vec::new(),
+            commands_run: vec!["npm run build".to_string()],
+            known_failures: Vec::new(),
+            raw_output_path: None,
+            command: result.command.clone(),
+            exit_code: None,
+        };
+
+        assert!(worker_response_diagnostics(
+            &result,
+            &outcome,
+            WorkerCategory::Deep,
+            WorkerKind::ZedAgent,
+            "diff",
+            1,
+        )?
+        .is_empty());
         Ok(())
     }
 
@@ -22194,7 +22338,7 @@ mod tests {
         };
         let summary = budget_summary(&budget, &snapshot, 2, 1, 3, 4);
 
-        assert!(summary.contains("worker_calls=3/5"));
+        assert!(summary.contains("worker_calls=3/unbounded"));
         assert!(summary.contains("attempts=5"));
         assert!(summary.contains("same_failure_retries=1/2"));
         assert!(summary.contains("token limit"));
@@ -22552,6 +22696,26 @@ mod tests {
         let output = format!("{}\n# completed_steps\n- step-001\n", receipt);
         let parsed = parse_review_receipt(&output).expect("embedded JSON receipt should parse");
         assert_eq!(parsed.reviewed_execution_id, "executor-report");
+        assert_eq!(parsed.dimensions.len(), 4);
+    }
+
+    #[test]
+    fn review_receipt_parser_accepts_json_appended_to_worker_thought_text() {
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "reviewed_execution_id": "executor-appended",
+            "dimensions": [
+                {"dimension": "goal_verification", "verdict": "pass", "findings": ["ok"]},
+                {"dimension": "code_quality", "verdict": "pass", "findings": ["ok"]},
+                {"dimension": "security", "verdict": "pass", "findings": ["ok"]},
+                {"dimension": "qa_execution", "verdict": "pass", "findings": ["ok"]}
+            ]
+        });
+        let output = format!("**Resolving JSON output shape conflict**{}", receipt);
+
+        let parsed = parse_review_receipt(&output)
+            .expect("receipt appended to worker thought text should parse");
+        assert_eq!(parsed.reviewed_execution_id, "executor-appended");
         assert_eq!(parsed.dimensions.len(), 4);
     }
 
@@ -24830,66 +24994,16 @@ mod tests {
     }
 
     #[test]
-    fn objective_production_gap_repro() -> Result<()> {
-        let cli_runtime = PhaseRuntime::legacy();
+    fn production_phase_runtime_contract_rejects_legacy_routes() -> Result<()> {
+        let legacy_runtime = PhaseRuntime::legacy();
+        let error = legacy_runtime
+            .routes
+            .validate_luna_flash_contract()
+            .expect_err("legacy routes must not be accepted for production execution");
         assert!(
-            cli_runtime.broker_factory.is_none(),
-            "CLI objective path uses PhaseRuntime::legacy() which lacks broker_factory"
-        );
-        assert!(
-            cli_runtime.broker.is_none(),
-            "CLI objective path uses PhaseRuntime::legacy() which lacks broker"
-        );
-        let cli_routes_hash = cli_runtime.routes.hash()?;
-        let legacy_routes_hash = PhaseRouteTable::legacy_defaults().hash()?;
-        assert_eq!(
-            cli_routes_hash, legacy_routes_hash,
-            "CLI objective path routes must be legacy_defaults"
-        );
-
-        let profiles = crate::phase_routing::OpenCodeModelProfiles {
-            planner: "openai/gpt-planner".to_string(),
-            executor: "deepseek/flash".to_string(),
-            reviewer: "openai/gpt-reviewer".to_string(),
-        };
-        let gui_routes = PhaseRouteTable::opencode_only(profiles)?;
-        let gui_routes_hash = gui_routes.hash()?;
-        assert_ne!(
-            cli_routes_hash, gui_routes_hash,
-            "CLI legacy routes must differ from GUI opencode_only production routes"
-        );
-
-        let temp_dir = tempfile::tempdir()?;
-        let backend = Arc::new(ts::FakeNativeWorkerBackend::new());
-        let registry = Arc::new(crate::workers::WorkerRegistry::with_native_backend(backend));
-        let broker_factory = Arc::new(crate::worker_broker::PhaseBrokerFactory::new(
-            registry,
-            temp_dir.path().join(".gearbox-agent"),
-        ));
-        let gui_runtime = PhaseRuntime {
-            routes: gui_routes,
-            inventory: LiveModelInventory::default(),
-            current_model: None,
-            planner: None,
-            intent_fold_hook: None,
-            planner_hook: None,
-            plan_critic_hook: None,
-            oracle_hook: None,
-            plan_revision_hook: None,
-            strategist_next_goal_hook: None,
-            require_plan_approval: false,
-            max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
-            broker: None,
-            broker_factory: Some(broker_factory),
-            direct_model_usage_provider: None,
-        };
-        assert!(
-            gui_runtime.broker_factory.is_some(),
-            "GUI production path must have broker_factory"
-        );
-        assert_ne!(
-            cli_runtime.routes, gui_runtime.routes,
-            "CLI and GUI PhaseRuntime routes must not be equivalent"
+            error
+                .to_string()
+                .contains("does not request the strict Luna/Flash contract")
         );
         Ok(())
     }
@@ -25332,7 +25446,11 @@ mod tests {
                 max_iterations: 2,
                 max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
                 max_child_depth: usize::MAX,
-                max_runtime_minutes: 1,
+                // This test exercises objective-ledger settlement, not the
+                // wall-clock lease guard. Keep the fixture independent of
+                // host scheduling and slow debug builds while retaining a
+                // finite lease duration accepted by the state layer.
+                max_runtime_minutes: 10,
                 budget: None,
                 coordinator_model: None,
                 coordinator_brief: None,
@@ -25404,62 +25522,10 @@ mod tests {
     }
 
     #[test]
-    fn objective_cli_profile_assertion() -> Result<()> {
-        let cli_runtime = PhaseRuntime::legacy();
-        assert!(
-            cli_runtime.broker_factory.is_none(),
-            "CLI --objective path must not have broker_factory (legacy is not production)"
-        );
-        assert!(
-            cli_runtime.broker.is_none(),
-            "CLI --objective path must not have broker (legacy is not production)"
-        );
-
-        let profiles = crate::phase_routing::OpenCodeModelProfiles {
-            planner: "openai/gpt-planner".to_string(),
-            executor: "deepseek/flash".to_string(),
-            reviewer: "openai/gpt-reviewer".to_string(),
-        };
-        let production_routes = PhaseRouteTable::opencode_only(profiles)?;
-        let production_routes_hash = production_routes.hash()?;
-        let cli_routes_hash = cli_runtime.routes.hash()?;
-        assert_ne!(
-            cli_routes_hash, production_routes_hash,
-            "CLI legacy routes must differ from OpenCode production routes"
-        );
-
-        let temp_dir = tempfile::tempdir()?;
-        let backend = Arc::new(ts::FakeNativeWorkerBackend::new());
-        let registry = Arc::new(crate::workers::WorkerRegistry::with_native_backend(backend));
-        let broker_factory = Arc::new(crate::worker_broker::PhaseBrokerFactory::new(
-            registry,
-            temp_dir.path().join(".gearbox-agent"),
-        ));
-        let production_runtime = PhaseRuntime {
-            routes: production_routes,
-            inventory: LiveModelInventory::default(),
-            current_model: None,
-            planner: None,
-            intent_fold_hook: None,
-            planner_hook: None,
-            plan_critic_hook: None,
-            oracle_hook: None,
-            plan_revision_hook: None,
-            strategist_next_goal_hook: None,
-            require_plan_approval: false,
-            max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
-            broker: None,
-            broker_factory: Some(broker_factory),
-            direct_model_usage_provider: None,
-        };
-        assert!(
-            production_runtime.broker_factory.is_some(),
-            "production PhaseRuntime for --objective + OpenCode profile requires Gear-owned broker_factory"
-        );
-        assert!(
-            cli_runtime.broker_factory.is_none(),
-            "PhaseRuntime::legacy() is NOT production"
-        );
+    fn production_phase_runtime_contract_accepts_canonical_routes() -> Result<()> {
+        let mut canonical_runtime = PhaseRuntime::legacy();
+        canonical_runtime.routes = PhaseRouteTable::canonical_luna_flash()?;
+        canonical_runtime.routes.validate_luna_flash_contract()?;
         Ok(())
     }
 
@@ -25917,6 +25983,24 @@ mod tests {
             Some(expected_sha.as_str()),
             "receipt sha256 must match on-disk evidence"
         );
+
+        let mut codex_decision = decision.clone();
+        codex_decision.candidate.backend = PhaseBackend::CodexAcp;
+        codex_decision.worker_kind = Some(WorkerKind::Codex);
+        let mut codex_task_record = task_record.clone();
+        codex_task_record.worker_kind = WorkerKind::Codex.as_str().to_string();
+        codex_task_record.attempts[0].worker_kind = WorkerKind::Codex.as_str().to_string();
+        let codex_receipt = phase_route_receipt_for_worker(
+            &codex_decision,
+            2,
+            goal_id,
+            &plan,
+            managed_task_id,
+            Some("worker-session-073"),
+            &codex_task_record,
+            &store,
+        )?;
+        assert_eq!(codex_receipt.binding_status, ModelBindingStatus::LegacyUnverified);
 
         Ok(())
     }

@@ -1399,7 +1399,7 @@ fn parse_status_paths(status: &str) -> Vec<String> {
         .collect()
 }
 
-fn cancellable_shell_command(command: &str) -> StdCommand {
+pub(crate) fn cancellable_shell_command(command: &str) -> StdCommand {
     if cfg!(windows) {
         let mut process = StdCommand::new("cmd");
         process.args(["/C", command]);
@@ -1422,7 +1422,7 @@ fn cancellable_shell_command(command: &str) -> StdCommand {
     }
 }
 
-fn terminate_command_process_group(
+pub(crate) fn terminate_command_process_group(
     child: &mut Child,
     owned_processes: &OwnedProcessTree,
     cleanup_artifact_path: Option<&Path>,
@@ -1494,7 +1494,7 @@ fn terminate_command_process_group(
 }
 
 #[derive(Debug, Default)]
-struct OwnedProcessTree {
+pub(crate) struct OwnedProcessTree {
     root_pid: u32,
     #[cfg(target_os = "linux")]
     root_identity: Option<LinuxProcessIdentity>,
@@ -1503,7 +1503,7 @@ struct OwnedProcessTree {
 }
 
 impl OwnedProcessTree {
-    fn new(root_pid: u32) -> Self {
+    pub(crate) fn new(root_pid: u32) -> Self {
         let mut tree = Self {
             root_pid,
             ..Default::default()
@@ -1512,7 +1512,7 @@ impl OwnedProcessTree {
         tree
     }
 
-    fn observe(&mut self, root_pid: u32) {
+    pub(crate) fn observe(&mut self, root_pid: u32) {
         #[cfg(target_os = "linux")]
         {
             let root_pid = root_pid as libc::pid_t;

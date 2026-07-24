@@ -1,12 +1,16 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
-use std::fs;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, Receiver, RecvTimeoutError},
 };
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
@@ -20,7 +24,8 @@ use crate::state::{
     is_destructive_command, timestamp, write_json,
 };
 use crate::tools::{
-    CancellationToken, git_snapshot, run_shell_command_with_env_and_cancellation_and_timeout,
+    CancellationToken, OwnedProcessTree, cancellable_shell_command, git_snapshot,
+    run_shell_command_with_env_and_cancellation_and_timeout, terminate_command_process_group,
 };
 
 const WORKER_RUNTIME_DEADLINE_SCHEMA_VERSION: u32 = 1;
@@ -48,8 +53,12 @@ fn goal_runtime_deadline(store: &StateStore, goal_id: &str) -> Result<Option<(u6
             });
         }
     };
-    let lease: crate::state::GoalRunLease = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse goal runtime lease {}", lease_path.display()))?;
+    let lease: crate::state::GoalRunLease = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse goal runtime lease {}",
+            lease_path.display()
+        )
+    })?;
     if lease.goal_id != goal_id {
         bail!(
             "goal runtime lease {} is bound to {}, expected {}",
@@ -59,7 +68,12 @@ fn goal_runtime_deadline(store: &StateStore, goal_id: &str) -> Result<Option<(u6
         );
     }
     let deadline_at_ms = DateTime::parse_from_rfc3339(&lease.expires_at)
-        .with_context(|| format!("goal runtime lease has invalid expires_at: {}", lease.expires_at))?
+        .with_context(|| {
+            format!(
+                "goal runtime lease has invalid expires_at: {}",
+                lease.expires_at
+            )
+        })?
         .timestamp_millis();
     let deadline_at_ms = u64::try_from(deadline_at_ms)
         .context("goal runtime lease expires_at precedes the Unix epoch")?;
@@ -152,8 +166,8 @@ fn worker_external_timeout(
 ///   "disabled_mcps": ["lsp"],
 ///   "model_fallback": false,
 ///   "runtime_fallback": false,
-///   "background_task": { "defaultConcurrency": 2 },
-///   "team_mode": { "enabled": false, "max_parallel_members": 2 }
+///   "background_task": { "defaultConcurrency": 1 },
+///   "team_mode": { "enabled": false, "max_parallel_members": 1 }
 /// }
 /// ```
 /// Build the isolated OpenCode config used by command-backed sessions.
@@ -249,11 +263,11 @@ pub(crate) fn setup_omo_plugin_config_dir_with_read_only(
         "model_fallback": false,
         "runtime_fallback": false,
         "background_task": {
-            "defaultConcurrency": 2,
+            "defaultConcurrency": 1,
         },
         "team_mode": {
             "enabled": false,
-            "max_parallel_members": 2,
+            "max_parallel_members": 1,
         },
     });
     let config_path = opencode_dir.join("oh-my-openagent.json");
@@ -370,18 +384,23 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            worker_kind: WorkerKind::default(),
-            worker_command: None,
-            worker_model: None,
-            worker_routes: Vec::new(),
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string()),
+            worker_model: Some(DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string()),
+                worker_model: Some(DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL.to_string()),
+            }],
             unavailable_worker_models: Vec::new(),
-            premium_worker_budget: 1,
+            // Paid-model call limits belong to the ACP/provider, not Gear.
+            premium_worker_budget: usize::MAX,
             max_parallel_workers: 1,
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
-            require_worker: false,
-            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
         }
     }
 }
@@ -399,11 +418,26 @@ pub struct FallbackRoute {
     pub worker_model: Option<String>,
 }
 
+/// Default external ACP server for both stateless and resident OpenCode
+/// workers. The workspace is supplied as an environment variable by the
+/// transport so the command remains safe for paths containing shell syntax.
+pub const DEFAULT_OPENCODE_SESSION_COMMAND: &str =
+    "opencode acp --pure --cwd \"$GEARBOX_ACP_WORKSPACE\"";
+
+/// Canonical Flash route for Gear's default ACP-only execution mode.
+pub const DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL: &str = "opencode-go/deepseek-v4-flash";
+
+/// Official ACP bridges used for provider workers which do not expose an ACP
+/// server from their own CLI. These are server commands, never prompt-running
+/// commands: the worker prompt is sent afterwards through JSON-RPC ACP.
+const DEFAULT_CODEX_ACP_COMMAND: &str = "npx --yes @agentclientprotocol/codex-acp@1.1.4";
+const DEFAULT_CLAUDE_ACP_COMMAND: &str = "npx --yes @agentclientprotocol/claude-agent-acp@0.59.0";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerKind {
-    #[default]
     Opencode,
+    #[default]
     OpencodeSession,
     Codex,
     Claude,
@@ -437,23 +471,19 @@ impl WorkerKind {
         }
     }
 
-    pub fn default_command(&self, worker_model: Option<&str>) -> Option<String> {
+    pub fn default_command(&self, _worker_model: Option<&str>) -> Option<String> {
         match self {
-            Self::Codex => {
-                let model_flag = worker_model
-                    .filter(|model| !model.trim().is_empty())
-                    .map(|model| format!(" -m {}", shell_single_quote(model.trim())))
-                    .unwrap_or_default();
-                Some(format!(
-                    "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox{model_flag} -o \"$GEARBOX_WORKER_LAST_MESSAGE\" - < \"$GEARBOX_WORKER_PROMPT\""
-                ))
+            Self::Opencode | Self::OpencodeSession => {
+                Some(DEFAULT_OPENCODE_SESSION_COMMAND.to_string())
             }
-            Self::Claude => Some(
-                "claude -p \"$(cat \"$GEARBOX_WORKER_PROMPT\")\" > \"$GEARBOX_WORKER_LAST_MESSAGE\""
-                    .to_string(),
-            ),
+            Self::Codex => Some(DEFAULT_CODEX_ACP_COMMAND.to_string()),
+            Self::Claude => Some(DEFAULT_CLAUDE_ACP_COMMAND.to_string()),
             _ => None,
         }
+    }
+
+    pub fn default_read_only_command(&self, worker_model: Option<&str>) -> Option<String> {
+        self.default_command(worker_model)
     }
 
     pub fn provider_id_hint(&self) -> Option<&'static str> {
@@ -696,16 +726,16 @@ impl WorkerCategory {
     fn prompt_append(self) -> Option<&'static str> {
         match self {
             Self::Quick | Self::Repair | Self::Deep | Self::Visual | Self::Custom => Some(
-                "Focus on implementation, keep changes minimal, and do not ask the user questions. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gear/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
+                "Focus on implementation, keep changes minimal, and do not ask the user questions. Before claiming completion, run the relevant verification and report the changed files, commands, and results. Gear persists protected runtime evidence; do not create or modify .gear.",
             ),
             Self::Review => Some(
-                "This is an independent review turn. Do not edit files; inspect the evidence and return concrete findings.",
+                "This is an independent read-only review turn. Do not edit files and do not run build, test, package-manager, compiler, linter, formatter, or Cargo commands. Use only observation commands such as pwd, ls, rg, sed, git status, and git diff; the executor alone performs verification. Inspect the evidence and return concrete findings.",
             ),
             Self::Explore | Self::Librarian => Some(
-                "This is a read-only exploration turn. Do not edit files; trace the code and summarize the evidence.",
+                "This is a read-only exploration turn. Do not edit files and do not run build, test, package-manager, compiler, linter, formatter, or Cargo commands. Use only observation commands such as pwd, ls, rg, sed, git status, and git diff; the executor alone performs verification. Trace the code and summarize the evidence.",
             ),
             Self::ZedNative => Some(
-                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gear/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
+                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively. Before claiming completion, run the relevant verification and report the changed files, commands, and results. Gear persists protected runtime evidence; do not create or modify .gear.",
             ),
         }
     }
@@ -1260,10 +1290,7 @@ pub(crate) fn is_free_model(worker_model: Option<&str>) -> bool {
 /// OpenCode Go models use `WorkerKind::OpencodeSession`.  Keep the provider
 /// identity in the route model so paid OpenCode calls cannot bypass the
 /// durable premium budget accounting.
-pub(crate) fn worker_route_is_premium(
-    worker_kind: WorkerKind,
-    worker_model: Option<&str>,
-) -> bool {
+pub(crate) fn worker_route_is_premium(worker_kind: WorkerKind, worker_model: Option<&str>) -> bool {
     worker_kind.is_premium()
         || worker_model
             .and_then(|model| model.split_once('/'))
@@ -1426,6 +1453,7 @@ fn worker_provider_model(worker_kind: WorkerKind, worker_model: Option<&str>) ->
     }
 }
 
+#[cfg(test)]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -2465,9 +2493,7 @@ fn validate_worker_parameter_value(value: &Value) -> Result<WorkerParameterResol
     }
     if let (Some(tools), Some(category_resolution)) = (
         value.get("tools").and_then(Value::as_object),
-        value
-            .get("category_resolution")
-            .and_then(Value::as_object),
+        value.get("category_resolution").and_then(Value::as_object),
     ) && category_resolution.get("tools") != Some(&Value::Object(tools.clone()))
     {
         errors.push(
@@ -2480,9 +2506,7 @@ fn validate_worker_parameter_value(value: &Value) -> Result<WorkerParameterResol
         .and_then(Value::as_bool)
         == Some(true)
     {
-        errors.push(
-            "recursive Gear task dispatch is not allowed from a worker packet".to_string(),
-        );
+        errors.push("recursive Gear task dispatch is not allowed from a worker packet".to_string());
     }
 
     let category_resolution_result = value
@@ -2552,7 +2576,9 @@ fn validate_worker_parameter_value(value: &Value) -> Result<WorkerParameterResol
     .seal()
 }
 
-fn validate_worker_packet_parameters(packet: &WorkerPacket) -> Result<WorkerParameterResolutionReceipt> {
+fn validate_worker_packet_parameters(
+    packet: &WorkerPacket,
+) -> Result<WorkerParameterResolutionReceipt> {
     validate_worker_parameter_value(&serde_json::to_value(packet)?)
 }
 
@@ -2637,7 +2663,10 @@ impl SkillInjectionReceipt {
     fn expected_hash(&self) -> Result<String> {
         let mut unsigned = self.clone();
         unsigned.receipt_hash.clear();
-        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&unsigned)?)))
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&unsigned)?)
+        ))
     }
 
     fn validate(&self) -> Result<()> {
@@ -2655,7 +2684,10 @@ impl RuleInjectionReceipt {
     fn expected_hash(&self) -> Result<String> {
         let mut unsigned = self.clone();
         unsigned.receipt_hash.clear();
-        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&unsigned)?)))
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&unsigned)?)
+        ))
     }
 
     fn validate(&self) -> Result<()> {
@@ -2783,6 +2815,11 @@ fn validate_worker_evidence_receipt_inner(
     let new_paths = current_paths
         .into_iter()
         .filter(|path| !baseline_contains_path(path, baseline_paths))
+        // Gear may materialize a protected transport-degradation receipt
+        // after an ACP turn.  It is runtime evidence, not a worker-produced
+        // receipt, and must not make a later follow-up appear to have created
+        // multiple worker receipts.
+        .filter(|path| !is_gear_generated_runtime_evidence_path(path))
         .collect::<Vec<_>>();
     for path in &new_paths {
         let metadata = fs::symlink_metadata(path)
@@ -2810,6 +2847,14 @@ fn validate_worker_evidence_receipt_inner(
     }
 
     validate_evidence_candidate(&new_files[0], &real_evidence_root, baseline_paths, true)
+}
+
+fn is_gear_generated_runtime_evidence_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("gear-runtime-") || name.starts_with("gear-read-only-")
+        })
 }
 
 pub(crate) fn snapshot_worker_evidence_paths(
@@ -2993,8 +3038,14 @@ impl WorkerClaimReconciliationReceipt {
         if self.task_id.trim().is_empty() || self.workspace.trim().is_empty() {
             bail!("worker claim reconciliation identity cannot be empty");
         }
-        if !matches!(self.status.as_str(), "reconciled" | "discrepancy" | "unverified") {
-            bail!("unknown worker claim reconciliation status `{}`", self.status);
+        if !matches!(
+            self.status.as_str(),
+            "reconciled" | "discrepancy" | "unverified"
+        ) {
+            bail!(
+                "unknown worker claim reconciliation status `{}`",
+                self.status
+            );
         }
         if self.receipt_hash != self.expected_hash()? {
             bail!("worker claim reconciliation receipt hash mismatch");
@@ -3012,9 +3063,7 @@ fn worker_workspace(store: &StateStore) -> PathBuf {
 }
 
 fn normalize_claim_path(workspace: &Path, raw_path: &str) -> String {
-    let trimmed = raw_path
-        .trim()
-        .trim_matches(['`', '"', '\'', ',', ';']);
+    let trimmed = raw_path.trim().trim_matches(['`', '"', '\'', ',', ';']);
     let candidate = Path::new(trimmed);
     let relative = if candidate.is_absolute() {
         candidate
@@ -3043,7 +3092,9 @@ pub fn reconcile_worker_claims(
     outcome: &WorkerOutcome,
 ) -> Result<WorkerClaimReconciliationReceipt> {
     let workspace = worker_workspace(store);
-    let workspace_for_paths = workspace.canonicalize().unwrap_or_else(|_| workspace.clone());
+    let workspace_for_paths = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
     let parsed_report = parsed_worker_report(result);
     let mut claimed_changed_files = parsed_report
         .changed_files
@@ -3055,68 +3106,76 @@ pub fn reconcile_worker_claims(
     claimed_changed_files.dedup();
 
     let snapshot = git_snapshot(&workspace);
-    let (observed_changed_files, observed_diff_hash, status, missing_claims, unclaimed_changes, reason) =
-        match snapshot {
-            Ok(snapshot) if snapshot.is_git_repo => {
-                let mut observed = snapshot
-                    .changed_files
-                    .iter()
-                    .map(|path| normalize_claim_path(&workspace_for_paths, path))
-                    .filter(|path| !path.is_empty() && !path.starts_with(".gear/"))
-                    .collect::<Vec<_>>();
-                observed.sort();
-                observed.dedup();
-                let observed_set = observed.iter().collect::<HashSet<_>>();
-                let claimed_set = claimed_changed_files.iter().collect::<HashSet<_>>();
-                let missing = claimed_changed_files
-                    .iter()
-                    .filter(|path| !observed_set.contains(path))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let unclaimed = observed
-                    .iter()
-                    .filter(|path| !claimed_set.contains(path))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let (status, reason) = if !missing.is_empty() {
-                    (
-                        "discrepancy",
-                        Some("worker claimed files that were absent from the repository observation"),
-                    )
-                } else if claimed_changed_files.is_empty() && !observed.is_empty() {
-                    (
-                        "unverified",
-                        Some("worker changed files were observed but the worker report declared no file claims"),
-                    )
-                } else {
-                    ("reconciled", None)
-                };
+    let (
+        observed_changed_files,
+        observed_diff_hash,
+        status,
+        missing_claims,
+        unclaimed_changes,
+        reason,
+    ) = match snapshot {
+        Ok(snapshot) if snapshot.is_git_repo => {
+            let mut observed = snapshot
+                .changed_files
+                .iter()
+                .map(|path| normalize_claim_path(&workspace_for_paths, path))
+                .filter(|path| !path.is_empty() && !path.starts_with(".gear/"))
+                .collect::<Vec<_>>();
+            observed.sort();
+            observed.dedup();
+            let observed_set = observed.iter().collect::<HashSet<_>>();
+            let claimed_set = claimed_changed_files.iter().collect::<HashSet<_>>();
+            let missing = claimed_changed_files
+                .iter()
+                .filter(|path| !observed_set.contains(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            let unclaimed = observed
+                .iter()
+                .filter(|path| !claimed_set.contains(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            let (status, reason) = if !missing.is_empty() {
                 (
-                    observed,
-                    snapshot.diff_hash,
-                    status.to_string(),
-                    missing,
-                    unclaimed,
-                    reason.map(str::to_string),
+                    "discrepancy",
+                    Some("worker claimed files that were absent from the repository observation"),
                 )
-            }
-            Ok(_) => (
-                Vec::new(),
-                None,
-                "unverified".to_string(),
-                Vec::new(),
-                Vec::new(),
-                Some("workspace is not a Git repository".to_string()),
-            ),
-            Err(error) => (
-                Vec::new(),
-                None,
-                "unverified".to_string(),
-                Vec::new(),
-                Vec::new(),
-                Some(format!("repository observation failed: {error:#}")),
-            ),
-        };
+            } else if claimed_changed_files.is_empty() && !observed.is_empty() {
+                (
+                    "unverified",
+                    Some(
+                        "worker changed files were observed but the worker report declared no file claims",
+                    ),
+                )
+            } else {
+                ("reconciled", None)
+            };
+            (
+                observed,
+                snapshot.diff_hash,
+                status.to_string(),
+                missing,
+                unclaimed,
+                reason.map(str::to_string),
+            )
+        }
+        Ok(_) => (
+            Vec::new(),
+            None,
+            "unverified".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Some("workspace is not a Git repository".to_string()),
+        ),
+        Err(error) => (
+            Vec::new(),
+            None,
+            "unverified".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Some(format!("repository observation failed: {error:#}")),
+        ),
+    };
 
     let receipt = WorkerClaimReconciliationReceipt {
         schema_version: WORKER_CLAIM_RECONCILIATION_SCHEMA_VERSION,
@@ -3195,9 +3254,14 @@ impl TeamSessionReconciliationReceipt {
         if self.task_id.trim().is_empty() || self.workspace.trim().is_empty() {
             bail!("team-session reconciliation identity cannot be empty");
         }
-        if !matches!(self.status.as_str(), "disabled" | "reconciled" | "degraded" | "blocked")
-        {
-            bail!("unknown team-session reconciliation status `{}`", self.status);
+        if !matches!(
+            self.status.as_str(),
+            "disabled" | "reconciled" | "degraded" | "blocked"
+        ) {
+            bail!(
+                "unknown team-session reconciliation status `{}`",
+                self.status
+            );
         }
         if self.reorderable_message_events > self.undelivered_message_events {
             bail!("reorderable messages cannot exceed undelivered messages");
@@ -3257,14 +3321,24 @@ fn reconcile_team_session(
     let mut malformed_lines = 0;
 
     if let Ok(transcript) = fs::read_to_string(&transcript_path) {
-        for line in transcript.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in transcript
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             let Ok(value) = serde_json::from_str::<Value>(line) else {
                 malformed_lines += 1;
                 continue;
             };
             let team_event = event_has_key(
                 &value,
-                &["teamrunid", "teamrun", "memberid", "membername", "teammember"],
+                &[
+                    "teamrunid",
+                    "teamrun",
+                    "memberid",
+                    "membername",
+                    "teammember",
+                ],
             );
             if !team_event {
                 continue;
@@ -3302,7 +3376,9 @@ fn reconcile_team_session(
         "reconciled"
     };
     let reason = if observed_team_events > 0 {
-        Some("team-shaped session events were observed while Gear team mode is disabled".to_string())
+        Some(
+            "team-shaped session events were observed while Gear team mode is disabled".to_string(),
+        )
     } else if malformed_lines > 0 {
         Some("team-session transcript contained malformed event lines".to_string())
     } else {
@@ -3597,24 +3673,6 @@ pub struct WorkerStartRequest<'a> {
     pub route_hint: Option<&'a str>,
 }
 
-impl<'a> WorkerStartRequest<'a> {
-    fn reborrow(&self) -> WorkerStartRequest<'a> {
-        WorkerStartRequest {
-            store: self.store,
-            workspace: self.workspace,
-            task: self.task,
-            route_attempt: self.route_attempt,
-            goal: self.goal,
-            verification_commands: self.verification_commands,
-            config: self.config,
-            cancellation_token: self.cancellation_token.clone(),
-            coordinator_model: self.coordinator_model,
-            coordinator_brief: self.coordinator_brief,
-            route_hint: self.route_hint,
-        }
-    }
-}
-
 pub type WorkerRunRequest<'a> = WorkerStartRequest<'a>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3704,8 +3762,11 @@ pub trait NativeWorkerBackend: Send + Sync {
         request: WorkerStartRequest<'_>,
     ) -> Result<Arc<dyn WorkerSessionHandle>>;
 
-    /// Optional ACP-backed worker route for provider workers such as
-    /// OpenCode, Codex, or Claude. Returning `None` preserves CLI fallback.
+    /// Optional in-process ACP route retained for host-owned integrations.
+    ///
+    /// Provider workers are intentionally not dispatched through this hook:
+    /// their identity and selected model must come from their own external ACP
+    /// server, rather than a host-native substitute.
     fn start_acp_worker(
         &self,
         _worker_kind: WorkerKind,
@@ -3721,6 +3782,12 @@ pub trait NativeWorkerBackend: Send + Sync {
         _worker_kind: WorkerKind,
     ) -> Option<Vec<BrokerCapability>> {
         None
+    }
+
+    /// Test doubles may opt in to the retired native Zed worker path. Product
+    /// backends must leave this disabled so all worker traffic uses ACP.
+    fn allows_native_zed_agent_for_testing(&self) -> bool {
+        false
     }
 }
 
@@ -3896,10 +3963,13 @@ impl WorkerRegistry {
         // Dispatch to the appropriate adapter, then wrap through broker if active.
         // Extract needed fields before consuming request in start_direct.
         let task_id = request.task.id.clone();
-        let native_broker_capabilities = self
-            .native_backend
-            .as_ref()
-            .and_then(|backend| backend.native_broker_capabilities(worker_kind));
+        let native_broker_capabilities = (worker_kind == WorkerKind::ZedAgent)
+            .then(|| {
+                self.native_backend
+                    .as_ref()
+                    .and_then(|backend| backend.native_broker_capabilities(worker_kind))
+            })
+            .flatten();
         let handle = self.start_direct(worker_kind, request)?;
 
         if let Some(broker) = &self.broker {
@@ -3920,17 +3990,15 @@ impl WorkerRegistry {
                     started_at: crate::state::timestamp(),
                     capabilities: Some(native_broker_capabilities.unwrap_or_else(|| {
                         match worker_kind {
-                            WorkerKind::Opencode => OpencodeCommandWorker {}.broker_capabilities(),
-                            WorkerKind::OpencodeSession => {
-                                OpencodeSessionWorker {}.broker_capabilities()
-                            }
-                            WorkerKind::Codex => CodexCommandWorker {}.broker_capabilities(),
-                            WorkerKind::Claude => ClaudeCommandWorker {}.broker_capabilities(),
+                            WorkerKind::Opencode
+                            | WorkerKind::OpencodeSession
+                            | WorkerKind::Codex
+                            | WorkerKind::Claude
+                            | WorkerKind::Custom => acp_broker_capabilities(),
                             WorkerKind::ZedAgent => broker_capabilities_for_kind(
                                 worker_kind,
                                 self.native_backend.is_some(),
                             ),
-                            WorkerKind::Custom => CustomCommandWorker {}.broker_capabilities(),
                         }
                     })),
                 };
@@ -3951,34 +4019,24 @@ impl WorkerRegistry {
             WorkerKind::Opencode
             | WorkerKind::OpencodeSession
             | WorkerKind::Codex
-            | WorkerKind::Claude => {
-                if let Some(native_backend) = self.native_backend.as_ref()
-                    && let Some(handle) =
-                        native_backend.start_acp_worker(worker_kind, request.reborrow())?
-                {
-                    return Ok(handle);
-                }
-                match worker_kind {
-                    WorkerKind::Opencode => OpencodeCommandWorker {}.start(request),
-                    WorkerKind::OpencodeSession => OpencodeSessionWorker {}.start(request),
-                    WorkerKind::Codex => CodexCommandWorker {}.start(request),
-                    WorkerKind::Claude => ClaudeCommandWorker {}.start(request),
-                    _ => bail!("worker kind was not a provider worker"),
-                }
-            }
+            | WorkerKind::Claude
+            | WorkerKind::Custom => start_acp_backed_worker(request),
             WorkerKind::ZedAgent => {
-                if let Some(native_backend) = self.native_backend.as_ref() {
+                if let Some(native_backend) = self
+                    .native_backend
+                    .as_ref()
+                    .filter(|backend| backend.allows_native_zed_agent_for_testing())
+                {
                     native_backend.start_zed_agent(request)
                 } else {
-                    ZedAgentCommandWorker {}.start(request)
+                    bail!("ZedAgent native worker is disabled; configure an ACP worker instead")
                 }
             }
-            WorkerKind::Custom => CustomCommandWorker {}.start(request),
         }
     }
 
     /// Return the capabilities for a given worker kind and backend mode.
-    /// External command workers have limited capabilities (Gear cannot
+    /// External ACP workers have limited capabilities (Gear cannot
     /// verify internal code editing). Native/resident workers have full
     /// capabilities.
     fn capabilities_for_kind(kind: WorkerKind, has_native_backend: bool) -> WorkerCapabilities {
@@ -4082,6 +4140,16 @@ pub struct ClaudeCommandWorker {}
 pub struct ZedAgentCommandWorker {}
 pub struct CustomCommandWorker {}
 
+fn acp_broker_capabilities() -> Vec<BrokerCapability> {
+    vec![
+        BrokerCapability::DiscoverAgents,
+        BrokerCapability::Start,
+        BrokerCapability::Cancel,
+        BrokerCapability::Wait,
+        BrokerCapability::ModelSelection,
+    ]
+}
+
 // ── Broker capability declarations ────────────────────────────────────────
 //
 // Each adapter declares its broker-level capabilities explicitly, matching
@@ -4178,7 +4246,7 @@ impl WorkerAdapter for CommandWorker {
     }
 }
 
-macro_rules! impl_command_backed_worker {
+macro_rules! impl_acp_backed_worker {
     ($worker:ty, $kind:expr, $name:literal) => {
         impl WorkerAdapter for $worker {
             fn name(&self) -> &'static str {
@@ -4197,24 +4265,20 @@ macro_rules! impl_command_backed_worker {
             }
 
             fn capabilities(&self) -> WorkerCapabilities {
-                WorkerCapabilities::command()
+                WorkerCapabilities::resident_command()
             }
 
             fn start(
                 &self,
                 request: WorkerStartRequest<'_>,
             ) -> Result<Arc<dyn WorkerSessionHandle>> {
-                start_command_backed_worker(request, false)
+                start_acp_backed_worker(request)
             }
         }
     };
 }
 
-impl_command_backed_worker!(
-    OpencodeCommandWorker,
-    WorkerKind::Opencode,
-    "opencode_command"
-);
+impl_acp_backed_worker!(OpencodeCommandWorker, WorkerKind::Opencode, "opencode_acp");
 impl WorkerAdapter for OpencodeSessionWorker {
     fn name(&self) -> &'static str {
         "opencode_session"
@@ -4236,18 +4300,37 @@ impl WorkerSessionAdapter for OpencodeSessionWorker {
     }
 
     fn start(&self, request: WorkerStartRequest<'_>) -> Result<Arc<dyn WorkerSessionHandle>> {
-        start_command_backed_worker(request, true)
+        start_acp_backed_worker(request)
     }
 }
 
-impl_command_backed_worker!(CodexCommandWorker, WorkerKind::Codex, "codex_command");
-impl_command_backed_worker!(ClaudeCommandWorker, WorkerKind::Claude, "claude_command");
-impl_command_backed_worker!(
-    ZedAgentCommandWorker,
-    WorkerKind::ZedAgent,
-    "zed_agent_command"
-);
-impl_command_backed_worker!(CustomCommandWorker, WorkerKind::Custom, "custom_command");
+impl_acp_backed_worker!(CodexCommandWorker, WorkerKind::Codex, "codex_acp");
+impl_acp_backed_worker!(ClaudeCommandWorker, WorkerKind::Claude, "claude_acp");
+impl_acp_backed_worker!(CustomCommandWorker, WorkerKind::Custom, "custom_acp");
+
+impl WorkerAdapter for ZedAgentCommandWorker {
+    fn name(&self) -> &'static str {
+        "zed_agent_acp"
+    }
+
+    fn run(&self, _request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
+        bail!("ZedAgent worker requires the native ACP backend; command fallback is disabled")
+    }
+}
+
+impl WorkerSessionAdapter for ZedAgentCommandWorker {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::ZedAgent
+    }
+
+    fn capabilities(&self) -> WorkerCapabilities {
+        WorkerCapabilities::command()
+    }
+
+    fn start(&self, _request: WorkerStartRequest<'_>) -> Result<Arc<dyn WorkerSessionHandle>> {
+        bail!("ZedAgent worker requires the native ACP backend; command fallback is disabled")
+    }
+}
 
 fn resident_session_descriptor_path(store: &StateStore, task_id: &str) -> PathBuf {
     store.worker_dir(task_id).join("resident-session.json")
@@ -4632,7 +4715,9 @@ pub fn discover_workspace_rules(
     workspace: &Path,
     task: &Task,
 ) -> Result<(Option<String>, Option<String>)> {
-    let workspace_real = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace_real = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     let workspace_display = workspace_real.to_string_lossy().to_string();
     let mut errors = Vec::new();
     let mut target_paths = Vec::new();
@@ -4678,7 +4763,11 @@ pub fn discover_workspace_rules(
             .strip_prefix(&workspace_real)
             .map(|path| {
                 let value = path.to_string_lossy().replace('\\', "/");
-                if value.is_empty() { ".".to_string() } else { value }
+                if value.is_empty() {
+                    ".".to_string()
+                } else {
+                    value
+                }
             })
             .unwrap_or_else(|_| ".".to_string());
         target_paths.push(relative_target);
@@ -4716,11 +4805,21 @@ pub fn discover_workspace_rules(
                 let real_path = match path.canonicalize() {
                     Ok(real_path) if real_path.starts_with(&workspace_real) => real_path,
                     Ok(_) => {
-                        candidates.push((path, None, distance, Some("realpath outside workspace".to_string())));
+                        candidates.push((
+                            path,
+                            None,
+                            distance,
+                            Some("realpath outside workspace".to_string()),
+                        ));
                         continue;
                     }
                     Err(error) => {
-                        candidates.push((path, None, distance, Some(format!("realpath failed: {error}"))));
+                        candidates.push((
+                            path,
+                            None,
+                            distance,
+                            Some(format!("realpath failed: {error}")),
+                        ));
                         continue;
                     }
                 };
@@ -4729,11 +4828,7 @@ pub fn discover_workspace_rules(
         }
     }
 
-    candidates.sort_by(|left, right| {
-        left.2
-            .cmp(&right.2)
-            .then_with(|| left.0.cmp(&right.0))
-    });
+    candidates.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
     let mut seen_real_paths = std::collections::HashSet::new();
     let mut seen_content_hashes = std::collections::HashSet::new();
     let mut directive_values = HashMap::<(usize, String), String>::new();
@@ -4885,14 +4980,18 @@ pub fn discover_workspace_rules(
     };
     receipt.receipt_hash = receipt.expected_hash()?;
     receipt.validate()?;
-    let receipt_path = store.write_worker_json_atomic(&task.id, "rules-injection.json", &receipt)?;
+    let receipt_path =
+        store.write_worker_json_atomic(&task.id, "rules-injection.json", &receipt)?;
     if receipt.context_conflict {
         bail!(
             "workspace rule context conflict; review required (receipt: {})",
             receipt_path.display()
         );
     }
-    Ok((injected_rules, Some(receipt_path.to_string_lossy().to_string())))
+    Ok((
+        injected_rules,
+        Some(receipt_path.to_string_lossy().to_string()),
+    ))
 }
 
 fn rule_directives(content: &str) -> Vec<(String, String)> {
@@ -4915,10 +5014,7 @@ fn rule_directives(content: &str) -> Vec<(String, String)> {
     content
         .lines()
         .filter_map(|line| {
-            let line = line
-                .trim()
-                .trim_start_matches(['-', '*', '+'])
-                .trim_start();
+            let line = line.trim().trim_start_matches(['-', '*', '+']).trim_start();
             let (key, value) = line.split_once(':')?;
             let key = key.trim().to_ascii_lowercase().replace('-', "_");
             if KEYS.contains(&key.as_str()) {
@@ -4943,7 +5039,10 @@ fn skill_is_disabled(content: &str) -> bool {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        if matches!(key.trim().to_ascii_lowercase().as_str(), "disabled" | "enabled") {
+        if matches!(
+            key.trim().to_ascii_lowercase().as_str(),
+            "disabled" | "enabled"
+        ) {
             let value = value.trim().trim_matches(['"', '\'']);
             if (key.trim().eq_ignore_ascii_case("disabled") && value.eq_ignore_ascii_case("true"))
                 || (key.trim().eq_ignore_ascii_case("enabled")
@@ -4973,12 +5072,7 @@ fn skill_frontmatter_directives(content: &str) -> HashMap<String, String> {
         let key = key.trim().to_ascii_lowercase().replace('-', "_");
         if matches!(
             key.as_str(),
-            "agent"
-                | "agents"
-                | "worker"
-                | "workers"
-                | "restricted_to"
-                | "required"
+            "agent" | "agents" | "worker" | "workers" | "restricted_to" | "required"
         ) {
             directives.insert(key, value.trim().to_string());
         }
@@ -5009,12 +5103,16 @@ fn skill_restricted_agents(content: &str) -> (Vec<String>, bool) {
     }
     agents.sort_unstable();
     agents.dedup();
-    let required = directives
-        .get("required")
-        .is_some_and(|value| matches!(
-            value.trim().trim_matches(['"', '\'']).to_ascii_lowercase().as_str(),
+    let required = directives.get("required").is_some_and(|value| {
+        matches!(
+            value
+                .trim()
+                .trim_matches(['"', '\''])
+                .to_ascii_lowercase()
+                .as_str(),
             "1" | "true" | "yes" | "required"
-        ));
+        )
+    });
     (agents, required)
 }
 
@@ -5071,7 +5169,9 @@ fn discover_workspace_skills_for_worker(
     worker_name: &str,
     worker_category: &str,
 ) -> Result<(Option<String>, Option<String>)> {
-    let workspace_real = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace_real = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     let workspace_display = workspace_real.to_string_lossy().to_string();
     let mut errors = Vec::new();
     let mut target_paths = Vec::new();
@@ -5116,7 +5216,11 @@ fn discover_workspace_skills_for_worker(
             .strip_prefix(&workspace_real)
             .map(|path| {
                 let value = path.to_string_lossy().replace('\\', "/");
-                if value.is_empty() { ".".to_string() } else { value }
+                if value.is_empty() {
+                    ".".to_string()
+                } else {
+                    value
+                }
             })
             .unwrap_or_else(|_| ".".to_string());
         target_paths.push(relative_target);
@@ -5431,7 +5535,8 @@ fn discover_workspace_skills_for_worker(
     };
     receipt.receipt_hash = receipt.expected_hash()?;
     receipt.validate()?;
-    let receipt_path = store.write_worker_json_atomic(&task.id, "skills-injection.json", &receipt)?;
+    let receipt_path =
+        store.write_worker_json_atomic(&task.id, "skills-injection.json", &receipt)?;
     let cache_bytes = serde_json::to_vec_pretty(&receipt)?;
     let cache_tmp = cache_path.with_file_name(format!(
         "skill-injection-cache-{}.json.tmp",
@@ -5464,7 +5569,10 @@ fn read_durable_current_step_id(store: &StateStore, task_id: &str) -> Result<Opt
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("failed to read durable current step cursor {}", path.display())
+                format!(
+                    "failed to read durable current step cursor {}",
+                    path.display()
+                )
             });
         }
     };
@@ -5478,9 +5586,89 @@ fn read_durable_current_step_id(store: &StateStore, task_id: &str) -> Result<Opt
     Ok(Some(step_id.to_string()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerTransport {
+    Command,
+    AcpStdio,
+}
+
+fn acp_server_command(worker_kind: WorkerKind, configured: Option<&str>) -> Result<String> {
+    let configured = configured
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(ToOwned::to_owned);
+    let command = configured.or_else(|| worker_kind.default_command(None));
+    let command = match (worker_kind, command) {
+        (WorkerKind::Custom, None) => {
+            bail!(
+                "Custom worker requires an explicit ACP server command; command fallback is disabled"
+            )
+        }
+        (WorkerKind::ZedAgent, _) => {
+            bail!("ZedAgent worker requires the native ACP backend; command fallback is disabled")
+        }
+        (_, Some(command)) => command,
+        (_, None) => bail!(
+            "{} worker has no ACP server command configured",
+            worker_kind.as_str()
+        ),
+    };
+    let normalized = command.to_ascii_lowercase();
+    if normalized.contains("opencode run")
+        || normalized.contains("codex exec")
+        || normalized.contains("claude -p")
+    {
+        bail!(
+            "{} worker command must start an ACP server, not a prompt-running CLI command",
+            worker_kind.as_str()
+        );
+    }
+    Ok(command)
+}
+
+fn start_acp_backed_worker(
+    request: WorkerStartRequest<'_>,
+) -> Result<Arc<dyn WorkerSessionHandle>> {
+    #[cfg(test)]
+    if test_legacy_command_transport(&request) {
+        let supports_interaction = matches!(
+            request
+                .config
+                .selected_route_for_hint(request.route_attempt, request.route_hint)
+                .worker_kind,
+            WorkerKind::OpencodeSession
+        );
+        return start_command_backed_worker(
+            request,
+            supports_interaction,
+            WorkerTransport::Command,
+        );
+    }
+    start_command_backed_worker(request, true, WorkerTransport::AcpStdio)
+}
+
+/// Old unit tests exercise prompt compilation, command output parsing, and
+/// task-manager state with local shell fixtures. Keep that fixture-only path
+/// out of production dispatch: a release build has no command fallback.
+#[cfg(test)]
+fn test_legacy_command_transport(request: &WorkerStartRequest<'_>) -> bool {
+    let route = request
+        .config
+        .selected_route_for_hint(request.route_attempt, request.route_hint);
+    let Some(command) = route.worker_command else {
+        return route.worker_kind != WorkerKind::Custom;
+    };
+    let command = command.to_ascii_lowercase();
+    !command.contains("acp")
+        && !command.contains("opencode run")
+        && !command.contains("codex exec")
+        && !command.contains("claude -p")
+}
+
 fn start_command_backed_worker(
     request: WorkerStartRequest<'_>,
     supports_interaction: bool,
+    transport: WorkerTransport,
 ) -> Result<Arc<dyn WorkerSessionHandle>> {
     let WorkerStartRequest {
         store,
@@ -5561,8 +5749,7 @@ fn start_command_backed_worker(
     let prompt_manifest_path = store.worker_dir(&task.id).join("prompt-manifest.json");
     let prompt_reconcile_path = store.worker_dir(&task.id).join("prompt-reconcile.json");
     let prompt_capsule_path = store.worker_dir(&task.id).join("prompt-capsule.json");
-    let (injected_rules, rules_injection_path) =
-        discover_workspace_rules(store, workspace, task)?;
+    let (injected_rules, rules_injection_path) = discover_workspace_rules(store, workspace, task)?;
     let (injected_skills, skills_injection_path) = discover_workspace_skills_for_worker(
         store,
         workspace,
@@ -5637,11 +5824,7 @@ fn start_command_backed_worker(
     // defaults from explicit invalid values and records the precedence that
     // produced the selected route.
     let parameter_resolution = validate_worker_packet_parameters(&packet)?;
-    store.write_worker_json_atomic(
-        &task.id,
-        "parameter-resolution.json",
-        &parameter_resolution,
-    )?;
+    store.write_worker_json_atomic(&task.id, "parameter-resolution.json", &parameter_resolution)?;
     if parameter_resolution.status == "invalid" {
         bail!(
             "worker dispatch parameter validation failed: {}",
@@ -5655,47 +5838,43 @@ fn start_command_backed_worker(
     let prompt_manifest = prompt_manifest_for_packet(&packet, &prompt)?;
     store.write_worker_json_atomic(&task.id, "prompt-manifest.json", &prompt_manifest)?;
     let capsule_recovery_reason = PromptCapsuleRecoveryReason::Dispatch;
-    let mut prompt_capsule = match build_prompt_capsule(
-        &packet,
-        &prompt_manifest,
-        &prompt,
-        &capsule_recovery_reason,
-    ) {
-        Ok(capsule) => capsule,
-        Err(error) => {
-            if let Some(overflow) = error.downcast_ref::<PromptCapsuleBudgetOverflow>() {
-                let receipt = json!({
-                    "schema_version": PROMPT_BUDGET_OVERFLOW_SCHEMA_VERSION,
-                    "status": "blocked",
-                    "task_id": task.id,
-                    "worker": worker_name,
-                    "worker_model": packet.worker_model,
-                    "variant": packet.variant,
-                    "route_attempt": route_attempt,
-                    "attempt": task.attempt,
-                    "budget_tokens": overflow.budget_tokens,
-                    "context_limit_tokens": overflow.context_limit_tokens,
-                    "reserved_output_tokens": overflow.reserved_output_tokens,
-                    "headroom_source": overflow.headroom_source,
-                    "budget_source": overflow.budget_source,
-                    "token_estimator": PROMPT_TOKEN_ESTIMATOR,
-                    "required_tokens": overflow.required_tokens,
-                    "semantic_contract_hash": prompt_manifest.semantic_contract_hash,
-                    "packet_path": packet_path.clone(),
-                    "prompt_full_path": full_prompt_path,
-                    "prompt_manifest_path": prompt_manifest_path.clone(),
-                    "next_action": "try_next_explicit_route_or_split_task",
-                    "error": error.to_string(),
-                });
-                store.write_worker_json_atomic(
-                    &task.id,
-                    "prompt-budget-overflow.json",
-                    &receipt,
-                )?;
+    let mut prompt_capsule =
+        match build_prompt_capsule(&packet, &prompt_manifest, &prompt, &capsule_recovery_reason) {
+            Ok(capsule) => capsule,
+            Err(error) => {
+                if let Some(overflow) = error.downcast_ref::<PromptCapsuleBudgetOverflow>() {
+                    let receipt = json!({
+                        "schema_version": PROMPT_BUDGET_OVERFLOW_SCHEMA_VERSION,
+                        "status": "blocked",
+                        "task_id": task.id,
+                        "worker": worker_name,
+                        "worker_model": packet.worker_model,
+                        "variant": packet.variant,
+                        "route_attempt": route_attempt,
+                        "attempt": task.attempt,
+                        "budget_tokens": overflow.budget_tokens,
+                        "context_limit_tokens": overflow.context_limit_tokens,
+                        "reserved_output_tokens": overflow.reserved_output_tokens,
+                        "headroom_source": overflow.headroom_source,
+                        "budget_source": overflow.budget_source,
+                        "token_estimator": PROMPT_TOKEN_ESTIMATOR,
+                        "required_tokens": overflow.required_tokens,
+                        "semantic_contract_hash": prompt_manifest.semantic_contract_hash,
+                        "packet_path": packet_path.clone(),
+                        "prompt_full_path": full_prompt_path,
+                        "prompt_manifest_path": prompt_manifest_path.clone(),
+                        "next_action": "try_next_explicit_route_or_split_task",
+                        "error": error.to_string(),
+                    });
+                    store.write_worker_json_atomic(
+                        &task.id,
+                        "prompt-budget-overflow.json",
+                        &receipt,
+                    )?;
+                }
+                return Err(error).context("failed to build worker prompt capsule");
             }
-            return Err(error).context("failed to build worker prompt capsule");
-        }
-    };
+        };
     // Generate bounded compiled prompt from capsule section decisions.
     let compiled_prompt = worker_compiled_prompt(&packet, &prompt_capsule)?;
     let prompt_path = store.write_worker_file(&task.id, "prompt.md", &compiled_prompt)?;
@@ -5761,7 +5940,9 @@ fn start_command_backed_worker(
     // workers.  This directory is bound to the handle's lifetime and cleaned
     // up when the handle is dropped.
     let omo_config_dir = if route.worker_kind == WorkerKind::OpencodeSession {
-        Some(setup_omo_plugin_config_dir_with_read_only(!packet.tools.can_write)?)
+        Some(setup_omo_plugin_config_dir_with_read_only(
+            !packet.tools.can_write,
+        )?)
     } else {
         None
     };
@@ -5778,13 +5959,20 @@ fn start_command_backed_worker(
         task_attempt: task.attempt,
         worker_name: worker_name.to_string(),
         skip_worker: config.skip_worker,
-        command: route.worker_command.map(ToString::to_string),
+        command: match transport {
+            WorkerTransport::Command => route.worker_command.map(ToString::to_string),
+            WorkerTransport::AcpStdio => {
+                Some(acp_server_command(route.worker_kind, route.worker_command)?)
+            }
+        },
         // OpenCode owns its own provider/retry lifecycle.  A slow free model
         // and its paid fallback are both valid progress, so the generic Gear
         // stale-task timeout must not terminate the command while it is still
         // producing a result.  Fallback is driven by provider/process errors;
         // other worker kinds retain the configured command timeout.
-        command_timeout: if matches!(
+        command_timeout: if transport == WorkerTransport::AcpStdio {
+            None
+        } else if matches!(
             route.worker_kind,
             WorkerKind::Opencode | WorkerKind::OpencodeSession
         ) {
@@ -5816,6 +6004,8 @@ fn start_command_backed_worker(
         follow_up_count: Mutex::new(0),
         supports_interaction,
         omo_config_dir,
+        transport,
+        acp_session: Mutex::new(None),
     }))
 }
 
@@ -5862,6 +6052,8 @@ struct CommandWorkerSessionHandle {
     /// Temporary OMO plugin config directory (bound to handle lifetime).
     /// Dropping this handle cleans up the directory.
     omo_config_dir: Option<tempfile::TempDir>,
+    transport: WorkerTransport,
+    acp_session: Mutex<Option<Arc<AcpStdioSession>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -5872,6 +6064,952 @@ struct ResidentSessionState {
     interrupt_count: usize,
     turn_epoch: usize,
     stale_reason: Option<String>,
+}
+
+enum AcpIncoming {
+    Message(Value),
+    TransportError(String),
+}
+
+const CODEX_READ_ONLY_INITIAL_AGENT_MODE: &str = "read-only";
+const DEFAULT_CODEX_READ_ONLY_MCP_SERVERS: &[&str] = &["serena"];
+const DEFAULT_CODEX_READ_ONLY_PLUGINS: &[&str] = &["context-mode@context-mode"];
+
+#[derive(Clone, Debug)]
+struct CodexReadOnlySessionIsolation {
+    disabled_mcp_servers: Vec<String>,
+    disabled_plugins: Vec<String>,
+}
+
+struct CodexReadOnlyHome {
+    directory: tempfile::TempDir,
+    uses_existing_auth: bool,
+}
+
+fn requires_codex_read_only_session_isolation(
+    worker_kind: WorkerKind,
+    tool_policy: &WorkerToolPolicy,
+) -> bool {
+    worker_kind == WorkerKind::Codex && !tool_policy.can_write
+}
+
+fn codex_global_home() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".codex"))
+        })
+}
+
+fn codex_global_config_path() -> Option<PathBuf> {
+    codex_global_home().map(|home| home.join("config.toml"))
+}
+
+fn configured_codex_extension_names(
+    config_path: Option<&Path>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let Some(config_path) = config_path else {
+        return Ok((BTreeSet::new(), BTreeSet::new()));
+    };
+    let contents = match fs::read_to_string(config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read Codex config {}", config_path.display()));
+        }
+    };
+    let config: toml::Value = contents
+        .parse()
+        .with_context(|| format!("failed to parse Codex config {}", config_path.display()))?;
+    let config = config
+        .as_table()
+        .context("Codex config root must be a TOML table")?;
+    let mcp_servers = config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .map(|servers| servers.keys().cloned().collect())
+        .unwrap_or_default();
+    let plugins = config
+        .get("plugins")
+        .and_then(toml::Value::as_table)
+        .map(|plugins| plugins.keys().cloned().collect())
+        .unwrap_or_default();
+    Ok((mcp_servers, plugins))
+}
+
+fn codex_read_only_session_isolation_for_config_path(
+    config_path: Option<&Path>,
+) -> Result<CodexReadOnlySessionIsolation> {
+    let (configured_mcp_servers, configured_plugins) =
+        configured_codex_extension_names(config_path)?;
+    let mut disabled_mcp_servers = DEFAULT_CODEX_READ_ONLY_MCP_SERVERS
+        .iter()
+        .map(|server| (*server).to_string())
+        .collect::<BTreeSet<_>>();
+    disabled_mcp_servers.extend(configured_mcp_servers);
+    let mut disabled_plugins = DEFAULT_CODEX_READ_ONLY_PLUGINS
+        .iter()
+        .map(|plugin| (*plugin).to_string())
+        .collect::<BTreeSet<_>>();
+    disabled_plugins.extend(configured_plugins);
+    let disabled_mcp_servers = disabled_mcp_servers.into_iter().collect::<Vec<_>>();
+    let disabled_plugins = disabled_plugins.into_iter().collect::<Vec<_>>();
+    Ok(CodexReadOnlySessionIsolation {
+        disabled_mcp_servers,
+        disabled_plugins,
+    })
+}
+
+fn codex_read_only_session_isolation(
+    worker_kind: WorkerKind,
+    tool_policy: &WorkerToolPolicy,
+) -> Result<Option<CodexReadOnlySessionIsolation>> {
+    if !requires_codex_read_only_session_isolation(worker_kind, tool_policy) {
+        return Ok(None);
+    }
+    codex_read_only_session_isolation_for_config_path(codex_global_config_path().as_deref())
+        .map(Some)
+}
+
+fn create_codex_read_only_home_from_source(
+    source_home: Option<&Path>,
+) -> Result<CodexReadOnlyHome> {
+    let directory = tempfile::tempdir().context("failed to create private Codex home")?;
+    let Some(source_home) = source_home else {
+        return Ok(CodexReadOnlyHome {
+            directory,
+            uses_existing_auth: false,
+        });
+    };
+    let auth_source = source_home.join("auth.json");
+    let auth_metadata = match fs::metadata(&auth_source) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect Codex auth file {}",
+                    auth_source.display()
+                )
+            });
+        }
+    };
+    let Some(auth_metadata) = auth_metadata else {
+        return Ok(CodexReadOnlyHome {
+            directory,
+            uses_existing_auth: false,
+        });
+    };
+    if !auth_metadata.is_file() {
+        bail!(
+            "Codex auth path is not a regular file: {}",
+            auth_source.display()
+        );
+    }
+    let auth_target = directory.path().join("auth.json");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&auth_source, &auth_target).with_context(|| {
+        format!(
+            "failed to link existing Codex auth into private home {}",
+            auth_target.display()
+        )
+    })?;
+    #[cfg(not(unix))]
+    fs::copy(&auth_source, &auth_target).with_context(|| {
+        format!(
+            "failed to copy existing Codex auth into private home {}",
+            auth_target.display()
+        )
+    })?;
+    Ok(CodexReadOnlyHome {
+        directory,
+        uses_existing_auth: true,
+    })
+}
+
+fn create_codex_read_only_home() -> Result<CodexReadOnlyHome> {
+    let source_home = codex_global_home();
+    create_codex_read_only_home_from_source(source_home.as_deref())
+}
+
+struct AcpTurn {
+    response: Value,
+    events: Vec<Value>,
+    output: String,
+}
+
+/// A small headless ACP stdio client used by the Gear CLI and runtime.
+///
+/// This intentionally owns a real external ACP server. It does not route
+/// Codex, OpenCode, or Claude through the Zed native agent provider, which
+/// would make the worker and model identity unverifiable.
+struct AcpStdioSession {
+    child: Mutex<Child>,
+    owned_process_tree: Mutex<OwnedProcessTree>,
+    cleanup_artifact_path: PathBuf,
+    stdin: Mutex<ChildStdin>,
+    incoming: Mutex<Receiver<AcpIncoming>>,
+    next_request_id: AtomicUsize,
+    session_id: String,
+    agent_name: String,
+    agent_version: Option<String>,
+    events: Mutex<Vec<Value>>,
+    stderr: Arc<Mutex<String>>,
+    stopped: AtomicBool,
+    _codex_read_only_home_dir: Option<tempfile::TempDir>,
+}
+
+impl AcpStdioSession {
+    #[allow(clippy::disallowed_methods)]
+    fn connect(
+        command: &str,
+        workspace: &Path,
+        worker_kind: WorkerKind,
+        worker_model: Option<&str>,
+        tool_policy: &WorkerToolPolicy,
+        omo_config_dir: Option<&tempfile::TempDir>,
+        store: &StateStore,
+        task_id: &str,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Arc<Self>> {
+        let mut process = cancellable_shell_command(command);
+        process
+            .current_dir(workspace)
+            .env("GEARBOX_ACP_WORKSPACE", workspace)
+            .env("GEARBOX_WORKER_TRANSPORT", "acp-stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(worker_model) = worker_model {
+            process.env("GEARBOX_WORKER_MODEL", worker_model);
+        }
+        if matches!(
+            worker_kind,
+            WorkerKind::Opencode | WorkerKind::OpencodeSession
+        ) {
+            process.env("OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER", "true");
+        }
+        let codex_read_only_isolation =
+            codex_read_only_session_isolation(worker_kind, tool_policy)?;
+        let codex_read_only_home = codex_read_only_isolation
+            .is_some()
+            .then(create_codex_read_only_home)
+            .transpose()?;
+        if codex_read_only_isolation.is_some() {
+            let home = codex_read_only_home
+                .as_ref()
+                .context("strict Codex read-only ACP home was not created")?;
+            // Codex applies plugin and MCP configuration while its app server starts. A private
+            // home prevents inherited extensions, while the adapter's empty mcpServers request
+            // prevents client-supplied servers from entering this strict session.
+            process
+                .env("CODEX_HOME", home.directory.path())
+                .env("INITIAL_AGENT_MODE", CODEX_READ_ONLY_INITIAL_AGENT_MODE);
+        }
+        let codex_read_only_home_uses_existing_auth = codex_read_only_home
+            .as_ref()
+            .is_some_and(|home| home.uses_existing_auth);
+        let codex_read_only_home_dir = codex_read_only_home.map(|home| home.directory);
+        if let Some(omo_config_dir) = omo_config_dir {
+            process.env("XDG_CONFIG_HOME", omo_config_dir.path());
+        }
+
+        let mut child = process
+            .spawn()
+            .with_context(|| format!("failed to start ACP server for {}", worker_kind.as_str()))?;
+        let cleanup_artifact_path = store.worker_dir(task_id).join("acp-process-cleanup.json");
+        let mut owned_process_tree = OwnedProcessTree::new(child.id());
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                owned_process_tree.observe(child.id());
+                if let Err(error) = terminate_command_process_group(
+                    &mut child,
+                    &owned_process_tree,
+                    Some(&cleanup_artifact_path),
+                    "ACP stdio setup failed while taking stdout",
+                ) {
+                    eprintln!("Gear ACP cleanup failed after stdout setup error: {error}");
+                }
+                bail!("ACP server did not expose stdout")
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                owned_process_tree.observe(child.id());
+                if let Err(error) = terminate_command_process_group(
+                    &mut child,
+                    &owned_process_tree,
+                    Some(&cleanup_artifact_path),
+                    "ACP stdio setup failed while taking stdin",
+                ) {
+                    eprintln!("Gear ACP cleanup failed after stdin setup error: {error}");
+                }
+                bail!("ACP server did not expose stdin")
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                owned_process_tree.observe(child.id());
+                if let Err(error) = terminate_command_process_group(
+                    &mut child,
+                    &owned_process_tree,
+                    Some(&cleanup_artifact_path),
+                    "ACP stdio setup failed while taking stderr",
+                ) {
+                    eprintln!("Gear ACP cleanup failed after stderr setup error: {error}");
+                }
+                bail!("ACP server did not expose stderr")
+            }
+        };
+
+        let (incoming_tx, incoming_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let incoming = match line {
+                    Ok(line) => match serde_json::from_str::<Value>(&line) {
+                        Ok(message) => AcpIncoming::Message(message),
+                        Err(error) => AcpIncoming::TransportError(format!(
+                            "ACP server emitted invalid JSON-RPC line: {error}; line={line}"
+                        )),
+                    },
+                    Err(error) => AcpIncoming::TransportError(format!(
+                        "failed to read ACP server stdout: {error}"
+                    )),
+                };
+                if incoming_tx.send(incoming).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stderr_log = Arc::new(Mutex::new(String::new()));
+        let stderr_sink = stderr_log.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(line) => match stderr_sink.lock() {
+                        Ok(mut captured) => {
+                            captured.push_str(&line);
+                            captured.push('\n');
+                        }
+                        Err(_) => {
+                            eprintln!("Gear ACP stderr collector mutex poisoned");
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("Gear ACP stderr read failed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut session = Self {
+            child: Mutex::new(child),
+            owned_process_tree: Mutex::new(owned_process_tree),
+            cleanup_artifact_path,
+            stdin: Mutex::new(stdin),
+            incoming: Mutex::new(incoming_rx),
+            next_request_id: AtomicUsize::new(1),
+            session_id: String::new(),
+            agent_name: String::new(),
+            agent_version: None,
+            events: Mutex::new(Vec::new()),
+            stderr: stderr_log,
+            stopped: AtomicBool::new(false),
+            _codex_read_only_home_dir: codex_read_only_home_dir,
+        };
+
+        let initialize = session.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {
+                    "name": "gearbox",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }),
+            None,
+            cancellation_token,
+        )?;
+        let protocol_version = initialize
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .context("ACP initialize response omitted protocolVersion")?;
+        if protocol_version < 1 {
+            bail!("ACP server negotiated unsupported protocol version {protocol_version}");
+        }
+        let agent_info = initialize
+            .get("agentInfo")
+            .and_then(Value::as_object)
+            .context("ACP initialize response omitted agentInfo")?;
+        let agent_name = agent_info
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .context("ACP initialize response has an empty agentInfo.name")?
+            .to_string();
+        validate_acp_agent_identity(worker_kind, &agent_name)?;
+        let agent_version = agent_info
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|version| !version.trim().is_empty())
+            .map(ToOwned::to_owned);
+
+        let session_response = session.request(
+            "session/new",
+            json!({
+                "cwd": workspace,
+                "mcpServers": [],
+            }),
+            None,
+            cancellation_token,
+        )?;
+        let session_id = session_response
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .context("ACP session/new response omitted sessionId")?
+            .to_string();
+
+        session.session_id = session_id;
+        session.agent_name = agent_name;
+        session.agent_version = agent_version;
+        let session = Arc::new(session);
+        store.write_worker_json_atomic(
+            task_id,
+            "acp-initialize.json",
+            &json!({
+                "schema_version": 1,
+                "transport": "acp-stdio",
+                "worker": worker_kind.as_str(),
+                "server_command": command,
+                "codex_read_only_mcp_isolation": codex_read_only_isolation.as_ref().map(|isolation| json!({
+                    "strategy": "private_codex_home",
+                    "initial_agent_mode": CODEX_READ_ONLY_INITIAL_AGENT_MODE,
+                    "uses_existing_auth": codex_read_only_home_uses_existing_auth,
+                    "disabled_mcp_servers": isolation.disabled_mcp_servers.clone(),
+                    "disabled_plugins": isolation.disabled_plugins.clone(),
+                })),
+                "response": initialize,
+                "recorded_at": timestamp(),
+            }),
+        )?;
+        store.write_worker_json_atomic(
+            task_id,
+            "acp-session.json",
+            &json!({
+                "schema_version": 1,
+                "transport": "acp-stdio",
+                "worker": worker_kind.as_str(),
+                "agent_name": session.agent_name,
+                "agent_version": session.agent_version,
+                "session_id": session.session_id,
+                "response": session_response,
+                "recorded_at": timestamp(),
+            }),
+        )?;
+        session.configure(
+            worker_kind,
+            worker_model,
+            tool_policy,
+            &session_response,
+            store,
+            task_id,
+            cancellation_token,
+        )?;
+        Ok(session)
+    }
+
+    fn configure(
+        &self,
+        worker_kind: WorkerKind,
+        worker_model: Option<&str>,
+        tool_policy: &WorkerToolPolicy,
+        session_response: &Value,
+        store: &StateStore,
+        task_id: &str,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<()> {
+        let config_options = session_response
+            .get("configOptions")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let mut selections = Vec::new();
+        if let Some(worker_model) = worker_model {
+            let configured_model = acp_model_config_value(worker_kind, worker_model)?;
+            let requested_model = acp_canonical_model_identity(worker_kind, worker_model);
+            if !acp_config_option_supports(&config_options, "model", &configured_model) {
+                bail!(
+                    "ACP server {} does not advertise requested model `{worker_model}` as ACP value `{configured_model}`",
+                    self.agent_name
+                );
+            }
+            let response = self.request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": self.session_id,
+                    "configId": "model",
+                    "value": configured_model,
+                }),
+                None,
+                cancellation_token,
+            )?;
+            let applied_config_value =
+                acp_config_option_current_value(&response, "model").map(ToOwned::to_owned);
+            let applied_model = applied_config_value
+                .as_deref()
+                .map(|model| acp_canonical_model_identity(worker_kind, model));
+            let model_confirmed = applied_config_value.as_deref()
+                == Some(configured_model.as_str())
+                && applied_model.as_deref() == Some(requested_model.as_str());
+            selections.push(json!({
+                "config_id": "model",
+                "requested": &requested_model,
+                "requested_config_value": &configured_model,
+                "applied": &applied_model,
+                "applied_config_value": &applied_config_value,
+                "status": if model_confirmed { "applied" } else { "rejected" },
+                "response": &response,
+            }));
+            if !model_confirmed {
+                store.write_worker_json_atomic(
+                    task_id,
+                    "acp-config.json",
+                    &json!({
+                        "schema_version": 1,
+                        "transport": "acp-stdio",
+                        "agent_name": self.agent_name,
+                        "session_id": self.session_id,
+                        "advertised_options": config_options,
+                        "selections": selections,
+                        "configuration_error": format!(
+                            "ACP server {} did not confirm requested model `{requested_model}`",
+                            self.agent_name
+                        ),
+                        "recorded_at": timestamp(),
+                    }),
+                )?;
+                bail!(
+                    "ACP server {} did not confirm requested model `{requested_model}`",
+                    self.agent_name
+                );
+            }
+        }
+        if let Some(mode) = acp_supported_mode(worker_kind, tool_policy, &config_options) {
+            let response = self.request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": self.session_id,
+                    "configId": "mode",
+                    "value": mode,
+                }),
+                None,
+                cancellation_token,
+            )?;
+            let applied = acp_config_option_current_value(&response, "mode").map(ToOwned::to_owned);
+            selections.push(json!({
+                "config_id": "mode",
+                "requested": mode,
+                "applied": applied,
+                "status": if applied.as_deref() == Some(mode) { "applied" } else { "rejected" },
+                "response": &response,
+            }));
+            if applied.as_deref() != Some(mode) {
+                store.write_worker_json_atomic(
+                    task_id,
+                    "acp-config.json",
+                    &json!({
+                        "schema_version": 1,
+                        "transport": "acp-stdio",
+                        "agent_name": self.agent_name,
+                        "session_id": self.session_id,
+                        "advertised_options": config_options,
+                        "selections": selections,
+                        "configuration_error": format!(
+                            "ACP server {} did not confirm requested mode `{mode}`",
+                            self.agent_name
+                        ),
+                        "recorded_at": timestamp(),
+                    }),
+                )?;
+                bail!(
+                    "ACP server {} did not confirm requested mode `{mode}`",
+                    self.agent_name
+                );
+            }
+        }
+        store.write_worker_json_atomic(
+            task_id,
+            "acp-config.json",
+            &json!({
+                "schema_version": 1,
+                "transport": "acp-stdio",
+                "agent_name": self.agent_name,
+                "session_id": self.session_id,
+                "advertised_options": config_options,
+                "selections": selections,
+                "recorded_at": timestamp(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn prompt(
+        &self,
+        prompt: &str,
+        timeout: Option<Duration>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<AcpTurn> {
+        let event_start = self
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ACP event mutex poisoned"))?
+            .len();
+        let response = self.request(
+            "session/prompt",
+            json!({
+                "sessionId": self.session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": prompt,
+                }],
+            }),
+            timeout,
+            cancellation_token,
+        )?;
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ACP event mutex poisoned"))?
+            .iter()
+            .skip(event_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let output = acp_output_from_events(&events, &response);
+        Ok(AcpTurn {
+            response,
+            events,
+            output,
+        })
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Value> {
+        if self.stopped.load(Ordering::SeqCst) {
+            bail!("ACP session {} is no longer running", self.session_id);
+        }
+        let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        self.send_json(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }))?;
+        let started_at = SystemTime::now();
+        loop {
+            self.observe_owned_process_tree();
+            if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+                self.stop();
+                bail!("ACP {method} request was cancelled")
+            }
+            let wait = match timeout {
+                Some(timeout) => {
+                    let elapsed = started_at.elapsed().unwrap_or_default();
+                    let remaining = timeout.checked_sub(elapsed).unwrap_or_default();
+                    if remaining.is_zero() {
+                        self.stop();
+                        bail!("ACP {method} request exceeded the goal runtime deadline")
+                    }
+                    remaining.min(Duration::from_millis(100))
+                }
+                None => Duration::from_millis(100),
+            };
+            let incoming = self
+                .incoming
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ACP incoming channel mutex poisoned"))?
+                .recv_timeout(wait);
+            match incoming {
+                Ok(AcpIncoming::TransportError(error)) => bail!("ACP transport error: {error}"),
+                Ok(AcpIncoming::Message(message)) => {
+                    if message.get("id").and_then(Value::as_u64) == Some(request_id as u64) {
+                        if let Some(error) = message.get("error") {
+                            bail!("ACP {method} request failed: {error}")
+                        }
+                        return message
+                            .get("result")
+                            .cloned()
+                            .context("ACP response omitted result");
+                    }
+                    if message.get("id").is_some() && message.get("method").is_some() {
+                        self.respond_to_agent_request(&message)?;
+                    } else {
+                        self.events
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("ACP event mutex poisoned"))?
+                            .push(message);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    let stderr = self.stderr_output()?;
+                    bail!("ACP server disconnected while waiting for {method}; stderr: {stderr}")
+                }
+            }
+        }
+    }
+
+    fn observe_owned_process_tree(&self) {
+        let child_id = match self.child.lock() {
+            Ok(child) => child.id(),
+            Err(_) => {
+                eprintln!("Gear ACP child mutex poisoned while observing process tree");
+                return;
+            }
+        };
+        match self.owned_process_tree.lock() {
+            Ok(mut owned_process_tree) => owned_process_tree.observe(child_id),
+            Err(_) => eprintln!("Gear ACP process-tree mutex poisoned while observing cleanup"),
+        }
+    }
+
+    fn send_json(&self, message: Value) -> Result<()> {
+        let serialized =
+            serde_json::to_string(&message).context("failed to serialize ACP JSON-RPC request")?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ACP stdin mutex poisoned"))?;
+        stdin
+            .write_all(serialized.as_bytes())
+            .context("failed to write ACP JSON-RPC request")?;
+        stdin
+            .write_all(b"\n")
+            .context("failed to terminate ACP JSON-RPC request")?;
+        stdin
+            .flush()
+            .context("failed to flush ACP JSON-RPC request")?;
+        Ok(())
+    }
+
+    fn respond_to_agent_request(&self, request: &Value) -> Result<()> {
+        self.send_json(json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(Value::Null),
+            "error": {
+                "code": -32601,
+                "message": "Gear headless ACP worker did not advertise client tool support",
+            },
+        }))
+    }
+
+    fn stderr_output(&self) -> Result<String> {
+        Ok(self
+            .stderr
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ACP stderr mutex poisoned"))?
+            .clone())
+    }
+
+    fn stop(&self) {
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match self.child.lock() {
+            Ok(mut child) => {
+                match self.owned_process_tree.lock() {
+                    Ok(mut owned_process_tree) => {
+                        owned_process_tree.observe(child.id());
+                        if let Err(error) = terminate_command_process_group(
+                            &mut child,
+                            &owned_process_tree,
+                            Some(&self.cleanup_artifact_path),
+                            "ACP session stopped",
+                        ) {
+                            eprintln!("Gear ACP process-tree cleanup failed: {error:#}");
+                        }
+                    }
+                    Err(_) => eprintln!("Gear ACP process-tree mutex poisoned during cleanup"),
+                }
+            }
+            Err(_) => eprintln!("Gear ACP child mutex poisoned during cleanup"),
+        }
+    }
+}
+
+impl Drop for AcpStdioSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn validate_acp_agent_identity(worker_kind: WorkerKind, agent_name: &str) -> Result<()> {
+    let agent_name = agent_name.to_ascii_lowercase();
+    let expected = match worker_kind {
+        WorkerKind::Opencode | WorkerKind::OpencodeSession => Some("opencode"),
+        WorkerKind::Codex => Some("codex"),
+        WorkerKind::Claude => Some("claude"),
+        WorkerKind::Custom => None,
+        WorkerKind::ZedAgent => Some("zed"),
+    };
+    if let Some(expected) = expected
+        && !agent_name.contains(expected)
+    {
+        bail!(
+            "ACP server identity `{agent_name}` does not match {} worker",
+            worker_kind.as_str()
+        );
+    }
+    if matches!(
+        worker_kind,
+        WorkerKind::Opencode | WorkerKind::OpencodeSession | WorkerKind::Codex | WorkerKind::Claude
+    ) && agent_name.contains("zed")
+    {
+        bail!("provider worker may not be substituted by the Zed native ACP agent");
+    }
+    Ok(())
+}
+
+fn acp_config_option_supports(config_options: &Value, id: &str, requested: &str) -> bool {
+    config_options
+        .as_array()
+        .and_then(|options| {
+            options.iter().find(|option| {
+                option.get("id").and_then(Value::as_str) == Some(id)
+                    && (option.get("currentValue").and_then(Value::as_str) == Some(requested)
+                        || option
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .is_some_and(|values| {
+                                values.iter().any(|value| {
+                                    value.get("value").and_then(Value::as_str) == Some(requested)
+                                        || value.as_str() == Some(requested)
+                                })
+                            }))
+            })
+        })
+        .is_some()
+}
+
+fn acp_model_config_value(worker_kind: WorkerKind, worker_model: &str) -> Result<String> {
+    let worker_model = worker_model.trim();
+    if worker_model.is_empty() {
+        bail!("ACP worker model cannot be empty");
+    }
+    if worker_kind != WorkerKind::Codex {
+        return Ok(worker_model.to_string());
+    }
+    let Some((provider_id, model_id)) = worker_model.split_once('/') else {
+        return Ok(worker_model.to_string());
+    };
+    if provider_id != "openai" || model_id.trim().is_empty() {
+        bail!(
+            "Codex ACP model `{worker_model}` must use `openai/<model>` when it is provider-qualified"
+        );
+    }
+    Ok(model_id.trim().to_string())
+}
+
+fn acp_canonical_model_identity(worker_kind: WorkerKind, model: &str) -> String {
+    let model = model.trim();
+    if worker_kind == WorkerKind::Codex && !model.contains('/') {
+        return format!("openai/{model}");
+    }
+    model.to_string()
+}
+
+fn acp_config_option_current_value<'a>(response: &'a Value, id: &str) -> Option<&'a str> {
+    response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .and_then(|option| option.get("currentValue"))
+        .and_then(Value::as_str)
+}
+
+fn acp_supported_mode(
+    worker_kind: WorkerKind,
+    tool_policy: &WorkerToolPolicy,
+    config_options: &Value,
+) -> Option<&'static str> {
+    let candidates: &[&str] = if tool_policy.can_write {
+        match worker_kind {
+            WorkerKind::Opencode | WorkerKind::OpencodeSession => &["build"],
+            WorkerKind::Codex => &["agent", "full"],
+            WorkerKind::Claude => &["agent", "build"],
+            WorkerKind::Custom | WorkerKind::ZedAgent => &[],
+        }
+    } else {
+        match worker_kind {
+            WorkerKind::Opencode | WorkerKind::OpencodeSession => &["plan", "read-only"],
+            WorkerKind::Codex | WorkerKind::Claude => &["read-only", "plan"],
+            WorkerKind::Custom | WorkerKind::ZedAgent => &[],
+        }
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| acp_config_option_supports(config_options, "mode", candidate))
+}
+
+fn acp_output_from_events(events: &[Value], response: &Value) -> String {
+    let mut chunks = Vec::new();
+    for event in events {
+        acp_collect_text(event, &mut chunks);
+    }
+    if chunks.is_empty() {
+        acp_collect_text(response, &mut chunks);
+    }
+    if chunks.is_empty() {
+        serde_json::to_string_pretty(response)
+            .unwrap_or_else(|_| "ACP prompt completed".to_string())
+    } else {
+        chunks.join("")
+    }
+}
+
+fn acp_collect_text(value: &Value, chunks: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = object.get("text").and_then(Value::as_str)
+            {
+                chunks.push(text.to_string());
+                return;
+            }
+            for child in object.values() {
+                acp_collect_text(child, chunks);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                acp_collect_text(child, chunks);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 /// Durable admission receipt for a command rejected before a child process
@@ -5955,6 +7093,207 @@ impl ToolPairValidationReceipt {
 }
 
 impl CommandWorkerSessionHandle {
+    fn acp_session(
+        &self,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Arc<AcpStdioSession>> {
+        let mut session = self
+            .acp_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ACP session mutex poisoned"))?;
+        if let Some(session) = session.as_ref() {
+            return Ok(session.clone());
+        }
+        let command = self
+            .command
+            .as_deref()
+            .context("ACP server command missing")?;
+        let session_handle = AcpStdioSession::connect(
+            command,
+            &self.workspace,
+            WorkerKind::parse(&self.worker_name).context("unknown ACP worker kind")?,
+            self.worker_model.as_deref(),
+            &self.tool_policy,
+            self.omo_config_dir.as_ref(),
+            &self.store,
+            &self.task_id,
+            cancellation_token,
+        )?;
+        *session = Some(session_handle.clone());
+        Ok(session_handle)
+    }
+
+    fn clear_acp_session(&self) {
+        match self.acp_session.lock() {
+            Ok(mut session) => {
+                session.take();
+            }
+            Err(_) => eprintln!("Gear ACP session mutex poisoned during cleanup"),
+        }
+    }
+
+    fn execute_acp_with_prompt(
+        &self,
+        prompt_path: &Path,
+        stdout_file: &str,
+        stderr_file: &str,
+    ) -> Result<WorkerResult> {
+        let command = self
+            .command
+            .as_deref()
+            .context("ACP server command missing")?;
+        let turn_kind = Self::turn_kind_from_files(stdout_file, stderr_file);
+        self.with_session_state(|state| {
+            state.turn_epoch += 1;
+            state.active_command = true;
+        })?;
+        self.emit_event(WorkerEvent::TurnStarted {
+            kind: turn_kind.clone(),
+            prompt_path: prompt_path.to_path_buf(),
+        })?;
+        if let Some(matched_pattern) = is_destructive_command(command) {
+            return self.reject_destructive_command(
+                prompt_path,
+                &turn_kind,
+                command,
+                matched_pattern,
+            );
+        }
+        let cancellation_token =
+            self.with_session_state(|state| state.cancellation_token.clone())?;
+        let timeout = self.command_timeout;
+        let prompt = fs::read_to_string(prompt_path)
+            .with_context(|| format!("failed to read ACP prompt {}", prompt_path.display()))?;
+        let turn = self
+            .acp_session(Some(&cancellation_token))
+            .and_then(|session| session.prompt(&prompt, timeout, Some(&cancellation_token)));
+        self.with_session_state(|state| {
+            state.active_command = false;
+            if cancellation_token.is_cancelled() {
+                state.stale_reason = Some("cancelled ACP session".to_string());
+            } else if turn.is_ok() {
+                state.stale_reason = None;
+            }
+        })?;
+        let turn = match turn {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.clear_acp_session();
+                self.store.write_worker_json_atomic(
+                    &self.task_id,
+                    &format!("acp-error-{turn_kind}.json"),
+                    &json!({
+                        "schema_version": 1,
+                        "transport": "acp-stdio",
+                        "task_id": self.task_id,
+                        "worker": self.worker_name,
+                        "turn_kind": turn_kind,
+                        "error": format!("{error:#}"),
+                        "recorded_at": timestamp(),
+                    }),
+                )?;
+                self.emit_event(WorkerEvent::Error {
+                    kind: turn_kind,
+                    message: format!("{error:#}"),
+                })?;
+                return Err(error);
+            }
+        };
+        let session = self.acp_session(Some(&cancellation_token))?;
+        let stderr = session.stderr_output()?;
+        let events = turn
+            .events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        let event_log = if events.is_empty() {
+            String::new()
+        } else {
+            format!("{events}\n")
+        };
+        self.store.write_worker_file(
+            &self.task_id,
+            &format!("acp-events-{turn_kind}.jsonl"),
+            &event_log,
+        )?;
+        self.store.write_worker_json_atomic(
+            &self.task_id,
+            &format!("acp-turn-{turn_kind}.json"),
+            &json!({
+                "schema_version": 1,
+                "transport": "acp-stdio",
+                "task_id": self.task_id,
+                "worker": self.worker_name,
+                "session_id": session.session_id,
+                "agent_name": session.agent_name,
+                "agent_version": session.agent_version,
+                "response": turn.response,
+                "event_count": turn.events.len(),
+                "recorded_at": timestamp(),
+            }),
+        )?;
+        let stdout_path = self
+            .store
+            .write_worker_file(&self.task_id, stdout_file, &turn.output)?;
+        let stderr_path = self
+            .store
+            .write_worker_file(&self.task_id, stderr_file, &stderr)?;
+        let last_message_path = self.store.write_worker_file(
+            &self.task_id,
+            &format!("{stdout_file}.last-message.md"),
+            &turn.output,
+        )?;
+        self.store.write_worker_file(
+            &self.task_id,
+            "partial-output.md",
+            &format!(
+                "# Gear worker ACP output\n\n## session/update\n\n{}\n\n## server stderr\n\n{}\n",
+                turn.output, stderr
+            ),
+        )?;
+        if !turn.output.is_empty() {
+            self.emit_event(WorkerEvent::AssistantTextDelta {
+                kind: turn_kind.clone(),
+                delta: turn.output.clone(),
+            })?;
+        }
+        self.emit_event(WorkerEvent::WorkerStdout {
+            kind: turn_kind.clone(),
+            output: turn.output,
+        })?;
+        if !stderr.is_empty() {
+            self.emit_event(WorkerEvent::WorkerStderr {
+                kind: turn_kind.clone(),
+                output: stderr,
+            })?;
+        }
+        let result = WorkerResult {
+            status: WorkerStatus::Succeeded,
+            command: Some(format!("acp-stdio: {command}")),
+            exit_code: None,
+            summary: format!(
+                "ACP {} session {} completed through {}.",
+                self.worker_name, session.session_id, session.agent_name
+            ),
+            packet_path: self.packet_path.clone(),
+            prompt_path: prompt_path.to_path_buf(),
+            stdout_path: Some(stdout_path),
+            stderr_path: Some(stderr_path),
+            last_message_path: Some(last_message_path),
+            result_path: self.store.worker_dir(&self.task_id).join("result.json"),
+            outcome_path: self.store.worker_dir(&self.task_id).join("outcome.json"),
+        };
+        write_result_and_outcome(&self.store, &self.task_id, &result)?;
+        self.emit_event(WorkerEvent::TurnFinished {
+            kind: turn_kind,
+            result_path: result.result_path.clone(),
+            outcome_path: result.outcome_path.clone(),
+            summary: result.summary.clone(),
+        })?;
+        Ok(result)
+    }
+
     fn reject_destructive_command(
         &self,
         prompt_path: &Path,
@@ -6056,7 +7395,9 @@ impl CommandWorkerSessionHandle {
             return Ok(result);
         }
 
-        let result = if self.skip_worker || self.command.is_none() {
+        let result = if self.skip_worker
+            || (self.transport == WorkerTransport::Command && self.command.is_none())
+        {
             let summary = if self.skip_worker {
                 "Worker execution was skipped by CLI option."
             } else {
@@ -6075,6 +7416,8 @@ impl CommandWorkerSessionHandle {
                 result_path: self.store.worker_dir(&self.task_id).join("result.json"),
                 outcome_path: self.store.worker_dir(&self.task_id).join("outcome.json"),
             }
+        } else if self.transport == WorkerTransport::AcpStdio {
+            self.execute_command()?
         } else if let Some(command) = self.command.as_deref() {
             if is_destructive_command(command).is_some() {
                 self.execute_command()?
@@ -6118,6 +7461,9 @@ impl CommandWorkerSessionHandle {
         stdout_file: &str,
         stderr_file: &str,
     ) -> Result<WorkerResult> {
+        if self.transport == WorkerTransport::AcpStdio {
+            return self.execute_acp_with_prompt(prompt_path, stdout_file, stderr_file);
+        }
         let command = self.command.as_deref().context("worker command missing")?;
         let turn_kind = Self::turn_kind_from_files(stdout_file, stderr_file);
         self.with_session_state(|state| {
@@ -6139,11 +7485,8 @@ impl CommandWorkerSessionHandle {
             state.active_command = true;
             state.cancellation_token.clone()
         })?;
-        let external_timeout = worker_external_timeout(
-            &self.store,
-            &self.task_id,
-            self.command_timeout,
-        )?;
+        let external_timeout =
+            worker_external_timeout(&self.store, &self.task_id, self.command_timeout)?;
         let mut env = HashMap::new();
         let turn_epoch = self.with_session_state(|state| state.turn_epoch)?;
         let worker_directory = self.store.worker_dir(&self.task_id);
@@ -6155,14 +7498,8 @@ impl CommandWorkerSessionHandle {
             "GEARBOX_WORKER_DIR".to_string(),
             worker_directory.to_string_lossy().to_string(),
         );
-        env.insert(
-            "GEARBOX_EXTERNAL_TASK_ID".to_string(),
-            self.task_id.clone(),
-        );
-        env.insert(
-            "GEARBOX_WORKER_TASK_ID".to_string(),
-            self.task_id.clone(),
-        );
+        env.insert("GEARBOX_EXTERNAL_TASK_ID".to_string(), self.task_id.clone());
+        env.insert("GEARBOX_WORKER_TASK_ID".to_string(), self.task_id.clone());
         env.insert(
             "GEARBOX_EXTERNAL_OWNER".to_string(),
             self.worker_name.clone(),
@@ -6391,9 +7728,7 @@ impl CommandWorkerSessionHandle {
                     }))?
                 ),
             )?;
-            if is_free_model(self.worker_model.as_deref())
-                && provider_error_is_free_quota(label)
-            {
+            if is_free_model(self.worker_model.as_deref()) && provider_error_is_free_quota(label) {
                 self.record_global_free_provider_cooldown(label)?;
             }
         }
@@ -6507,8 +7842,8 @@ impl CommandWorkerSessionHandle {
         let source_attempt = self
             .with_session_state(|state| state.turn_epoch)
             .unwrap_or_default();
-        self.store.write_global_provider_cooldown(
-            GlobalProviderCooldown {
+        self.store
+            .write_global_provider_cooldown(GlobalProviderCooldown {
                 schema_version: crate::state::GLOBAL_PROVIDER_COOLDOWN_SCHEMA_VERSION,
                 provider_scope: "opencode-free-tier".to_string(),
                 failed_models,
@@ -6519,8 +7854,7 @@ impl CommandWorkerSessionHandle {
                 source_attempt,
                 recorded_at: timestamp(),
                 receipt_hash: String::new(),
-            },
-        )?;
+            })?;
         Ok(())
     }
 
@@ -6626,6 +7960,9 @@ impl CommandWorkerSessionHandle {
             .result
             .lock()
             .map_err(|_| anyhow::anyhow!("worker result mutex poisoned"))? = None;
+        if self.transport == WorkerTransport::AcpStdio {
+            self.clear_acp_session();
+        }
         Ok(())
     }
 
@@ -6805,20 +8142,14 @@ impl CommandWorkerSessionHandle {
                 Some("tool-call group was truncated before its closing tag"),
             )
         } else if orphan_finished > 0 {
-            (
-                "error",
-                Some("tool-call result had no matching invocation"),
-            )
+            ("error", Some("tool-call result had no matching invocation"))
         } else if unknown_results > 0 {
             (
                 "unknown",
                 Some("command-backed worker output did not contain tool results"),
             )
         } else if started_calls != finished_calls {
-            (
-                "error",
-                Some("tool-call start/result counts did not match"),
-            )
+            ("error", Some("tool-call start/result counts did not match"))
         } else {
             ("pass", None)
         };
@@ -6845,11 +8176,8 @@ impl CommandWorkerSessionHandle {
         }
         .seal()?;
         let receipt_file = format!("tool-pair-validation-{kind}-{turn_epoch}.json");
-        self.store.write_worker_json_atomic(
-            &self.task_id,
-            &receipt_file,
-            &receipt,
-        )?;
+        self.store
+            .write_worker_json_atomic(&self.task_id, &receipt_file, &receipt)?;
         // Keep a stable latest receipt for runtime consumers while retaining
         // one immutable receipt per turn for replay and audit.
         self.store.write_worker_json_atomic(
@@ -6895,6 +8223,12 @@ impl CommandWorkerSessionHandle {
 
 impl WorkerSessionHandle for CommandWorkerSessionHandle {
     fn session_id(&self) -> Option<String> {
+        if self.transport == WorkerTransport::AcpStdio
+            && let Ok(session) = self.acp_session.lock()
+            && let Some(session) = session.as_ref()
+        {
+            return Some(session.session_id.clone());
+        }
         if !self.supports_interaction {
             return None;
         }
@@ -6926,6 +8260,9 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
             state.stale_reason = Some(reason.clone());
             (interrupt_count, reason)
         })?;
+        if self.transport == WorkerTransport::AcpStdio {
+            self.clear_acp_session();
+        }
         if self.supports_interaction {
             self.store.write_worker_file(
                 &self.task_id,
@@ -6946,6 +8283,9 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
                 state.stale_reason = Some("cancelled while idle".to_string());
             }
         })?;
+        if self.transport == WorkerTransport::AcpStdio {
+            self.clear_acp_session();
+        }
         Ok(())
     }
 
@@ -6954,6 +8294,9 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
     }
 
     fn dispose(&self) -> Result<()> {
+        if self.transport == WorkerTransport::AcpStdio {
+            self.clear_acp_session();
+        }
         if self.supports_interaction {
             self.store.write_worker_file(
                 &self.task_id,
@@ -7030,8 +8373,8 @@ fn worker_prompt_packet_json(packet: &WorkerPacket) -> Result<String> {
         return serde_json::to_string_pretty(packet)
             .context("failed to serialize worker prompt packet");
     };
-    let mut packet_value = serde_json::to_value(packet)
-        .context("failed to serialize worker prompt packet value")?;
+    let mut packet_value =
+        serde_json::to_value(packet).context("failed to serialize worker prompt packet value")?;
     packet_value["goal"] = Value::String(marker);
     serde_json::to_string_pretty(&packet_value)
         .context("failed to serialize bounded phase worker prompt packet")
@@ -7158,10 +8501,7 @@ Return a concise report with:
 /// marked `included: true` in the capsule. Hard sections (identity,
 /// task_contract) are always included. Omitted soft sections are removed
 /// from the packet fields and do not appear in the rendered prompt.
-pub fn worker_compiled_prompt(
-    packet: &WorkerPacket,
-    capsule: &PromptCapsule,
-) -> Result<String> {
+pub fn worker_compiled_prompt(packet: &WorkerPacket, capsule: &PromptCapsule) -> Result<String> {
     let included_ids: std::collections::HashSet<&str> = capsule
         .sections
         .iter()
@@ -7182,9 +8522,11 @@ pub fn worker_compiled_prompt(
     let mut reduced = packet.clone();
     let mut bounded_sections = Vec::new();
 
-    for section in capsule.sections.iter().filter(|section| {
-        !section.required && section.included && section.clipped
-    }) {
+    for section in capsule
+        .sections
+        .iter()
+        .filter(|section| !section.required && section.included && section.clipped)
+    {
         let content = prompt_section_content(packet, &section.id)?;
         let bounded = clip_text_head_tail(&content, section.retained_tokens);
         if !bounded.is_empty() {
@@ -7192,10 +8534,11 @@ pub fn worker_compiled_prompt(
         }
     }
 
-    if !included_ids.contains("route") || capsule
-        .sections
-        .iter()
-        .any(|section| section.id == "route" && section.clipped)
+    if !included_ids.contains("route")
+        || capsule
+            .sections
+            .iter()
+            .any(|section| section.id == "route" && section.clipped)
     {
         reduced.worker_model = None;
         reduced.variant = None;
@@ -7210,10 +8553,11 @@ pub fn worker_compiled_prompt(
         reduced.coordinator_model = None;
     }
 
-    if !included_ids.contains("context") || capsule
-        .sections
-        .iter()
-        .any(|section| section.id == "context" && section.clipped)
+    if !included_ids.contains("context")
+        || capsule
+            .sections
+            .iter()
+            .any(|section| section.id == "context" && section.clipped)
     {
         reduced.inputs.spec_path = None;
         reduced.inputs.plan_path = None;
@@ -7221,10 +8565,11 @@ pub fn worker_compiled_prompt(
         reduced.coordinator_brief = None;
     }
 
-    if !included_ids.contains("route_append") || capsule
-        .sections
-        .iter()
-        .any(|section| section.id == "route_append" && section.clipped)
+    if !included_ids.contains("route_append")
+        || capsule
+            .sections
+            .iter()
+            .any(|section| section.id == "route_append" && section.clipped)
     {
         reduced.prompt_append = None;
     }
@@ -7249,9 +8594,7 @@ pub fn worker_compiled_prompt(
 
     let mut compiled = worker_prompt(&reduced)?;
     for (section_id, bounded) in bounded_sections {
-        compiled.push_str(&format!(
-            "\n## Bounded {section_id} context\n\n{bounded}\n"
-        ));
+        compiled.push_str(&format!("\n## Bounded {section_id} context\n\n{bounded}\n"));
     }
     Ok(compiled)
 }
@@ -7474,15 +8817,11 @@ pub fn prompt_manifest_hash(manifest: &PromptManifest) -> Result<String> {
 
 pub const PROMPT_CAPSULE_SCHEMA_VERSION: u32 = 1;
 
-/// Conservative default context budget used when the worker model cannot
-/// advertise an exact context limit. The value is intentionally conservative
-/// and flagged `estimated` so downstream consumers know it is not authoritative.
-// The packet hard contract itself is larger than the historical 8k fallback
-// for real PlanGraph tasks. Keep an explicit override available for providers
-// with smaller contexts, but make the unknown-model default large enough to
-// admit the durable contract before soft sections are clipped.
-const DEFAULT_CONTEXT_LIMIT_TOKENS: usize = 12288;
-const DEFAULT_PAID_CONTEXT_LIMIT_TOKENS: usize = 32768;
+/// Gear does not own the provider's context limit. OpenCode and Codex workers
+/// receive the compiled prompt and their backend enforces the actual model
+/// limit. A finite value is used only when an operator explicitly configures
+/// `GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS[_<MODEL>]` for a constrained route.
+const BACKEND_OWNED_CONTEXT_LIMIT_TOKENS: usize = usize::MAX;
 /// Output headroom is opt-in because providers expose different completion
 /// limits.  A caller that knows the provider's output contract can reserve
 /// space without changing the context limit itself.
@@ -7563,7 +8902,13 @@ fn prompt_budget_policy(runtime_model: Option<&str>) -> PromptBudgetPolicy {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .map(|value| (value, false, "config:GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS".to_string()))
+        .map(|value| {
+            (
+                value,
+                false,
+                "config:GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS".to_string(),
+            )
+        })
         .or_else(|| {
             model_variable.as_deref().and_then(|variable| {
                 env::var(variable)
@@ -7574,45 +8919,27 @@ fn prompt_budget_policy(runtime_model: Option<&str>) -> PromptBudgetPolicy {
             })
         })
         .unwrap_or_else(|| {
-            let normalized_model = runtime_model
-                .map(|model| model.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            let paid_model = normalized_model
-                .strip_prefix("opencode-go/")
-                .is_some_and(|model| !model.trim().is_empty());
-            let deepseek_flash_model = normalized_model.contains("deepseek-v4-flash");
-            if paid_model || deepseek_flash_model {
-                (
-                    DEFAULT_PAID_CONTEXT_LIMIT_TOKENS,
-                    true,
-                    if deepseek_flash_model {
-                        "deepseek_flash_conservative_default".to_string()
-                    } else {
-                        "paid_model_conservative_default".to_string()
-                    },
-                )
-            } else {
-                (
-                    DEFAULT_CONTEXT_LIMIT_TOKENS,
-                    true,
-                    "conservative_default".to_string(),
-                )
-            }
+            (
+                BACKEND_OWNED_CONTEXT_LIMIT_TOKENS,
+                true,
+                "backend_owned_context_limit".to_string(),
+            )
         });
 
-    let (reserved_output_tokens, headroom_source) = match env::var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-    {
-        Some(value) => (
-            value.min(context_limit_tokens),
-            "config:GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS".to_string(),
-        ),
-        None => (
-            DEFAULT_RESERVED_OUTPUT_TOKENS,
-            "default:GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS".to_string(),
-        ),
-    };
+    let (reserved_output_tokens, headroom_source) =
+        match env::var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+        {
+            Some(value) => (
+                value.min(context_limit_tokens),
+                "config:GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS".to_string(),
+            ),
+            None => (
+                DEFAULT_RESERVED_OUTPUT_TOKENS,
+                "default:GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS".to_string(),
+            ),
+        };
 
     PromptBudgetPolicy {
         context_limit_tokens,
@@ -7632,12 +8959,7 @@ pub fn prompt_capsule_recovery_key(
     semantic_contract_hash: &str,
     reason: &PromptCapsuleRecoveryReason,
 ) -> String {
-    format!(
-        "{}:{}:{}",
-        task_id,
-        semantic_contract_hash,
-        reason.as_key()
-    )
+    format!("{}:{}:{}", task_id, semantic_contract_hash, reason.as_key())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7780,11 +9102,7 @@ impl PromptCapsule {
     /// authoritative for the current dispatch. A capsule can outlive a
     /// session, so checking only its schema/required flags would allow stale
     /// route or task identity to be reused after recovery.
-    pub fn validate_against(
-        &self,
-        packet: &WorkerPacket,
-        manifest: &PromptManifest,
-    ) -> Result<()> {
+    pub fn validate_against(&self, packet: &WorkerPacket, manifest: &PromptManifest) -> Result<()> {
         self.validate()?;
         if self.task_id != packet.task_id {
             bail!("prompt capsule task identity does not match worker packet");
@@ -7811,15 +9129,27 @@ impl PromptCapsule {
             bail!("prompt capsule used token count exceeds budget");
         }
         for required in manifest.sections.iter().filter(|section| section.required) {
-            let Some(capsule_section) = self.sections.iter().find(|section| section.id == required.id)
+            let Some(capsule_section) = self
+                .sections
+                .iter()
+                .find(|section| section.id == required.id)
             else {
-                bail!("prompt capsule is missing required section `{}`", required.id);
+                bail!(
+                    "prompt capsule is missing required section `{}`",
+                    required.id
+                );
             };
             if !capsule_section.included || !capsule_section.required {
-                bail!("prompt capsule required section `{}` is not included", required.id);
+                bail!(
+                    "prompt capsule required section `{}` is not included",
+                    required.id
+                );
             }
             if capsule_section.content_hash != required.content_hash {
-                bail!("prompt capsule section `{}` content hash mismatch", required.id);
+                bail!(
+                    "prompt capsule section `{}` content hash mismatch",
+                    required.id
+                );
             }
         }
         Ok(())
@@ -7910,17 +9240,15 @@ pub fn build_prompt_capsule(
                     section.retained_bytes = clipped.len();
                     section.retained_tokens = retained_tokens;
                     section.deleted_bytes = section.bytes.saturating_sub(clipped.len());
-                    section.deleted_tokens = section
-                        .estimated_tokens
-                        .saturating_sub(retained_tokens);
+                    section.deleted_tokens =
+                        section.estimated_tokens.saturating_sub(retained_tokens);
                     section.freshness = "bounded_head_tail".to_string();
                     section.omission_reason = Some(format!(
                         "bounded head/tail clip: retained {} of {} tokens",
                         retained_tokens, section.estimated_tokens
                     ));
                     remaining = remaining.saturating_sub(
-                        retained_tokens
-                            .saturating_add(CLIPPED_SECTION_OVERHEAD_TOKENS),
+                        retained_tokens.saturating_add(CLIPPED_SECTION_OVERHEAD_TOKENS),
                     );
                     continue;
                 }
@@ -7954,10 +9282,9 @@ pub fn build_prompt_capsule(
         })
         .sum();
 
-    let model_family =
-        runtime_model
-            .as_deref()
-            .map(|model| prompt_model_family(Some(model), packet.worker.as_str()));
+    let model_family = runtime_model
+        .as_deref()
+        .map(|model| prompt_model_family(Some(model), packet.worker.as_str()));
 
     let capsule = PromptCapsule {
         schema_version: PROMPT_CAPSULE_SCHEMA_VERSION,
@@ -8085,8 +9412,9 @@ fn compile_recovery_prompt_with_attempt(
 
     let packet: WorkerPacket = match fs::read_to_string(packet_path)
         .map_err(|e| anyhow::anyhow!("failed to read worker packet: {e}"))
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("invalid packet JSON: {e}")))
-    {
+        .and_then(|s| {
+            serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("invalid packet JSON: {e}"))
+        }) {
         Ok(p) => p,
         Err(e) => {
             let receipt = serde_json::json!({
@@ -8113,8 +9441,9 @@ fn compile_recovery_prompt_with_attempt(
     };
     let manifest: PromptManifest = match fs::read_to_string(manifest_path)
         .map_err(|e| anyhow::anyhow!("failed to read prompt manifest: {e}"))
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("invalid manifest JSON: {e}")))
-    {
+        .and_then(|s| {
+            serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("invalid manifest JSON: {e}"))
+        }) {
         Ok(m) => m,
         Err(e) => {
             let receipt = serde_json::json!({
@@ -8172,8 +9501,9 @@ fn compile_recovery_prompt_with_attempt(
     let capsule: PromptCapsule = if capsule_path.exists() {
         match fs::read_to_string(capsule_path)
             .map_err(|e| anyhow::anyhow!("failed to read prompt capsule: {e}"))
-            .and_then(|s| serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("invalid capsule JSON: {e}")))
-        {
+            .and_then(|s| {
+                serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("invalid capsule JSON: {e}"))
+            }) {
             Ok(c) => c,
             Err(e) => {
                 let receipt = serde_json::json!({
@@ -8225,9 +9555,9 @@ fn compile_recovery_prompt_with_attempt(
                     .is_some_and(|value| value == manifest_hash);
             if receipt_matches_current_contract
                 && receipt_val
-                .get("status")
-                .and_then(|s| s.as_str())
-                .is_some_and(|s| s == "compiled")
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s == "compiled")
             {
                 if let Some(compiled_path_str) = receipt_val
                     .get("compiled_prompt_path")
@@ -8326,11 +9656,8 @@ fn compile_recovery_prompt_with_attempt(
         }
     };
     let full_prompt = format!("{base_compiled}{bounded_recovery}");
-    let compiled_path = store.write_worker_file(
-        task_id,
-        &format!("{output_stem}-compiled.md"),
-        &full_prompt,
-    )?;
+    let compiled_path =
+        store.write_worker_file(task_id, &format!("{output_stem}-compiled.md"), &full_prompt)?;
     store.write_worker_file(
         task_id,
         &format!("{output_stem}-recovery-full.md"),
@@ -8397,9 +9724,7 @@ fn compile_recovery_prompt_with_attempt(
 /// re-reading the (possibly compacted) transcript. Returns the running or first
 /// pending step so compact/empty-response rebuilds resume the same logical
 /// step rather than restarting from scratch.
-pub fn recover_current_step_id(
-    execution_steps: &[crate::state::PlanStepRun],
-) -> Option<String> {
+pub fn recover_current_step_id(execution_steps: &[crate::state::PlanStepRun]) -> Option<String> {
     let completed = execution_steps
         .iter()
         .filter(|step| matches!(step.status, crate::state::PlanStepRunStatus::Completed))
@@ -8776,8 +10101,14 @@ fn parsed_worker_report(result: &WorkerResult) -> ParsedWorkerReport {
     let mut current_section: Option<String> = None;
 
     for line in text.lines() {
-        if let Some(section) = worker_report_section_name(line) {
+        if let Some((section, inline_value)) = worker_report_section_line(line) {
             current_section = Some(section.to_string());
+            if let Some(inline_value) = inline_value {
+                sections
+                    .entry(section.to_string())
+                    .or_default()
+                    .push(inline_value.to_string());
+            }
             continue;
         }
         if let Some(section) = current_section.as_ref() {
@@ -8800,7 +10131,7 @@ fn parsed_worker_report(result: &WorkerResult) -> ParsedWorkerReport {
         changed_files: section_list(sections.get("changed_files")),
         commands_run: section_list(sections.get("commands_run")),
         known_failures: section_list(sections.get("known_failures")),
-        completed_step_ids: section_list(sections.get("completed_steps")),
+        completed_step_ids: section_step_ids(sections.get("completed_steps")),
         step_evidence: section_map(sections.get("step_evidence")),
     }
 }
@@ -8832,8 +10163,13 @@ fn section_list_from_result(result: &WorkerResult, name: &str) -> Vec<String> {
     let mut in_section = false;
     let mut values = Vec::new();
     for line in text.lines() {
-        if let Some(section) = worker_report_section_name(line) {
+        if let Some((section, inline_value)) = worker_report_section_line(line) {
             in_section = section == name;
+            if in_section
+                && let Some(inline_value) = inline_value
+            {
+                values.push(inline_value.to_string());
+            }
             continue;
         }
         if in_section {
@@ -8861,7 +10197,9 @@ pub fn worker_step_evidence_from_result(result: &WorkerResult) -> WorkerStepEvid
         .and_then(|path| fs::read_to_string(path).ok())
         .is_some_and(|text| {
             text.lines()
-                .any(|line| worker_report_section_name(line) == Some("completed_steps"))
+                .any(|line| {
+                    worker_report_section_name(line) == Some("completed_steps")
+                })
         });
     WorkerStepEvidenceReport {
         declared,
@@ -8890,7 +10228,10 @@ pub fn worker_output_indicates_provider_error(stdout: &str, stderr: &str) -> Opt
         ("limit exhausted", "provider limit exhausted"),
         ("cooling down", "provider cooling down"),
         ("service unavailable", "provider service unavailable"),
-        ("temporarily unavailable", "provider temporarily unavailable"),
+        (
+            "temporarily unavailable",
+            "provider temporarily unavailable",
+        ),
         ("overloaded", "provider overloaded"),
         ("model not found", "provider model not found"),
         ("model unavailable", "provider model unavailable"),
@@ -8915,7 +10256,11 @@ pub fn worker_output_indicates_provider_error(stdout: &str, stderr: &str) -> Opt
         return Some((*label).to_string());
     }
 
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let is_json_error = serde_json::from_str::<serde_json::Value>(line)
             .ok()
             .is_some_and(|value| {
@@ -9008,9 +10353,13 @@ pub fn worker_receipt_evidence_paths(result: &WorkerResult) -> Vec<PathBuf> {
     paths
 }
 
-fn worker_report_section_name(line: &str) -> Option<&'static str> {
+fn worker_report_section_line(line: &str) -> Option<(&'static str, Option<&str>)> {
     let heading = line.trim().trim_start_matches('#').trim();
-    let normalized = heading
+    let (label, inline_value) = heading
+        .split_once(':')
+        .map(|(label, value)| (label.trim(), Some(value.trim())))
+        .unwrap_or((heading, None));
+    let normalized = label
         .chars()
         .map(|character| match character {
             'A'..='Z' => character.to_ascii_lowercase(),
@@ -9018,17 +10367,22 @@ fn worker_report_section_name(line: &str) -> Option<&'static str> {
             _ => '_',
         })
         .collect::<String>();
-    match normalized.trim_matches('_') {
-        "summary" => Some("summary"),
-        "changed_files" => Some("changed_files"),
-        "commands_run" => Some("commands_run"),
-        "known_failures" => Some("known_failures"),
-        "next_steps" => Some("next_steps"),
-        "plan_gap" => Some("plan_gap"),
-        "completed_steps" => Some("completed_steps"),
-        "step_evidence" => Some("step_evidence"),
-        _ => None,
-    }
+    let section = match normalized.trim_matches('_') {
+        "summary" => "summary",
+        "changed_files" => "changed_files",
+        "commands_run" => "commands_run",
+        "known_failures" => "known_failures",
+        "next_steps" => "next_steps",
+        "plan_gap" => "plan_gap",
+        "completed_steps" => "completed_steps",
+        "step_evidence" => "step_evidence",
+        _ => return None,
+    };
+    Some((section, inline_value.filter(|value| !value.is_empty())))
+}
+
+fn worker_report_section_name(line: &str) -> Option<&'static str> {
+    worker_report_section_line(line).map(|(section, _)| section)
 }
 
 fn section_map(lines: Option<&Vec<String>>) -> HashMap<String, String> {
@@ -9076,6 +10430,48 @@ fn section_list(lines: Option<&Vec<String>>) -> Vec<String> {
         })
         .filter(|line| !line.is_empty())
         .collect()
+}
+
+fn section_step_ids(lines: Option<&Vec<String>>) -> Vec<String> {
+    let mut step_ids = Vec::new();
+    for line in section_list(lines) {
+        // ACP workers commonly serialize a compact receipt as
+        // `**completed_steps**: step-001, step-002`.  Preserve commas inside
+        // an explanatory step description, while accepting this compact form.
+        let entries = if line.contains(", ")
+            && !line.contains(" — ")
+            && !line.contains(" – ")
+            && !line.contains(": ")
+        {
+            line.split(", ").collect::<Vec<_>>()
+        } else {
+            vec![line.as_str()]
+        };
+        for entry in entries {
+            let step_id = [" — ", " – ", ": "]
+                .into_iter()
+                .find_map(|separator| entry.split_once(separator).map(|(step_id, _)| step_id))
+                .unwrap_or(entry)
+                .trim()
+                .trim_matches('`')
+                .trim()
+                .to_string();
+            // A worker may introduce a prose heading such as `Completed
+            // steps:` before the actual receipt.  Keep explicit identifiers,
+            // but do not turn an unrelated sentence (occasionally glued to a
+            // following `## Report` heading by ACP text deltas) into an
+            // execution-step id.  Unknown identifier-shaped tokens still
+            // reach the ledger and are rejected against the sealed plan.
+            if !step_id.is_empty()
+                && !step_id.chars().any(char::is_whitespace)
+                && !step_id.contains("##")
+                && !step_id.contains("**")
+            {
+                step_ids.push(step_id);
+            }
+        }
+    }
+    step_ids
 }
 
 fn output_from_result(result: &WorkerResult) -> Result<Option<String>> {
@@ -9326,6 +10722,39 @@ mod tests {
     }
 
     #[test]
+    fn worker_evidence_discovery_ignores_gear_runtime_receipts() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gear/evidence");
+        fs::create_dir_all(&evidence_root)?;
+        fs::write(evidence_root.join("gear-runtime-old.md"), "old\n")?;
+        let baseline = snapshot_worker_evidence_paths(workspace.path()).map_err(anyhow::Error::msg)?;
+
+        fs::write(evidence_root.join("gear-runtime-follow-up.md"), "degraded\n")?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(&message, "completed without a marker\n")?;
+        let result = evidence_test_result(message);
+
+        let error = validate_worker_evidence_receipt_with_baseline(
+            &result,
+            workspace.path(),
+            &baseline,
+        )
+        .expect_err("Gear-owned receipts must not satisfy worker discovery");
+        assert!(error.contains("found 0"), "unexpected error: {error}");
+
+        let worker_receipt = evidence_root.join("worker.md");
+        fs::write(&worker_receipt, "worker receipt\n")?;
+        let validated = validate_worker_evidence_receipt_with_baseline(
+            &result,
+            workspace.path(),
+            &baseline,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(validated, worker_receipt.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
     fn worker_step_evidence_parser_reads_ordered_ids_and_paths() -> Result<()> {
         let workspace = tempfile::tempdir()?;
         let message = workspace.path().join("last-message.md");
@@ -9344,19 +10773,74 @@ mod tests {
     }
 
     #[test]
+    fn worker_step_evidence_parser_keeps_ids_when_worker_adds_explanations() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "# completed_steps\n- step-001 — read the baseline\n- step-002: implementation already present\n- `step-003` – tests passed\n",
+        )?;
+
+        let report = worker_step_evidence_from_result(&evidence_test_result(message));
+
+        assert_eq!(
+            report.completed_step_ids,
+            ["step-001", "step-002", "step-003"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_step_evidence_parser_accepts_inline_bold_receipt_sections() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "**completed_steps**: step-001, step-002, step-003\n**step_evidence**: \n- step-001: .gear/steps/001.md\n- step-002: .gear/steps/002.md\n- step-003: .gear/steps/003.md\n",
+        )?;
+
+        let report = worker_step_evidence_from_result(&evidence_test_result(message));
+
+        assert!(report.declared);
+        assert_eq!(
+            report.completed_step_ids,
+            ["step-001", "step-002", "step-003"]
+        );
+        assert_eq!(
+            report.evidence_by_step.get("step-003").map(String::as_str),
+            Some(".gear/steps/003.md")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_step_evidence_parser_ignores_prose_after_unformatted_heading() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "Completed steps:\n- step-001: tests passed\nThe implementation is already correct.## Report\n",
+        )?;
+
+        let report = worker_step_evidence_from_result(&evidence_test_result(message));
+
+        assert!(report.declared);
+        assert_eq!(report.completed_step_ids, ["step-001"]);
+        Ok(())
+    }
+
+    #[test]
     fn worker_provider_error_classifier_detects_rate_limit_and_quota() {
         assert_eq!(
             worker_output_indicates_provider_error("", "Error: rate limit exceeded").as_deref(),
             Some("provider rate limit")
         );
         assert_eq!(
-            worker_output_indicates_provider_error("HTTP 429 too many requests", "")
-                .as_deref(),
+            worker_output_indicates_provider_error("HTTP 429 too many requests", "").as_deref(),
             Some("provider rate limit (429)")
         );
         assert_eq!(
-            worker_output_indicates_provider_error("", "quota exceeded for model")
-                .as_deref(),
+            worker_output_indicates_provider_error("", "quota exceeded for model").as_deref(),
             Some("provider quota exceeded")
         );
         assert_eq!(
@@ -9369,11 +10853,13 @@ mod tests {
         // words are not a provider failure and must not trip fallback.
         let valid_intent_fold = r#"{"type":"text","part":{"text":"{\"constraints\":[\"Provider errors must halt the current attempt\"],\"risks\":[{\"description\":\"context length remains a future concern\"}]}"}}"#;
         assert!(worker_output_indicates_provider_error(valid_intent_fold, "").is_none());
-        assert!(worker_output_indicates_provider_error(
-            "The plan documents a rate limit and provider error as risks.",
-            ""
-        )
-        .is_none());
+        assert!(
+            worker_output_indicates_provider_error(
+                "The plan documents a rate limit and provider error as risks.",
+                ""
+            )
+            .is_none()
+        );
         assert_eq!(
             worker_output_indicates_provider_error(
                 r#"{"type":"error","error":{"message":"429 too many requests"}}"#,
@@ -9384,12 +10870,13 @@ mod tests {
         );
         // A slow-but-progressing response must not be classified as a provider error.
         assert!(
-            worker_output_indicates_provider_error("still thinking... token stream", "")
-                .is_none()
+            worker_output_indicates_provider_error("still thinking... token stream", "").is_none()
         );
         assert!(provider_error_is_free_quota("provider rate limit"));
         assert!(provider_error_is_free_quota("provider quota exceeded"));
-        assert!(!provider_error_is_free_quota("provider service unavailable"));
+        assert!(!provider_error_is_free_quota(
+            "provider service unavailable"
+        ));
         assert!(is_free_model(Some("opencode/mimo-v2.5-free")));
         assert!(!is_free_model(Some("opencode-go/mimo-v2.5")));
         assert!(worker_route_is_premium(
@@ -9417,10 +10904,7 @@ mod tests {
             worker_status_for_output(true, None),
             WorkerStatus::Succeeded
         );
-        assert_eq!(
-            worker_status_for_output(false, None),
-            WorkerStatus::Failed
-        );
+        assert_eq!(worker_status_for_output(false, None), WorkerStatus::Failed);
     }
 
     #[test]
@@ -9877,20 +11361,25 @@ mod tests {
     }
 
     #[test]
-    fn worker_parameter_resolution_distinguishes_defaults_and_rejects_invalid_values() -> Result<()> {
+    fn worker_parameter_resolution_distinguishes_defaults_and_rejects_invalid_values() -> Result<()>
+    {
         let mut packet = prompt_manifest_test_packet();
         packet.category_resolution.tools = packet.tools.clone();
         let receipt = validate_worker_packet_parameters(&packet)?;
         assert_eq!(receipt.status, "resolved");
-        assert!(receipt
-            .parameters
-            .iter()
-            .any(|parameter| parameter.name == "worker_model"
-                && parameter.state == WorkerParameterState::Configured));
-        assert!(receipt
-            .parameters
-            .iter()
-            .all(|parameter| parameter.state != WorkerParameterState::Invalid));
+        assert!(
+            receipt
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "worker_model"
+                    && parameter.state == WorkerParameterState::Configured)
+        );
+        assert!(
+            receipt
+                .parameters
+                .iter()
+                .all(|parameter| parameter.state != WorkerParameterState::Invalid)
+        );
         receipt.validate()?;
 
         let mut invalid = serde_json::to_value(&packet)?;
@@ -9899,18 +11388,24 @@ mod tests {
         invalid["variant_applied"] = json!("fast");
         let invalid_receipt = validate_worker_parameter_value(&invalid)?;
         assert_eq!(invalid_receipt.status, "invalid");
-        assert!(invalid_receipt
-            .errors
-            .iter()
-            .any(|error| error.contains("worker") && error.contains("null")));
-        assert!(invalid_receipt
-            .errors
-            .iter()
-            .any(|error| error.contains("tools.can_write") && error.contains("boolean")));
-        assert!(invalid_receipt
-            .errors
-            .iter()
-            .any(|error| error.contains("variant conflict")));
+        assert!(
+            invalid_receipt
+                .errors
+                .iter()
+                .any(|error| error.contains("worker") && error.contains("null"))
+        );
+        assert!(
+            invalid_receipt
+                .errors
+                .iter()
+                .any(|error| error.contains("tools.can_write") && error.contains("boolean"))
+        );
+        assert!(
+            invalid_receipt
+                .errors
+                .iter()
+                .any(|error| error.contains("variant conflict"))
+        );
         Ok(())
     }
 
@@ -9930,11 +11425,19 @@ mod tests {
         let rules = rules.context("rules should be injected")?;
         assert!(rules.find("root rule").unwrap() < rules.find("target rule").unwrap());
         let receipt_path = receipt_path.context("receipt path")?;
-        let receipt: RuleInjectionReceipt = serde_json::from_str(&fs::read_to_string(receipt_path)?)?;
+        let receipt: RuleInjectionReceipt =
+            serde_json::from_str(&fs::read_to_string(receipt_path)?)?;
         receipt.validate()?;
         assert_eq!(receipt.schema_version, RULE_INJECTION_SCHEMA_VERSION);
         assert_eq!(receipt.target_paths, vec!["src"]);
-        assert_eq!(receipt.entries.iter().filter(|entry| entry.injected).count(), 2);
+        assert_eq!(
+            receipt
+                .entries
+                .iter()
+                .filter(|entry| entry.injected)
+                .count(),
+            2
+        );
         let injected_entries = receipt
             .entries
             .iter()
@@ -9966,14 +11469,15 @@ mod tests {
             .expect_err("conflicting same-layer directives must block dispatch");
         assert!(error.to_string().contains("context conflict"));
         let receipt_path = store.worker_dir(&task.id).join("rules-injection.json");
-        let receipt: RuleInjectionReceipt =
-            serde_json::from_slice(&fs::read(receipt_path)?)?;
+        let receipt: RuleInjectionReceipt = serde_json::from_slice(&fs::read(receipt_path)?)?;
         receipt.validate()?;
         assert!(receipt.context_conflict);
-        assert!(receipt
-            .context_conflict_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("scope")));
+        assert!(
+            receipt
+                .context_conflict_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scope"))
+        );
         Ok(())
     }
 
@@ -10006,19 +11510,31 @@ mod tests {
         let skills = skills.context("skills should be injected")?;
         assert!(skills.find("Root skill").unwrap() < skills.find("Target skill").unwrap());
         let receipt_path = receipt_path.context("skills receipt path")?;
-        let receipt: SkillInjectionReceipt = serde_json::from_str(&fs::read_to_string(receipt_path)?)?;
+        let receipt: SkillInjectionReceipt =
+            serde_json::from_str(&fs::read_to_string(receipt_path)?)?;
         receipt.validate()?;
         assert!(!receipt.cache_hit);
-        assert_eq!(receipt.entries.iter().filter(|entry| entry.injected).count(), 2);
-        assert!(receipt
-            .entries
-            .iter()
-            .filter(|entry| entry.injected)
-            .all(|entry| entry.modified_at_ms > 0 && entry.precedence == entry.distance));
-        assert!(receipt
-            .entries
-            .iter()
-            .any(|entry| entry.freshness == "disabled" && !entry.injected));
+        assert_eq!(
+            receipt
+                .entries
+                .iter()
+                .filter(|entry| entry.injected)
+                .count(),
+            2
+        );
+        assert!(
+            receipt
+                .entries
+                .iter()
+                .filter(|entry| entry.injected)
+                .all(|entry| entry.modified_at_ms > 0 && entry.precedence == entry.distance)
+        );
+        assert!(
+            receipt
+                .entries
+                .iter()
+                .any(|entry| entry.freshness == "disabled" && !entry.injected)
+        );
 
         let mut second_task = default_task_with_id("skills-second");
         second_task.scope = Scope::new(vec!["src".to_string()], Vec::new(), 3);
@@ -10027,11 +11543,13 @@ mod tests {
             receipt_path.context("second skills receipt path")?,
         )?)?;
         assert!(receipt.cache_hit);
-        assert!(receipt
-            .entries
-            .iter()
-            .filter(|entry| entry.injected)
-            .all(|entry| entry.freshness == "cached"));
+        assert!(
+            receipt
+                .entries
+                .iter()
+                .filter(|entry| entry.injected)
+                .all(|entry| entry.freshness == "cached")
+        );
 
         fs::write(
             source.join(".agents/skills/target/SKILL.md"),
@@ -10044,7 +11562,12 @@ mod tests {
             receipt_path.context("third skills receipt path")?,
         )?)?;
         assert!(!receipt.cache_hit);
-        assert!(receipt.entries.iter().any(|entry| entry.freshness == "stale"));
+        assert!(
+            receipt
+                .entries
+                .iter()
+                .any(|entry| entry.freshness == "stale")
+        );
         Ok(())
     }
 
@@ -10090,9 +11613,7 @@ mod tests {
         let workspace = tempfile::tempdir()?;
         fs::create_dir_all(workspace.path().join(".agents/skills/review-only"))?;
         fs::write(
-            workspace
-                .path()
-                .join(".agents/skills/review-only/SKILL.md"),
+            workspace.path().join(".agents/skills/review-only/SKILL.md"),
             "---\nagents: [review]\nrequired: true\n---\n# Review-only skill\n",
         )?;
         let store = StateStore::new(workspace.path());
@@ -10152,11 +11673,17 @@ mod tests {
         let (rules, receipt_path) = discover_workspace_rules(&store, workspace.path(), &task)?;
         let rules = rules.context("first copy should be injected")?;
         assert_eq!(rules.matches("same rule").count(), 1);
-        let receipt: RuleInjectionReceipt = serde_json::from_str(&fs::read_to_string(
-            receipt_path.context("receipt path")?,
-        )?)?;
+        let receipt: RuleInjectionReceipt =
+            serde_json::from_str(&fs::read_to_string(receipt_path.context("receipt path")?)?)?;
         receipt.validate()?;
-        assert_eq!(receipt.entries.iter().filter(|entry| entry.injected).count(), 1);
+        assert_eq!(
+            receipt
+                .entries
+                .iter()
+                .filter(|entry| entry.injected)
+                .count(),
+            1
+        );
         assert!(receipt.entries.iter().any(|entry| {
             entry.freshness == "duplicate_content"
                 && entry.omission_reason.as_deref() == Some("duplicate content")
@@ -10182,9 +11709,8 @@ mod tests {
 
         let (rules, receipt_path) = discover_workspace_rules(&store, workspace.path(), &task)?;
         assert!(rules.is_none());
-        let receipt: RuleInjectionReceipt = serde_json::from_str(&fs::read_to_string(
-            receipt_path.context("receipt path")?,
-        )?)?;
+        let receipt: RuleInjectionReceipt =
+            serde_json::from_str(&fs::read_to_string(receipt_path.context("receipt path")?)?)?;
         receipt.validate()?;
         assert!(receipt.entries.iter().any(|entry| {
             entry.omission_reason.as_deref() == Some("realpath outside workspace")
@@ -10195,7 +11721,8 @@ mod tests {
     #[test]
     fn workspace_rules_are_soft_prompt_context() -> Result<()> {
         let mut packet = prompt_manifest_test_packet();
-        packet.injected_rules = Some("[Rule: AGENTS.md]\n[Match: walk-up]\nkeep scope narrow".to_string());
+        packet.injected_rules =
+            Some("[Rule: AGENTS.md]\n[Match: walk-up]\nkeep scope narrow".to_string());
         let prompt = worker_prompt(&packet)?;
         assert!(prompt.contains("## Workspace rules"));
         assert!(prompt.contains("keep scope narrow"));
@@ -10291,7 +11818,10 @@ mod tests {
                 .filter(|section| section.required)
                 .map(|section| section.estimated_tokens)
                 .sum();
-            assert!(hard_tokens < 32_768, "phase prompt was duplicated in hard sections");
+            assert!(
+                hard_tokens < 32_768,
+                "phase prompt was duplicated in hard sections"
+            );
             unsafe {
                 env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", "32768");
             }
@@ -10395,7 +11925,10 @@ mod tests {
 
             // The rendered prompt hash ties the capsule to the exact manifest output.
             assert_eq!(capsule.rendered_prompt_hash, manifest.rendered_prompt_hash);
-            assert_eq!(capsule.semantic_contract_hash, manifest.semantic_contract_hash);
+            assert_eq!(
+                capsule.semantic_contract_hash,
+                manifest.semantic_contract_hash
+            );
             Ok(())
         });
         unsafe {
@@ -10409,25 +11942,16 @@ mod tests {
 
     #[test]
     fn prompt_capsule_recovery_key_is_idempotent_and_stable() {
-        let key_a = prompt_capsule_recovery_key(
-            "task_x",
-            "semhash",
-            &PromptCapsuleRecoveryReason::Compact,
-        );
-        let key_b = prompt_capsule_recovery_key(
-            "task_x",
-            "semhash",
-            &PromptCapsuleRecoveryReason::Compact,
-        );
+        let key_a =
+            prompt_capsule_recovery_key("task_x", "semhash", &PromptCapsuleRecoveryReason::Compact);
+        let key_b =
+            prompt_capsule_recovery_key("task_x", "semhash", &PromptCapsuleRecoveryReason::Compact);
         assert_eq!(key_a, key_b);
         assert_eq!(key_a, "task_x:semhash:compact");
 
         // Different reason produces a distinct, still idempotent key.
-        let key_resume = prompt_capsule_recovery_key(
-            "task_x",
-            "semhash",
-            &PromptCapsuleRecoveryReason::Resume,
-        );
+        let key_resume =
+            prompt_capsule_recovery_key("task_x", "semhash", &PromptCapsuleRecoveryReason::Resume);
         assert_ne!(key_a, key_resume);
         assert_eq!(key_resume, "task_x:semhash:resume");
     }
@@ -10487,35 +12011,42 @@ mod tests {
     }
 
     #[test]
-    fn prompt_budget_policy_uses_a_larger_default_for_paid_opencode_models() {
+    fn prompt_budget_policy_leaves_context_limit_to_the_backend_by_default() {
         let previous_global = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
         let previous_paid =
             env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5").ok();
+        let previous_headroom = env::var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS").ok();
         unsafe {
             env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS");
             env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5");
+            env::remove_var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS");
         }
 
         let paid_policy = prompt_budget_policy(Some("opencode-go/mimo-v2.5"));
-        assert_eq!(paid_policy.context_limit_tokens, DEFAULT_PAID_CONTEXT_LIMIT_TOKENS);
-        assert_eq!(paid_policy.prompt_budget_tokens, DEFAULT_PAID_CONTEXT_LIMIT_TOKENS);
+        assert_eq!(
+            paid_policy.context_limit_tokens,
+            BACKEND_OWNED_CONTEXT_LIMIT_TOKENS
+        );
+        assert_eq!(
+            paid_policy.prompt_budget_tokens,
+            BACKEND_OWNED_CONTEXT_LIMIT_TOKENS
+        );
         assert!(paid_policy.estimated);
-        assert_eq!(paid_policy.source, "paid_model_conservative_default");
+        assert_eq!(paid_policy.source, "backend_owned_context_limit");
 
         let unknown_policy = prompt_budget_policy(Some("opencode/mimo-v2.5-free"));
-        assert_eq!(unknown_policy.context_limit_tokens, DEFAULT_CONTEXT_LIMIT_TOKENS);
-        assert_eq!(unknown_policy.source, "conservative_default");
+        assert_eq!(
+            unknown_policy.context_limit_tokens,
+            BACKEND_OWNED_CONTEXT_LIMIT_TOKENS
+        );
+        assert_eq!(unknown_policy.source, "backend_owned_context_limit");
 
-        let deepseek_free_policy =
-            prompt_budget_policy(Some("opencode/deepseek-v4-flash-free"));
+        let deepseek_free_policy = prompt_budget_policy(Some("opencode/deepseek-v4-flash-free"));
         assert_eq!(
             deepseek_free_policy.context_limit_tokens,
-            DEFAULT_PAID_CONTEXT_LIMIT_TOKENS
+            BACKEND_OWNED_CONTEXT_LIMIT_TOKENS
         );
-        assert_eq!(
-            deepseek_free_policy.source,
-            "deepseek_flash_conservative_default"
-        );
+        assert_eq!(deepseek_free_policy.source, "backend_owned_context_limit");
         assert!(deepseek_free_policy.estimated);
 
         unsafe {
@@ -10528,21 +12059,78 @@ mod tests {
                     "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5",
                     value,
                 ),
-                None => env::remove_var(
-                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5",
-                ),
+                None => {
+                    env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5")
+                }
+            }
+            match previous_headroom {
+                Some(value) => env::set_var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS", value),
+                None => env::remove_var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS"),
             }
         }
     }
 
     #[test]
+    fn default_backend_owned_budget_does_not_reject_large_worker_contract() -> Result<()> {
+        let previous_global = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
+        let previous_model =
+            env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH_FREE").ok();
+        unsafe {
+            env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS");
+            env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH_FREE");
+        }
+
+        let result = (|| {
+            let mut packet = prompt_manifest_test_packet();
+            packet.worker_model = Some("opencode/deepseek-v4-flash-free".to_string());
+            packet.goal = "canonical bundle evidence ".repeat(8_000);
+            let prompt = worker_prompt(&packet)?;
+            let manifest = prompt_manifest_for_packet(&packet, &prompt)?;
+            let capsule = build_prompt_capsule(
+                &packet,
+                &manifest,
+                &prompt,
+                &PromptCapsuleRecoveryReason::Dispatch,
+            )?;
+            assert_eq!(
+                capsule.context_limit_tokens,
+                BACKEND_OWNED_CONTEXT_LIMIT_TOKENS
+            );
+            assert_eq!(capsule.budget_tokens, BACKEND_OWNED_CONTEXT_LIMIT_TOKENS);
+            assert!(capsule.sections.iter().all(|section| !section.clipped));
+            Ok(())
+        })();
+
+        unsafe {
+            match previous_global {
+                Some(value) => env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", value),
+                None => env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS"),
+            }
+            match previous_model {
+                Some(value) => env::set_var(
+                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH_FREE",
+                    value,
+                ),
+                None => env::remove_var(
+                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH_FREE",
+                ),
+            }
+        }
+        result
+    }
+
+    #[test]
     fn prompt_budget_policy_records_precedence_and_headroom() {
         let previous_global = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
-        let previous_model = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH").ok();
+        let previous_model =
+            env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH").ok();
         let previous_headroom = env::var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS").ok();
         unsafe {
             env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS");
-            env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH", "12000");
+            env::set_var(
+                "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH",
+                "12000",
+            );
             env::set_var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS", "512");
         }
         let model_policy = prompt_budget_policy(Some("opencode/deepseek-v4-flash"));
@@ -10558,7 +12146,11 @@ mod tests {
         let global_policy = prompt_budget_policy(Some("opencode/deepseek-v4-flash"));
         assert_eq!(global_policy.context_limit_tokens, 9000);
         assert_eq!(global_policy.prompt_budget_tokens, 8488);
-        assert!(global_policy.source.contains("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS"));
+        assert!(
+            global_policy
+                .source
+                .contains("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS")
+        );
 
         unsafe {
             match previous_global {
@@ -10566,8 +12158,13 @@ mod tests {
                 None => env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS"),
             }
             match previous_model {
-                Some(value) => env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH", value),
-                None => env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH"),
+                Some(value) => env::set_var(
+                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH",
+                    value,
+                ),
+                None => env::remove_var(
+                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH",
+                ),
             }
             match previous_headroom {
                 Some(value) => env::set_var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS", value),
@@ -10670,6 +12267,7 @@ mod tests {
                     route_hint: None,
                 },
                 false,
+                WorkerTransport::Command,
             )
         });
         unsafe {
@@ -10691,10 +12289,18 @@ mod tests {
         let receipt: serde_json::Value = serde_json::from_slice(&fs::read(receipt_path)?)?;
         assert_eq!(receipt["status"], "blocked");
         assert_eq!(receipt["task_id"], task_id);
-        assert_eq!(receipt["next_action"], "try_next_explicit_route_or_split_task");
+        assert_eq!(
+            receipt["next_action"],
+            "try_next_explicit_route_or_split_task"
+        );
         assert!(receipt["required_tokens"].as_u64().unwrap_or_default() > 1);
         assert_eq!(receipt["budget_tokens"], 1);
-        assert!(!store.worker_dir(task_id).join("resident-session.json").exists());
+        assert!(
+            !store
+                .worker_dir(task_id)
+                .join("resident-session.json")
+                .exists()
+        );
         Ok(())
     }
 
@@ -10747,10 +12353,7 @@ mod tests {
             },
         ];
         // Recovery resumes at the first not-completed step, not the whole plan.
-        assert_eq!(
-            recover_current_step_id(&steps).as_deref(),
-            Some("step-002")
-        );
+        assert_eq!(recover_current_step_id(&steps).as_deref(), Some("step-002"));
         let all_complete = vec![PlanStepRun {
             step_id: "step-001".to_string(),
             action: "inspect".to_string(),
@@ -10760,10 +12363,7 @@ mod tests {
             error: None,
             updated_at: String::new(),
         }];
-        assert_eq!(
-            recover_current_step_id(&all_complete).as_deref(),
-            None
-        );
+        assert_eq!(recover_current_step_id(&all_complete).as_deref(), None);
     }
 
     #[test]
@@ -11102,6 +12702,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn writable_worker_prompt_leaves_protected_gear_evidence_to_runtime() {
+        let prompt = WorkerCategory::Quick
+            .prompt_append()
+            .expect("writable ACP worker prompt");
+
+        assert!(prompt.contains("Gear persists protected runtime evidence"));
+        assert!(prompt.contains("do not create or modify .gear"));
+        assert!(!prompt.contains(".gear/evidence"));
+        assert!(!prompt.contains(WORKER_EVIDENCE_MARKER));
+    }
+
     // GBX-237 (237-001/237-002): routing after a failed review must resolve to
     // the Repairable category, not back to a read-only review loop.
     #[test]
@@ -11116,8 +12728,14 @@ mod tests {
 
         // Category parsing must round-trip so a persisted route decision of
         // "repair" is never silently reinterpreted as "review".
-        assert_eq!(WorkerCategory::parse("repair"), Some(WorkerCategory::Repair));
-        assert_eq!(WorkerCategory::parse("review"), Some(WorkerCategory::Review));
+        assert_eq!(
+            WorkerCategory::parse("repair"),
+            Some(WorkerCategory::Repair)
+        );
+        assert_eq!(
+            WorkerCategory::parse("review"),
+            Some(WorkerCategory::Review)
+        );
         assert_ne!(
             WorkerCategory::parse("repair"),
             WorkerCategory::parse("review")
@@ -11214,15 +12832,51 @@ mod tests {
     }
 
     #[test]
-    fn worker_kind_default_codex_command_includes_prompt_and_model() {
+    fn default_worker_config_pins_every_category_to_flash_acp() {
+        let config = WorkerConfig::default();
+        for route_hint in ["quick", "deep", "review", "repair", "explore"] {
+            let route = config.selected_route_for_hint(1, Some(route_hint));
+            assert_eq!(route.worker_kind, WorkerKind::OpencodeSession);
+            assert_eq!(route.worker_command, Some(DEFAULT_OPENCODE_SESSION_COMMAND));
+            assert_eq!(
+                route.worker_model,
+                Some(DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL)
+            );
+            assert!(route.require_worker);
+        }
+    }
+
+    #[test]
+    fn worker_kind_default_codex_command_is_an_acp_server() {
         let command = WorkerKind::Codex
             .default_command(Some("gpt-5"))
             .expect("codex default command should exist");
 
-        assert!(command.contains("codex exec"));
-        assert!(command.contains("-m 'gpt-5'"));
-        assert!(command.contains("$GEARBOX_WORKER_PROMPT"));
-        assert!(command.contains("$GEARBOX_WORKER_LAST_MESSAGE"));
+        assert!(command.contains("@agentclientprotocol/codex-acp"));
+        assert!(!command.contains("codex exec"));
+        assert!(!command.contains("gpt-5"));
+    }
+
+    #[test]
+    fn worker_kind_read_only_codex_command_uses_the_same_acp_bridge() {
+        let command = WorkerKind::Codex
+            .default_read_only_command(Some("gpt-5.6-luna"))
+            .expect("read-only Codex command should exist");
+
+        assert!(command.contains("@agentclientprotocol/codex-acp"));
+        assert!(!command.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!command.contains("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn worker_kind_default_opencode_session_command_is_an_acp_server() {
+        let command = WorkerKind::OpencodeSession
+            .default_command(None)
+            .expect("OpenCode session default command should exist");
+
+        assert!(command.contains("opencode acp --pure"));
+        assert!(command.contains("GEARBOX_ACP_WORKSPACE"));
+        assert!(!command.contains("mimo-v2.5"));
     }
 
     #[test]
@@ -11437,9 +13091,9 @@ mod tests {
     }
 
     #[test]
-    fn command_backed_worker_adapters_report_worker_identity() {
+    fn acp_backed_worker_adapters_report_worker_identity() {
         assert_eq!(OpencodeCommandWorker {}.kind(), WorkerKind::Opencode);
-        assert_eq!(OpencodeCommandWorker {}.name(), "opencode_command");
+        assert_eq!(OpencodeCommandWorker {}.name(), "opencode_acp");
         assert_eq!(OpencodeSessionWorker {}.kind(), WorkerKind::OpencodeSession);
         assert_eq!(OpencodeSessionWorker {}.name(), "opencode_session");
         assert!(
@@ -11448,13 +13102,13 @@ mod tests {
                 .supports_resident_session
         );
         assert_eq!(CodexCommandWorker {}.kind(), WorkerKind::Codex);
-        assert_eq!(CodexCommandWorker {}.name(), "codex_command");
+        assert_eq!(CodexCommandWorker {}.name(), "codex_acp");
         assert_eq!(ClaudeCommandWorker {}.kind(), WorkerKind::Claude);
-        assert_eq!(ClaudeCommandWorker {}.name(), "claude_command");
+        assert_eq!(ClaudeCommandWorker {}.name(), "claude_acp");
         assert_eq!(ZedAgentCommandWorker {}.kind(), WorkerKind::ZedAgent);
-        assert_eq!(ZedAgentCommandWorker {}.name(), "zed_agent_command");
+        assert_eq!(ZedAgentCommandWorker {}.name(), "zed_agent_acp");
         assert_eq!(CustomCommandWorker {}.kind(), WorkerKind::Custom);
-        assert_eq!(CustomCommandWorker {}.name(), "custom_command");
+        assert_eq!(CustomCommandWorker {}.name(), "custom_acp");
     }
 
     #[test]
@@ -11516,6 +13170,10 @@ mod tests {
     }
 
     impl NativeWorkerBackend for FakeNativeBackend {
+        fn allows_native_zed_agent_for_testing(&self) -> bool {
+            true
+        }
+
         fn start_zed_agent(
             &self,
             request: WorkerStartRequest<'_>,
@@ -11677,6 +13335,10 @@ mod tests {
     }
 
     impl NativeWorkerBackend for CountedNativeBackend {
+        fn allows_native_zed_agent_for_testing(&self) -> bool {
+            true
+        }
+
         fn start_zed_agent(
             &self,
             request: WorkerStartRequest<'_>,
@@ -11764,28 +13426,44 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn worker_registry_routes_provider_workers_to_native_acp_backend() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let store = StateStore::new(temp_dir.path());
-        store.initialize()?;
-        let task = Task {
-            id: "task_native_acp".to_string(),
-            goal_id: "goal_native_acp".to_string(),
-            title: "test native ACP worker".to_string(),
+    fn fixture_acp_server_command(agent_name: &str) -> String {
+        let set_config_response = r#"config_id=$(printf '%s' "$request" | sed -n 's/.*"configId":"\([^"]*\)".*/\1/p'); value=$(printf '%s' "$request" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p'); printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"configOptions":[{"id":"'"$config_id"'","currentValue":"'"$value"'"}]}}'"#;
+        format!(
+            r#": acp-fixture; while IFS= read -r request; do id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$request" in *'"method":"initialize"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocolVersion":1,"agentInfo":{{"name":"{agent_name}","version":"fixture"}},"agentCapabilities":{{}}}}}}' ;; *'"method":"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"sessionId":"fixture-session","configOptions":[{{"id":"model","type":"select","currentValue":"fixture","options":[{{"value":"gpt-5.6-luna"}},{{"value":"opencode/deepseek-v4-flash-free"}}]}}]}}}}' ;; *'"method":"session/set_config_option"'*) {set_config_response} ;; *'"method":"session/prompt"'*) printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fixture-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"ACP fixture completed"}}}}}}}}'; printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"stopReason":"end_turn"}}}}' ;; esac; done"#,
+        )
+    }
+
+    fn fixture_acp_server_without_config_confirmation(agent_name: &str) -> String {
+        format!(
+            r#": acp-fixture; while IFS= read -r request; do id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$request" in *'"method":"initialize"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocolVersion":1,"agentInfo":{{"name":"{agent_name}","version":"fixture"}},"agentCapabilities":{{}}}}}}' ;; *'"method":"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"sessionId":"fixture-session","configOptions":[{{"id":"model","type":"select","currentValue":"fixture","options":[{{"value":"opencode/deepseek-v4-flash-free"}}]}}]}}}}' ;; *'"method":"session/set_config_option"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"configOptions":[]}}}}' ;; esac; done"#,
+        )
+    }
+
+    fn acp_test_task(id: &str, worker_kind: WorkerKind) -> Task {
+        Task {
+            id: id.to_string(),
+            goal_id: "goal_external_acp".to_string(),
+            title: "external ACP worker".to_string(),
             kind: crate::state::TaskKind::Edit,
             status: crate::state::TaskStatus::Pending,
-            assigned_worker: Some("codex".to_string()),
+            assigned_worker: Some(worker_kind.as_str().to_string()),
             attempt: 1,
             parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
-        };
-        let config = WorkerConfig {
-            worker_kind: WorkerKind::Codex,
-            worker_command: Some("must-not-run".to_string()),
-            worker_model: None,
+        }
+    }
+
+    fn acp_test_config(
+        worker_kind: WorkerKind,
+        worker_model: Option<&str>,
+        command: Option<String>,
+    ) -> WorkerConfig {
+        WorkerConfig {
+            worker_kind,
+            worker_command: command,
+            worker_model: worker_model.map(ToOwned::to_owned),
             worker_routes: Vec::new(),
             unavailable_worker_models: Vec::new(),
             premium_worker_budget: 1,
@@ -11793,19 +13471,30 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
-            default_worker_for_small_tasks: WorkerKind::Codex,
-            require_worker: false,
-        };
-        let started = Arc::new(AtomicBool::new(false));
-        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeAcpBackend {
-            started: started.clone(),
-        }));
-        let result = registry.run(WorkerRunRequest {
+            default_worker_for_small_tasks: worker_kind,
+            require_worker: true,
+        }
+    }
+
+    #[test]
+    fn acp_model_configuration_requires_provider_confirmation() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = acp_test_task("task_model_confirmation", WorkerKind::OpencodeSession);
+        let config = acp_test_config(
+            WorkerKind::OpencodeSession,
+            Some(DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL),
+            Some(fixture_acp_server_without_config_confirmation(
+                "OpenCode fixture",
+            )),
+        );
+        let handle = WorkerRegistry::default().start(WorkerStartRequest {
             store: &store,
             workspace: temp_dir.path(),
             task: &task,
             route_attempt: 1,
-            goal: "test ACP goal",
+            goal: "test ACP configuration confirmation",
             verification_commands: &[],
             config: &config,
             cancellation_token: None,
@@ -11813,8 +13502,281 @@ mod tests {
             coordinator_brief: None,
             route_hint: None,
         })?;
-        assert!(started.load(Ordering::SeqCst));
-        assert_eq!(result.command.as_deref(), Some("native-acp"));
+        let error = match handle.wait_for_result() {
+            Ok(_) => bail!("ACP model configuration without confirmation must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("did not confirm requested model")
+        );
+        let receipt: Value = serde_json::from_slice(&fs::read(
+            store.worker_dir(&task.id).join("acp-config.json"),
+        )?)?;
+        assert_eq!(
+            receipt["selections"][0]["requested"],
+            DEFAULT_OPENCODE_DEEPSEEK_FLASH_MODEL
+        );
+        assert_eq!(receipt["selections"][0]["applied"], Value::Null);
+        assert_eq!(receipt["selections"][0]["status"], "rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_workers_use_external_acp_and_never_call_native_provider_backend() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let started = Arc::new(AtomicBool::new(false));
+        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeAcpBackend {
+            started: started.clone(),
+        }));
+        for (worker_kind, agent_name, worker_model) in [
+            (
+                WorkerKind::Opencode,
+                "OpenCode fixture",
+                Some("opencode/deepseek-v4-flash-free"),
+            ),
+            (
+                WorkerKind::OpencodeSession,
+                "OpenCode fixture",
+                Some("opencode/deepseek-v4-flash-free"),
+            ),
+            (
+                WorkerKind::Codex,
+                "Codex fixture",
+                Some("openai/gpt-5.6-luna"),
+            ),
+            (WorkerKind::Claude, "Claude fixture", None),
+        ] {
+            let task = acp_test_task(&format!("task_{}", worker_kind.as_str()), worker_kind);
+            let config = acp_test_config(
+                worker_kind,
+                worker_model,
+                Some(fixture_acp_server_command(agent_name)),
+            );
+            let result = registry.run(WorkerRunRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "test external ACP goal",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            })?;
+            assert_eq!(result.status, WorkerStatus::Succeeded);
+            assert!(
+                result
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| command.starts_with("acp-stdio:"))
+            );
+            let initialize: Value = serde_json::from_slice(&fs::read(
+                store.worker_dir(&task.id).join("acp-initialize.json"),
+            )?)?;
+            assert_eq!(initialize["transport"], "acp-stdio");
+            assert_eq!(initialize["response"]["agentInfo"]["name"], agent_name);
+            if let Some(worker_model) = worker_model {
+                let configured_model = acp_model_config_value(worker_kind, worker_model)?;
+                let config_receipt: Value = serde_json::from_slice(&fs::read(
+                    store.worker_dir(&task.id).join("acp-config.json"),
+                )?)?;
+                assert_eq!(config_receipt["selections"][0]["requested"], worker_model);
+                assert_eq!(config_receipt["selections"][0]["applied"], worker_model);
+                assert_eq!(
+                    config_receipt["selections"][0]["requested_config_value"],
+                    configured_model
+                );
+                assert_eq!(
+                    config_receipt["selections"][0]["applied_config_value"],
+                    configured_model
+                );
+                assert_eq!(config_receipt["selections"][0]["status"], "applied");
+            }
+        }
+        assert!(!started.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    fn run_external_acp_smoke(
+        worker_kind: WorkerKind,
+        worker_model: &str,
+        command: String,
+        expected_agent_name: &str,
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let mut task = acp_test_task(
+            &format!("task_external_{}_acp", worker_kind.as_str()),
+            worker_kind,
+        );
+        task.kind = crate::state::TaskKind::Review;
+        task.scope = Scope::new(Vec::new(), Vec::new(), 1);
+        let config = acp_test_config(worker_kind, Some(worker_model), Some(command));
+        let result = WorkerRegistry::default().run(WorkerRunRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "ACP transport smoke test. Do not call tools or modify files. Reply with exactly GEARBOX_ACP_SMOKE_OK.",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        assert!(
+            result
+                .command
+                .as_deref()
+                .is_some_and(|command| command.starts_with("acp-stdio:"))
+        );
+        let session: Value = serde_json::from_slice(&fs::read(
+            store.worker_dir(&task.id).join("acp-session.json"),
+        )?)?;
+        assert!(
+            session["agent_name"]
+                .as_str()
+                .is_some_and(|name| name.to_ascii_lowercase().contains(expected_agent_name))
+        );
+        let turn: Value = serde_json::from_slice(&fs::read(
+            store.worker_dir(&task.id).join("acp-turn-run.json"),
+        )?)?;
+        assert_eq!(turn["transport"].as_str(), Some("acp-stdio"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires authenticated OpenCode ACP access"]
+    fn external_opencode_deepseek_flash_acp_smoke() -> Result<()> {
+        let worker_model = env::var("GEARBOX_OPENCODE_ACP_SMOKE_MODEL")
+            .unwrap_or_else(|_| "opencode/deepseek-v4-flash-free".to_string());
+        run_external_acp_smoke(
+            WorkerKind::OpencodeSession,
+            &worker_model,
+            DEFAULT_OPENCODE_SESSION_COMMAND.to_string(),
+            "opencode",
+        )
+    }
+
+    #[test]
+    #[ignore = "requires authenticated Codex ACP access"]
+    fn external_codex_luna_acp_smoke() -> Result<()> {
+        let worker_model = env::var("GEARBOX_CODEX_ACP_SMOKE_MODEL")
+            .unwrap_or_else(|_| "openai/gpt-5.6-luna".to_string());
+        run_external_acp_smoke(
+            WorkerKind::Codex,
+            &worker_model,
+            DEFAULT_CODEX_ACP_COMMAND.to_string(),
+            "codex",
+        )
+    }
+
+    #[test]
+    fn custom_worker_requires_an_explicit_acp_server_command() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = acp_test_task("task_custom_acp", WorkerKind::Custom);
+        let config = acp_test_config(WorkerKind::Custom, None, None);
+        let error = match WorkerRegistry::default().start_direct(
+            WorkerKind::Custom,
+            WorkerStartRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "custom ACP server required",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+        ) {
+            Ok(_) => bail!("custom command fallback must be disabled"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("explicit ACP server command"));
+        Ok(())
+    }
+
+    #[test]
+    fn zed_agent_without_native_backend_fails_closed_before_command_spawn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let marker = temp_dir.path().join("zed-command-fallback-marker");
+        let task = acp_test_task("task_zed_agent_acp", WorkerKind::ZedAgent);
+        let config = acp_test_config(
+            WorkerKind::ZedAgent,
+            None,
+            Some(format!("touch {}", marker.display())),
+        );
+        let error = match WorkerRegistry::default().start_direct(
+            WorkerKind::ZedAgent,
+            WorkerStartRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "Zed native ACP required",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+        ) {
+            Ok(_) => bail!("ZedAgent command fallback must be disabled"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("native worker is disabled"));
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_legacy_prompt_command_fails_closed_before_spawn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = acp_test_task("task_legacy_command", WorkerKind::Codex);
+        let config = acp_test_config(
+            WorkerKind::Codex,
+            Some("gpt-5.6-luna"),
+            Some("codex exec --sandbox read-only".to_string()),
+        );
+        let error = match WorkerRegistry::default().start_direct(
+            WorkerKind::Codex,
+            WorkerStartRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "legacy command must fail closed",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+        ) {
+            Ok(_) => bail!("prompt-running CLI must not replace an ACP server"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must start an ACP server"));
         Ok(())
     }
 
@@ -13338,6 +15300,8 @@ esac
             follow_up_count: Mutex::new(0),
             supports_interaction: true,
             omo_config_dir: None,
+            transport: WorkerTransport::Command,
+            acp_session: Mutex::new(None),
         };
 
         let stdout = "Some text before.\n<function_calls>\n<invoke name=\"read_file\">\n<parameter name=\"path\">src/main.rs</parameter>\n</invoke>\n<invoke name=\"write_file\">\n<parameter name=\"path\">src/lib.rs</parameter>\n<parameter name=\"content\">hello</parameter>\n</invoke>\n</function_calls>\nSome text after.";
@@ -13502,6 +15466,8 @@ esac
             follow_up_count: Mutex::new(0),
             supports_interaction: true,
             omo_config_dir: None,
+            transport: WorkerTransport::Command,
+            acp_session: Mutex::new(None),
         };
 
         let stdout = "Some text.\n<tool_use>\n<invoke name=\"read_file\">\n<parameter name=\"path\">src/main.rs</parameter>\n</invoke>\n</tool_use>\nMore text.";
@@ -13606,6 +15572,8 @@ esac
             follow_up_count: Mutex::new(0),
             supports_interaction: true,
             omo_config_dir: None,
+            transport: WorkerTransport::Command,
+            acp_session: Mutex::new(None),
         };
 
         let stdout1 = "This is just random text with no XML tool call patterns.";
@@ -14249,8 +16217,7 @@ esac
         let config = WorkerConfig {
             worker_kind: WorkerKind::Opencode,
             worker_command: Some(
-                "sh -c 'printf \"%s\" \"$OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER\"'"
-                    .to_string(),
+                "sh -c 'printf \"%s\" \"$OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER\"'".to_string(),
             ),
             worker_model: None,
             worker_routes: Vec::new(),
@@ -14284,7 +16251,10 @@ esac
 
         let policy_path = store.worker_dir(&task.id).join("resource-policy.json");
         let policy: Value = serde_json::from_str(&fs::read_to_string(policy_path)?)?;
-        assert_eq!(policy["mechanism_id"], "opencode_file_watcher_resource_guard");
+        assert_eq!(
+            policy["mechanism_id"],
+            "opencode_file_watcher_resource_guard"
+        );
         assert_eq!(policy["status"], "disabled");
         assert_eq!(policy["protection_status"], "configured");
         Ok(())
@@ -14292,7 +16262,7 @@ esac
 
     // ── GBX-003-004 Dispatch capture tests ──
     // Each test captures the launch contract for a specific adapter and
-    // verifies that its CLI command, capabilities, and interaction support
+    // verifies that its ACP server command, capabilities, and interaction support
     // are correctly declared.
 
     #[test]
@@ -14300,14 +16270,14 @@ esac
         let contract = WorkerLaunchContract {
             worker_kind: WorkerKind::Opencode.as_str().to_string(),
             default_command: WorkerKind::Opencode.default_command(None),
-            supports_interaction: false,
-            capabilities: WorkerCapabilities::command(),
+            supports_interaction: true,
+            capabilities: WorkerCapabilities::resident_command(),
             native_backend_available: false,
         };
         assert_eq!(contract.worker_kind, "opencode");
         assert!(contract.capabilities.supports_code_edit);
         assert!(contract.capabilities.supports_explore);
-        assert!(!contract.supports_interaction);
+        assert!(contract.supports_interaction);
         assert!(!contract.native_backend_available);
     }
 
@@ -14329,114 +16299,24 @@ esac
         assert!(contract.supports_interaction);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn opencode_session_worker_bounds_provider_call_by_goal_lease() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let store = StateStore::new(temp_dir.path());
-        store.initialize()?;
-        let goal_id = "goal_runtime_deadline";
-        let now = chrono::Utc::now();
-        let lease_path = store.goal_run_lease_path(goal_id);
-        let lease = crate::state::GoalRunLease {
-            schema_version: 1,
-            goal_id: goal_id.to_string(),
-            epoch_id: "epoch_runtime_deadline".to_string(),
-            owner_session_id: "session_runtime_deadline".to_string(),
-            lease_id: "lease_runtime_deadline".to_string(),
-            acquired_at: now.to_rfc3339(),
-            expires_at: (now + chrono::Duration::milliseconds(500)).to_rfc3339(),
-        };
-        fs::write(&lease_path, format!("{}\n", serde_json::to_string_pretty(&lease)?))?;
-        let task = Task {
-            id: "task_runtime_deadline".to_string(),
-            goal_id: goal_id.to_string(),
-            parent_task_id: None,
-            title: "bounded provider call".to_string(),
-            kind: crate::state::TaskKind::Review,
-            status: crate::state::TaskStatus::Pending,
-            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
-            attempt: 1,
-            scope: Scope::new(Vec::new(), vec![".git".to_string()], 1),
-            inputs: TaskInputs::default(),
-            outputs: crate::state::TaskOutputs::default(),
-        };
-        let config = WorkerConfig {
-            worker_kind: WorkerKind::OpencodeSession,
-            worker_command: Some("sleep 2".to_string()),
-            worker_model: Some("opencode-go/deepseek-v4-flash".to_string()),
-            worker_routes: Vec::new(),
-            unavailable_worker_models: Vec::new(),
-            premium_worker_budget: 1,
-            max_parallel_workers: 1,
-            max_parallel_per_key: 1,
-            stale_task_timeout_secs: 30,
-            skip_worker: false,
-            default_worker_for_small_tasks: WorkerKind::ZedAgent,
-            require_worker: true,
-        };
-
-        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
-            store: &store,
-            workspace: temp_dir.path(),
-            task: &task,
-            route_attempt: 1,
-            goal: "bound a slow provider call to the goal lease",
-            verification_commands: &[],
-            config: &config,
-            cancellation_token: None,
-            coordinator_model: None,
-            coordinator_brief: None,
-            route_hint: None,
-        })?;
-        let error = handle
-            .wait_for_result()
-            .expect_err("provider command must stop at the goal lease deadline");
-        assert!(error.to_string().contains("timed out"));
-
-        let worker_dir = store.worker_dir(&task.id);
-        let deadline_receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
-            worker_dir.join(WORKER_RUNTIME_DEADLINE_FILE),
-        )?)?;
-        assert_eq!(
-            deadline_receipt["goal_id"].as_str(),
-            Some(goal_id),
-            "deadline receipt must bind the goal"
-        );
-        assert!(deadline_receipt["deadline_at_ms"].as_u64().is_some());
-
-        let external_receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
-            worker_dir.join("external-call.json"),
-        )?)?;
-        assert_eq!(external_receipt["status"].as_str(), Some("deadline_exceeded"));
-        assert!(external_receipt["deadline_at_ms"].as_u64().is_some());
-        assert!(worker_dir.join("external-call-start.json").is_file());
-        assert!(worker_dir.join("process-cleanup.json").is_file());
-        Ok(())
-    }
-
     #[test]
     fn test_codex_adapter_dispatch_contract() {
         let cmd = WorkerKind::Codex.default_command(Some("gpt-4.1"));
         assert!(cmd.is_some(), "Codex should have a default command");
         if let Some(ref cmd) = cmd {
             assert!(
-                cmd.contains("codex exec"),
-                "Codex default should use 'codex exec': {cmd}"
-            );
-            assert!(
-                cmd.contains("gpt-4.1"),
-                "Codex default should include model flag: {cmd}"
+                cmd.contains("@agentclientprotocol/codex-acp"),
+                "Codex default should start the Codex ACP bridge: {cmd}"
             );
         }
         let contract = WorkerLaunchContract {
             worker_kind: WorkerKind::Codex.as_str().to_string(),
             default_command: WorkerKind::Codex.default_command(None),
-            supports_interaction: false,
-            capabilities: WorkerCapabilities::command(),
+            supports_interaction: true,
+            capabilities: WorkerCapabilities::resident_command(),
             native_backend_available: false,
         };
-        assert!(!contract.supports_interaction);
+        assert!(contract.supports_interaction);
         assert!(contract.capabilities.supports_code_edit);
     }
 
@@ -14446,18 +16326,18 @@ esac
         assert!(cmd.is_some(), "Claude should have a default command");
         if let Some(ref cmd) = cmd {
             assert!(
-                cmd.contains("claude -p"),
-                "Claude default should use 'claude -p': {cmd}"
+                cmd.contains("@agentclientprotocol/claude-agent-acp"),
+                "Claude default should start the Claude ACP bridge: {cmd}"
             );
         }
         let contract = WorkerLaunchContract {
             worker_kind: WorkerKind::Claude.as_str().to_string(),
             default_command: WorkerKind::Claude.default_command(None),
-            supports_interaction: false,
-            capabilities: WorkerCapabilities::command(),
+            supports_interaction: true,
+            capabilities: WorkerCapabilities::resident_command(),
             native_backend_available: false,
         };
-        assert!(!contract.supports_interaction);
+        assert!(contract.supports_interaction);
         assert!(contract.capabilities.supports_code_edit);
     }
 
@@ -14482,18 +16362,18 @@ esac
             native_backend_available: false,
             ..contract
         };
-        // Without native backend: same capabilities, command-worker based
+        // Without native backend, startup fails closed instead of invoking a command worker.
         assert!(!contract_native.native_backend_available);
     }
 
     #[test]
     fn test_worker_kind_default_commands_are_independent() -> Result<()> {
-        // Opencode/Codex/Claude must have independent default CLI contracts.
+        // Opencode/Codex/Claude must have independent ACP server contracts.
         let opencode_cmd = WorkerKind::Opencode.default_command(None);
         let codex_cmd = WorkerKind::Codex.default_command(None);
         let claude_cmd = WorkerKind::Claude.default_command(None);
 
-        assert!(opencode_cmd.is_none(), "Opencode has no default command");
+        assert!(opencode_cmd.is_some(), "OpenCode has an ACP server command");
         assert!(codex_cmd.is_some(), "Codex has a default command");
         assert!(claude_cmd.is_some(), "Claude has a default command");
 
@@ -14540,11 +16420,11 @@ esac
         let task = default_task_with_id("task_opencode_contract");
         let config = WorkerConfig {
             worker_kind: WorkerKind::Opencode,
-            worker_command: Some("sh -c 'echo opencode-contract'".to_string()),
+            worker_command: Some(fixture_acp_server_command("OpenCode fixture")),
             ..WorkerConfig::default()
         };
 
-        // Opencode dispatches through OpencodeCommandWorker (non-interactive)
+        // OpenCode dispatches through its external ACP server.
         let handle = WorkerRegistry::default().start(WorkerStartRequest {
             store: &store,
             workspace: temp.path(),
@@ -14558,10 +16438,8 @@ esac
             coordinator_brief: None,
             route_hint: None,
         })?;
-        // Non-interactive command workers return None for session_id
-        assert!(handle.session_id().is_none());
+        assert!(handle.session_id().is_some());
         let result = handle.wait_for_result()?;
-        // echo is always available → should succeed
         assert_eq!(result.status, WorkerStatus::Succeeded);
         Ok(())
     }
@@ -14574,11 +16452,11 @@ esac
         let task = default_task_with_id("task_codex_contract");
         let config = WorkerConfig {
             worker_kind: WorkerKind::Codex,
-            worker_command: Some("sh -c 'echo codex-contract'".to_string()),
+            worker_command: Some(fixture_acp_server_command("Codex fixture")),
             ..WorkerConfig::default()
         };
 
-        // Codex dispatches through CodexCommandWorker (non-interactive)
+        // Codex dispatches through its external ACP bridge.
         let handle = WorkerRegistry::default().start(WorkerStartRequest {
             store: &store,
             workspace: temp.path(),
@@ -14592,7 +16470,7 @@ esac
             coordinator_brief: None,
             route_hint: None,
         })?;
-        assert!(handle.session_id().is_none());
+        assert!(handle.session_id().is_some());
         let result = handle.wait_for_result()?;
         assert_eq!(result.status, WorkerStatus::Succeeded);
         Ok(())
@@ -14606,11 +16484,11 @@ esac
         let task = default_task_with_id("task_claude_contract");
         let config = WorkerConfig {
             worker_kind: WorkerKind::Claude,
-            worker_command: Some("sh -c 'echo claude-contract'".to_string()),
+            worker_command: Some(fixture_acp_server_command("Claude fixture")),
             ..WorkerConfig::default()
         };
 
-        // Claude dispatches through ClaudeCommandWorker (non-interactive)
+        // Claude dispatches through its external ACP bridge.
         let handle = WorkerRegistry::default().start(WorkerStartRequest {
             store: &store,
             workspace: temp.path(),
@@ -14624,7 +16502,7 @@ esac
             coordinator_brief: None,
             route_hint: None,
         })?;
-        assert!(handle.session_id().is_none());
+        assert!(handle.session_id().is_some());
         let result = handle.wait_for_result()?;
         assert_eq!(result.status, WorkerStatus::Succeeded);
         Ok(())
@@ -14830,13 +16708,13 @@ esac
             .as_object()
             .expect("team_mode should be an object");
         assert_eq!(team_mode["enabled"], false);
-        assert_eq!(team_mode["max_parallel_members"], 2);
+        assert_eq!(team_mode["max_parallel_members"], 1);
         assert_eq!(obj["model_fallback"], false);
         assert_eq!(obj["runtime_fallback"], false);
         let bg_task = obj["background_task"]
             .as_object()
             .expect("background_task should be an object");
-        assert_eq!(bg_task["defaultConcurrency"], 2);
+        assert_eq!(bg_task["defaultConcurrency"], 1);
         let disabled = obj["disabled_mcps"]
             .as_array()
             .expect("disabled_mcps should be an array");
@@ -14857,6 +16735,85 @@ esac
         assert_eq!(parsed["permission"]["task"], "deny");
         assert_eq!(parsed["permission"]["read"], "allow");
         assert_eq!(parsed["permission"]["grep"], "allow");
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_codex_isolation_collects_configured_extensions_without_affecting_other_workers()
+    -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[mcp_servers.serena]
+command = "serena"
+
+[mcp_servers.external_reader]
+command = "reader"
+
+[plugins."context-mode@context-mode"]
+enabled = true
+
+[plugins."custom-tools@example"]
+enabled = true
+"#,
+        )?;
+        let read_only = WorkerToolPolicy::default();
+        let isolation = codex_read_only_session_isolation_for_config_path(Some(&config_path))?;
+        assert_eq!(
+            isolation.disabled_mcp_servers,
+            vec!["external_reader".to_string(), "serena".to_string()]
+        );
+        assert_eq!(
+            isolation.disabled_plugins,
+            vec![
+                "context-mode@context-mode".to_string(),
+                "custom-tools@example".to_string()
+            ]
+        );
+        assert!(requires_codex_read_only_session_isolation(
+            WorkerKind::Codex,
+            &read_only
+        ));
+
+        let writable = WorkerToolPolicy {
+            can_write: true,
+            ..WorkerToolPolicy::default()
+        };
+        assert!(!requires_codex_read_only_session_isolation(
+            WorkerKind::Codex,
+            &writable
+        ));
+        assert!(!requires_codex_read_only_session_isolation(
+            WorkerKind::OpencodeSession,
+            &read_only
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_codex_home_links_auth_without_inheriting_config() -> Result<()> {
+        let source_home = tempfile::tempdir()?;
+        let auth_source = source_home.path().join("auth.json");
+        fs::write(&auth_source, "{\"token\":\"test\"}")?;
+        fs::write(
+            source_home.path().join("config.toml"),
+            "[plugins.\"context-mode@context-mode\"]\nenabled = true\n",
+        )?;
+        let home = create_codex_read_only_home_from_source(Some(source_home.path()))?;
+        assert!(home.uses_existing_auth);
+        assert!(!home.directory.path().join("config.toml").exists());
+        let auth_target = home.directory.path().join("auth.json");
+        assert!(auth_target.is_file());
+        #[cfg(unix)]
+        {
+            assert_eq!(fs::read_link(auth_target)?, auth_source);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(fs::read_to_string(auth_target)?, "{\"token\":\"test\"}");
+        }
         Ok(())
     }
 
@@ -14906,18 +16863,35 @@ esac
         // Body A, first call → compiled
         let body_a = "follow-up instruction A";
         let result_a = compile_recovery_prompt(
-            &store, task_id, command, body_a, &reason,
-            &packet_path, &manifest_path, &capsule_path,
-            "follow-up-1", Some("step-002"),
+            &store,
+            task_id,
+            command,
+            body_a,
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "follow-up-1",
+            Some("step-002"),
         )?;
-        assert!(result_a.is_file(), "first call should produce a compiled prompt");
+        assert!(
+            result_a.is_file(),
+            "first call should produce a compiled prompt"
+        );
 
         // Replaying the exact interaction (same stem) may reuse its compiled
         // prompt; a new interaction stem must receive a fresh artifact.
         let result_a_reuse = compile_recovery_prompt(
-            &store, task_id, command, body_a, &reason,
-            &packet_path, &manifest_path, &capsule_path,
-            "follow-up-1", Some("step-002"),
+            &store,
+            task_id,
+            command,
+            body_a,
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "follow-up-1",
+            Some("step-002"),
         )?;
         assert_eq!(
             result_a, result_a_reuse,
@@ -14944,8 +16918,7 @@ esac
             Some("step-002"),
         )?;
         assert_ne!(
-            result_a,
-            result_a_new_interaction,
+            result_a, result_a_new_interaction,
             "a new interaction attempt must not reuse the old compiled prompt"
         );
 
@@ -14955,19 +16928,36 @@ esac
         let original_content = fs::read_to_string(&result_a)?;
         fs::write(&result_a, "tampered recovery prompt")?;
         let rebuilt = compile_recovery_prompt(
-            &store, task_id, command, body_a, &reason,
-            &packet_path, &manifest_path, &capsule_path,
-            "follow-up-1", Some("step-002"),
+            &store,
+            task_id,
+            command,
+            body_a,
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "follow-up-1",
+            Some("step-002"),
         )?;
-        assert_eq!(rebuilt, result_a, "same interaction should rebuild in place");
+        assert_eq!(
+            rebuilt, result_a,
+            "same interaction should rebuild in place"
+        );
         assert_eq!(fs::read_to_string(rebuilt)?, original_content);
 
         // Body B → different compiled prompt
         let body_b = "different follow-up instruction B";
         let result_b = compile_recovery_prompt(
-            &store, task_id, command, body_b, &reason,
-            &packet_path, &manifest_path, &capsule_path,
-            "follow-up-3", Some("step-002"),
+            &store,
+            task_id,
+            command,
+            body_b,
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "follow-up-3",
+            Some("step-002"),
         )?;
         assert_ne!(
             result_a, result_b,
@@ -15128,10 +17118,18 @@ esac
 
         let reason = PromptCapsuleRecoveryReason::Resume;
         let err = compile_recovery_prompt(
-            &store, task_id, command, "some body", &reason,
-            &missing_packet, &manifest_path, &capsule_path,
-            "follow-up-1", Some("step-002"),
-        ).expect_err("missing packet should produce Err");
+            &store,
+            task_id,
+            command,
+            "some body",
+            &reason,
+            &missing_packet,
+            &manifest_path,
+            &capsule_path,
+            "follow-up-1",
+            Some("step-002"),
+        )
+        .expect_err("missing packet should produce Err");
 
         assert!(
             err.to_string().contains("failed to read worker packet"),
@@ -15156,8 +17154,18 @@ esac
         assert_eq!(receipt["status"], "degraded");
         assert_eq!(receipt["error_category"], "packet_read_failure");
         assert_eq!(receipt["task_id"], task_id);
-        assert!(receipt.get("error_detail").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()));
-        assert!(receipt.get("raw_fallback_path").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()));
+        assert!(
+            receipt
+                .get("error_detail")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            receipt
+                .get("raw_fallback_path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        );
 
         Ok(())
     }
@@ -15199,6 +17207,8 @@ esac
             follow_up_count: Mutex::new(0),
             supports_interaction: true,
             omo_config_dir: None,
+            transport: WorkerTransport::Command,
+            acp_session: Mutex::new(None),
         };
 
         let error = handle
@@ -15246,6 +17256,8 @@ esac
             follow_up_count: Mutex::new(0),
             supports_interaction: false,
             omo_config_dir: None,
+            transport: WorkerTransport::Command,
+            acp_session: Mutex::new(None),
         };
 
         let result = handle.wait_for_result()?;
@@ -15292,10 +17304,18 @@ esac
 
         let reason = PromptCapsuleRecoveryReason::Resume;
         let err = compile_recovery_prompt(
-            &store, task_id, command, "some body", &reason,
-            &packet_path, &missing_manifest, &capsule_path,
-            "follow-up-1", Some("step-002"),
-        ).expect_err("missing manifest should produce Err");
+            &store,
+            task_id,
+            command,
+            "some body",
+            &reason,
+            &packet_path,
+            &missing_manifest,
+            &capsule_path,
+            "follow-up-1",
+            Some("step-002"),
+        )
+        .expect_err("missing manifest should produce Err");
 
         assert!(
             err.to_string().contains("failed to read prompt manifest"),
@@ -15366,7 +17386,11 @@ esac
         let receipt = reconcile_worker_claims(&store, task_id, &result, &outcome)?;
         assert_eq!(receipt.status, "discrepancy");
         assert_eq!(receipt.missing_claims, vec!["missing.rs"]);
-        assert!(receipt.observed_changed_files.contains(&"observed.rs".to_string()));
+        assert!(
+            receipt
+                .observed_changed_files
+                .contains(&"observed.rs".to_string())
+        );
         receipt.validate()?;
         assert!(
             store

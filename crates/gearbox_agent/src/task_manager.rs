@@ -25,7 +25,7 @@ use crate::workers::{
     category_requires_worker_evidence, discard_resident_session_for_model_switch, is_free_model,
     provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
     snapshot_worker_evidence_paths, validate_worker_evidence_receipt_with_baseline,
-    worker_kind_supports_evidence_contract, worker_model_is_unavailable, worker_route_is_premium,
+    worker_kind_supports_evidence_contract, worker_model_is_unavailable,
     write_result_and_outcome_with_outcome, FREE_PROVIDER_COOLDOWN_MARKER,
 };
 
@@ -265,8 +265,10 @@ pub enum TaskFailureKind {
 }
 
 const WORKER_EVIDENCE_RETRY_PREFIX: &str = "worker evidence gate:";
+const TRANSIENT_ACP_STREAM_RETRY_PREFIX: &str = "transient ACP stream retry:";
+const MAX_TRANSIENT_ACP_STREAM_ATTEMPTS: usize = 3;
 pub(crate) const MAX_WORKER_EVIDENCE_ATTEMPTS: usize = 2;
-const WORKER_EVIDENCE_REPAIR_PROMPT: &str = "Gear evidence gate repair: inspect the work you just performed, run the relevant verification, write a non-empty regular receipt file under .gear/evidence/, and end the worker response with EVIDENCE_RECORDED: <path>. Do not claim completion until that receipt exists.";
+const WORKER_EVIDENCE_REPAIR_PROMPT: &str = "Gear evidence gate repair: inspect the work you just performed, run the relevant verification, and report the changed files, commands, and results. Gear persists protected runtime evidence; do not create or modify .gear. Do not claim completion until the verification evidence is described.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskAttempt {
@@ -2925,11 +2927,10 @@ impl TaskManager {
             .running_tasks
             .iter()
             .filter(|(task_id, running_task)| {
-                // OpenCode sessions are provider-backed and may legitimately
-                // spend a long time without producing a text heartbeat. The
-                // provider owns their response lifetime; this sweep is only a
-                // resource safeguard for workers whose command adapter can be
-                // judged stale locally.
+                // ACP provider sessions may legitimately spend a long time
+                // without producing a text heartbeat. The provider owns their
+                // response lifetime; this sweep is only a resource safeguard
+                // for workers whose command adapter can be judged stale locally.
                 let task_id = task_id.as_str();
                 let worker_kind = self
                     .records
@@ -3012,7 +3013,10 @@ impl TaskManager {
     fn worker_kind_owns_response_lifetime(worker_kind: WorkerKind) -> bool {
         matches!(
             worker_kind,
-            WorkerKind::Opencode | WorkerKind::OpencodeSession
+            WorkerKind::Opencode
+                | WorkerKind::OpencodeSession
+                | WorkerKind::Codex
+                | WorkerKind::Claude
         )
     }
 
@@ -3056,15 +3060,15 @@ impl TaskManager {
                 if let Some(session_id) = running_task.handle.session_id() {
                     record.session_id = Some(session_id);
                 }
+                let evidence_baseline = self
+                    .evidence_baselines
+                    .get(task_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let evidence_failure = if result.status == WorkerStatus::Succeeded
                     && category_requires_worker_evidence(&record.worker_category)
                     && worker_kind_supports_evidence_contract(&record.worker_kind)
                 {
-                    let evidence_baseline = self
-                        .evidence_baselines
-                        .get(task_id)
-                        .cloned()
-                        .unwrap_or_default();
                     Some(validate_worker_evidence_receipt_with_baseline(
                         &result,
                         &running_task.queued_task.workspace,
@@ -3106,13 +3110,14 @@ impl TaskManager {
                                 .last()
                                 .map(|attempt| attempt.attempt)
                                 .unwrap_or(1);
-                            let receipt_path = write_generated_read_only_evidence_receipt(
+                            let receipt_path = write_generated_runtime_evidence_receipt(
                                 &running_task.queued_task.workspace,
                                 task_id,
                                 attempt,
                                 &result,
                                 &outcome,
                                 &reason,
+                                "gear-read-only",
                             )?;
                             write_worker_evidence_gate_artifact(
                                 &running_task.store,
@@ -3129,24 +3134,28 @@ impl TaskManager {
                             outcome.summary = result.summary.clone();
                         }
                         Err(reason) if should_soft_accept_worker_evidence_failure(&reason) => {
-                            // A missing transport marker is a format failure,
-                            // not proof that the worker did no useful work.
-                            // Keep the degradation visible and let the
-                            // runtime's independent diff, verification,
-                            // review, and completion gates decide whether the
-                            // work can advance. Unsafe paths and malformed
-                            // receipts remain hard failures.
                             let attempt = record
                                 .attempts
                                 .last()
                                 .map(|attempt| attempt.attempt)
                                 .unwrap_or(1);
-                            let degradation = format!("soft worker evidence degradation: {reason}");
+                            let receipt_path = write_generated_runtime_evidence_receipt(
+                                &running_task.queued_task.workspace,
+                                task_id,
+                                attempt,
+                                &result,
+                                &outcome,
+                                &reason,
+                                "gear-runtime",
+                            )?;
+                            let degradation = format!(
+                                "soft worker evidence degradation: Gear generated protected runtime evidence after worker receipt degradation: {reason}"
+                            );
                             write_worker_evidence_gate_artifact(
                                 &running_task.store,
                                 task_id,
                                 attempt,
-                                None,
+                                Some(&receipt_path),
                                 Some(&degradation),
                             )?;
                             result.summary = format!("{} ({degradation})", result.summary);
@@ -6551,10 +6560,13 @@ fn write_worker_evidence_gate_artifact(
     receipt_path: Option<&Path>,
     reason: Option<&str>,
 ) -> Result<PathBuf> {
-    let status = if receipt_path.is_some() {
-        "accepted"
-    } else if reason.is_some_and(|reason| reason.starts_with("soft ")) {
+    let status = if reason.is_some_and(|reason| {
+        reason.starts_with("soft worker evidence degradation")
+            || reason.starts_with("Gear generated protected runtime evidence")
+    }) {
         "degraded"
+    } else if receipt_path.is_some() {
+        "accepted"
     } else if reason.is_some() {
         "rejected"
     } else {
@@ -6579,15 +6591,19 @@ fn should_soft_accept_worker_evidence_failure(reason: &str) -> bool {
     reason.starts_with("missing EVIDENCE_RECORDED:")
         || reason.starts_with("evidence root is unavailable")
         || reason.starts_with("failed to resolve evidence root:")
+        || reason.starts_with("receipt path is unavailable")
+        || reason.starts_with("failed to resolve receipt path:")
+        || reason.starts_with("receipt path was present before this worker attempt")
 }
 
-fn write_generated_read_only_evidence_receipt(
+fn write_generated_runtime_evidence_receipt(
     workspace: &Path,
     task_id: &str,
     attempt: usize,
     result: &WorkerResult,
     outcome: &WorkerOutcome,
     reason: &str,
+    file_prefix: &str,
 ) -> Result<PathBuf> {
     let evidence_root = workspace.join(".gear/evidence");
     fs::create_dir_all(&evidence_root)
@@ -6603,10 +6619,10 @@ fn write_generated_read_only_evidence_receipt(
         })
         .collect::<String>();
     let path = evidence_root.join(format!(
-        "gear-read-only-{safe_task_id}-attempt-{attempt}.md"
+        "{file_prefix}-{safe_task_id}-attempt-{attempt}.md"
     ));
     let contents = format!(
-        "# Gear-generated read-only evidence\n\n\
+        "# Gear-generated runtime evidence\n\n\
 Task: `{task_id}`\n\
 Attempt: `{attempt}`\n\
 Worker status: `{}`\n\
@@ -6614,7 +6630,7 @@ Exit code: `{}`\n\
 Summary: {}\n\
 Outcome: {}\n\
 Format degradation: {}\n\n\
-This receipt was generated by Gear because the read-only worker did not\n\
+This receipt was generated by Gear because the worker did not\n\
 produce a fresh machine-readable receipt. It records transport degradation\n\
 only; it does not replace repository verification or reviewer judgment.\n",
         result.status.as_str(),
@@ -6818,6 +6834,7 @@ fn record_worker_settle_event(
 
 fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> FallbackDecision {
     let evidence_retry = is_worker_evidence_retry(record);
+    let transient_acp_stream_retry = is_transient_acp_stream_retry(record);
     if let Some(failure_kind) = record
         .attempts
         .last()
@@ -6834,6 +6851,12 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
                         .is_some_and(|reason| reason.starts_with(WORKER_EVIDENCE_RETRY_PREFIX))
                 })
                 .count()
+        } else if transient_acp_stream_retry {
+            record
+                .attempts
+                .iter()
+                .filter(|attempt| is_transient_acp_stream_error(attempt.error.as_deref()))
+                .count()
         } else {
             record
                 .attempts
@@ -6843,6 +6866,8 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         };
         let max_attempts = if evidence_retry {
             MAX_WORKER_EVIDENCE_ATTEMPTS
+        } else if transient_acp_stream_retry {
+            MAX_TRANSIENT_ACP_STREAM_ATTEMPTS
         } else {
             queued_task.config.worker_routes.len().max(2)
         };
@@ -6860,10 +6885,11 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         }
     }
 
-    if let Some(previous_attempt) = record.attempts.last() {
+    if let Some(previous_attempt) = record.attempts.last().filter(|_| !transient_acp_stream_retry)
+    {
         mark_failed_model_unavailable_for_retry(previous_attempt, &mut queued_task.config);
     }
-    if !evidence_retry {
+    if !evidence_retry && !transient_acp_stream_retry {
         maybe_append_failure_upgrade_route(record, queued_task);
     } else {
         queued_task.goal.push_str("\n\n");
@@ -6898,6 +6924,7 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         route_identity_key(selected_route.worker_kind, worker_model.as_deref());
     if previous_route_identity == next_route_identity
         && !evidence_retry
+        && !transient_acp_stream_retry
         && normalized_worker_command(previous_attempt.worker_command.as_deref())
             == normalized_worker_command(worker_command.as_deref())
     {
@@ -6910,31 +6937,9 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
             failure_kind: TaskFailureKind::NoFallbackRoute,
         };
     }
-    let selected_route_is_premium =
-        worker_route_is_premium(selected_route.worker_kind, selected_route.worker_model);
-    if selected_route_is_premium {
-        let used_premium_attempts = record
-            .attempts
-            .iter()
-            .filter(|attempt| {
-                WorkerKind::parse(&attempt.worker_kind).is_some_and(|worker_kind| {
-                    worker_route_is_premium(worker_kind, attempt.worker_model.as_deref())
-                        && attempt.status != TaskAttemptStatus::Pending
-                })
-            })
-            .count();
-        if used_premium_attempts >= queued_task.config.premium_worker_budget {
-            return FallbackDecision::Unavailable {
-                reason: format!(
-                    "premium worker budget {} exhausted before `{}` attempt {}",
-                    queued_task.config.premium_worker_budget,
-                    selected_route.worker_kind.as_str(),
-                    next_attempt
-                ),
-                failure_kind: TaskFailureKind::PremiumBudgetExceeded,
-            };
-        }
-    }
+    // ACP/provider policy owns paid-model call limits. Gear records the route
+    // and can still apply scope/lease/retry safety, but it must not block a
+    // fallback because a local premium-attempt counter is exhausted.
 
     queued_task.task.attempt = next_attempt;
     queued_task.route_attempt = route_selection_attempt;
@@ -6952,6 +6957,10 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         format!(
             "{WORKER_EVIDENCE_RETRY_PREFIX} repair attempt {next_attempt}: receipt gate rejected the previous `{}` worker attempt",
             previous_attempt.worker_kind
+        )
+    } else if transient_acp_stream_retry {
+        format!(
+            "{TRANSIENT_ACP_STREAM_RETRY_PREFIX} attempt {next_attempt}: retrying the same ACP route after a streaming response failure"
         )
     } else {
         format!(
@@ -7004,6 +7013,20 @@ fn is_worker_evidence_retry(record: &TaskRecord) -> bool {
         .retry_reason
         .as_deref()
         .is_some_and(|reason| reason.starts_with(WORKER_EVIDENCE_RETRY_PREFIX))
+}
+
+fn is_transient_acp_stream_retry(record: &TaskRecord) -> bool {
+    record
+        .attempts
+        .last()
+        .is_some_and(|attempt| is_transient_acp_stream_error(attempt.error.as_deref()))
+}
+
+fn is_transient_acp_stream_error(error: Option<&str>) -> bool {
+    error.is_some_and(|error| {
+        error.contains("ACP session/prompt request failed")
+            && error.contains("Streaming response failed")
+    })
 }
 
 fn normalized_worker_command(value: Option<&str>) -> Option<String> {
@@ -8328,6 +8351,64 @@ mod tests {
         assert!(artifact.contains("soft worker evidence degradation"));
         let task_record = fs::read_to_string(store.worker_dir(&task.id).join("task-record.json"))?;
         assert!(task_record.contains(r#""status": "completed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_replaces_invalid_worker_receipt_marker_with_gear_receipt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_invalid_worker_evidence_marker");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(
+                r#"mkdir -p .gear/evidence && printf 'EVIDENCE_RECORDED: .gear/artifacts/final-report.md\n' > "$GEARBOX_WORKER_LAST_MESSAGE""#
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test invalid evidence marker",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        let evidence_root = temp_dir.path().join(".gear/evidence");
+        let receipts = fs::read_dir(&evidence_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("gear-runtime-")))
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 1);
+        let artifact = fs::read_to_string(
+            store
+                .worker_dir(&task.id)
+                .join("evidence-gate-attempt-1.json"),
+        )?;
+        assert!(artifact.contains(r#""status": "degraded""#));
+        assert!(artifact.contains("receipt path is unavailable"));
         Ok(())
     }
 
@@ -9934,6 +10015,110 @@ mod tests {
     }
 
     #[test]
+    fn queue_next_attempt_retries_transient_acp_stream_on_same_route() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_transient_acp_stream_retry");
+        let command = "opencode acp --pure --cwd \"$GEARBOX_ACP_WORKSPACE\"".to_string();
+        let model = "opencode-go/deepseek-v4-flash".to_string();
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command.clone()),
+            worker_model: Some(model.clone()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(command.clone()),
+                worker_model: Some(model.clone()),
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 0,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let task_id = task.id.clone();
+        let started_at = timestamp();
+        let streaming_error = "ACP session/prompt request failed: {\"code\":-32603,\"message\":\"Internal error: \\\"Streaming response failed\\\"\"}".to_string();
+        let mut queued_task = QueuedTask {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task,
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("quick".to_string()),
+        };
+        let mut record = TaskRecord {
+            task_id,
+            worker_kind: "opencode_session".to_string(),
+            worker_command: Some(command.clone()),
+            worker_model: Some(model.clone()),
+            worker_category: "quick".to_string(),
+            route_hint: Some("quick".to_string()),
+            route_reason: "initial route".to_string(),
+            status: ManagedTaskStatus::Failed,
+            started_at: started_at.clone(),
+            finished_at: Some(timestamp()),
+            residency_state: ResidencyState::Resident,
+            run_epoch: 0,
+            notified_epoch: default_notified_epoch(),
+            notification_failed_epoch: None,
+            killed: false,
+            session_id: None,
+            parent_session_id: None,
+            root_session_id: None,
+            parent_task_id: None,
+            result_path: None,
+            outcome_path: None,
+            summary: "failed".to_string(),
+            failure_kind: Some(TaskFailureKind::WorkerFailed),
+            retry_reason: None,
+            error: Some(streaming_error.clone()),
+            attempts: vec![TaskAttempt {
+                attempt: 1,
+                worker_kind: "opencode_session".to_string(),
+                worker_command: Some(command.clone()),
+                worker_model: Some(model.clone()),
+                worker_category: "quick".to_string(),
+                route_hint: Some("quick".to_string()),
+                route_reason: "initial route".to_string(),
+                status: TaskAttemptStatus::Failed,
+                started_at,
+                finished_at: Some(timestamp()),
+                session_id: None,
+                result_path: None,
+                outcome_path: None,
+                summary: "failed".to_string(),
+                failure_kind: Some(TaskFailureKind::WorkerFailed),
+                retry_reason: None,
+                error: Some(streaming_error),
+            }],
+        };
+
+        assert_eq!(
+            queue_next_attempt(&mut record, &mut queued_task),
+            FallbackDecision::Queued
+        );
+        assert_eq!(record.attempts.len(), 2);
+        assert_eq!(record.attempts[1].worker_model.as_deref(), Some(model.as_str()));
+        assert_eq!(record.attempts[1].worker_command.as_deref(), Some(command.as_str()));
+        assert!(record.attempts[1]
+            .retry_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(TRANSIENT_ACP_STREAM_RETRY_PREFIX)));
+        assert!(queued_task.config.unavailable_worker_models.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn task_manager_fallback_retries_unavailable_worker() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -10002,7 +10187,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_next_attempt_stops_when_premium_budget_is_exhausted() -> Result<()> {
+    fn queue_next_attempt_ignores_local_premium_budget() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
@@ -10097,13 +10282,8 @@ mod tests {
 
         let decision = queue_next_attempt(&mut record, &mut queued_task);
 
-        assert_eq!(
-            decision,
-            FallbackDecision::Unavailable {
-                reason: "premium worker budget 1 exhausted before `claude` attempt 2".to_string(),
-                failure_kind: TaskFailureKind::PremiumBudgetExceeded,
-            }
-        );
+        assert_eq!(decision, FallbackDecision::Queued);
+        assert_eq!(queued_task.task.attempt, 2);
         Ok(())
     }
 
@@ -12301,6 +12481,69 @@ mod tests {
             },
         );
         // Free-model tasks must survive stale sweep even with no recent activity.
+        assert_eq!(manager.sweep_stale_running_tasks()?, 0);
+        assert!(manager.running_tasks.contains_key(&task.id));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_acp_task_is_not_swept_as_stale() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_codex_acp_not_stale");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Codex,
+            worker_command: Some("npx --yes @agentclientprotocol/codex-acp@1.1.4".to_string()),
+            worker_model: Some("openai/gpt-5.6-luna".to_string()),
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 1,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Codex,
+        };
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
+            event_hub: WorkerEventHub::default(),
+        });
+        let mut record = test_task_record(
+            &task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.worker_kind = "codex".to_string();
+        record.worker_model = Some("openai/gpt-5.6-luna".to_string());
+        record.session_id = handle.session_id();
+        write_task_record(&store, &record)?;
+        let mut manager = TaskManager::new();
+        manager.records.insert(task.id.clone(), record);
+        manager.running_tasks.insert(
+            task.id.clone(),
+            RunningTask {
+                store,
+                handle,
+                queued_task,
+                started_at: Instant::now() - Duration::from_secs(60),
+                _subscription: None,
+            },
+        );
+
         assert_eq!(manager.sweep_stale_running_tasks()?, 0);
         assert!(manager.running_tasks.contains_key(&task.id));
         Ok(())

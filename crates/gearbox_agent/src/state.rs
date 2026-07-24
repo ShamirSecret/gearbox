@@ -455,7 +455,9 @@ pub struct Goal {
 pub struct Budget {
     #[serde(default = "default_max_calls_per_epoch")]
     pub max_calls_per_epoch: usize,
+    #[serde(default = "default_unbounded_usize")]
     pub max_worker_calls: usize,
+    #[serde(default = "default_unbounded_usize")]
     pub max_premium_worker_calls: usize,
     pub max_repair_attempts_per_error: usize,
     #[serde(default = "default_max_provider_unknown_streak")]
@@ -477,23 +479,30 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_calls_per_epoch: default_max_calls_per_epoch(),
-            max_worker_calls: 8,
-            max_premium_worker_calls: 8,
+            // ACP workers own provider context, token and spend policy. Gear
+            // keeps these fields for receipts and compatibility, but does
+            // not impose a local resource ceiling on worker calls.
+            max_calls_per_epoch: usize::MAX,
+            max_worker_calls: usize::MAX,
+            max_premium_worker_calls: usize::MAX,
             max_repair_attempts_per_error: 2,
             max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
             max_child_depth: usize::MAX,
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
-            max_tokens_per_call: default_max_tokens_per_call(),
-            max_tokens_per_epoch: default_max_tokens_per_epoch(),
-            max_cost_micros_per_epoch: default_max_cost_micros_per_epoch(),
-            max_usage_unknown_calls: default_max_usage_unknown_calls(),
+            max_tokens_per_call: u64::MAX,
+            max_tokens_per_epoch: u64::MAX,
+            max_cost_micros_per_epoch: u64::MAX,
+            max_usage_unknown_calls: usize::MAX,
         }
     }
 }
 
 fn default_max_calls_per_epoch() -> usize {
-    32
+    usize::MAX
+}
+
+fn default_unbounded_usize() -> usize {
+    usize::MAX
 }
 
 fn default_max_provider_unknown_streak() -> usize {
@@ -509,11 +518,11 @@ fn default_max_runtime_minutes() -> usize {
 }
 
 fn default_max_tokens_per_call() -> u64 {
-    128_000
+    u64::MAX
 }
 
 fn default_max_tokens_per_epoch() -> u64 {
-    4_096_000
+    u64::MAX
 }
 
 fn default_max_cost_micros_per_epoch() -> u64 {
@@ -521,7 +530,7 @@ fn default_max_cost_micros_per_epoch() -> u64 {
 }
 
 fn default_max_usage_unknown_calls() -> usize {
-    32
+    usize::MAX
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3329,10 +3338,12 @@ impl Default for ObjectivePolicy {
         Self {
             auto_continue: false,
             max_epochs: 1,
-            max_calls: 96,
-            max_tokens: 12_288_000,
-            max_cost_micros: 10_000_000,
-            max_unknown_usage_calls: 32,
+            // Objective orchestration must not become a second provider
+            // budget manager once its workers are ACP sessions.
+            max_calls: usize::MAX,
+            max_tokens: u64::MAX,
+            max_cost_micros: u64::MAX,
+            max_unknown_usage_calls: usize::MAX,
             max_consecutive_no_progress: 2,
             max_consecutive_failures: 3,
             cooldown_seconds: 0,
@@ -3351,14 +3362,10 @@ impl ObjectivePolicy {
 
     pub fn validate(&self) -> Result<()> {
         if self.max_epochs == 0
-            || self.max_calls == 0
-            || self.max_tokens == 0
-            || self.max_cost_micros == 0
-            || self.max_unknown_usage_calls == 0
             || self.max_consecutive_no_progress == 0
             || self.max_consecutive_failures == 0
         {
-            bail!("objective policy limits must be greater than zero");
+            bail!("objective orchestration limits must be greater than zero");
         }
         Ok(())
     }
@@ -5128,42 +5135,10 @@ impl StateStore {
             }
             bail!("objective budget reservation id conflicts with an existing reservation");
         }
-        let mut calls = 0usize;
-        let mut tokens = 0u64;
-        let mut cost = 0u64;
-        let mut unknown_calls = 0usize;
-        let mut premium_calls = 0usize;
-        for reservation in &ledger.reservations {
-            match reservation.status {
-                ObjectiveBudgetReservationStatus::Reserved => {
-                    calls = calls.saturating_add(reservation.reserved_calls);
-                    tokens = tokens.saturating_add(reservation.reserved_tokens);
-                    cost = cost.saturating_add(reservation.reserved_cost_micros);
-                    unknown_calls =
-                        unknown_calls.saturating_add(reservation.reserved_unknown_calls);
-                    premium_calls =
-                        premium_calls.saturating_add(reservation.reserved_premium_calls);
-                }
-                ObjectiveBudgetReservationStatus::Settled => {
-                    calls = calls.saturating_add(reservation.actual_calls.unwrap_or(0));
-                    tokens = tokens.saturating_add(reservation.actual_tokens.unwrap_or(0));
-                    cost = cost.saturating_add(reservation.actual_cost_micros.unwrap_or(0));
-                    unknown_calls =
-                        unknown_calls.saturating_add(reservation.actual_unknown_calls.unwrap_or(0));
-                    premium_calls =
-                        premium_calls.saturating_add(reservation.actual_premium_calls.unwrap_or(0));
-                }
-                ObjectiveBudgetReservationStatus::Released => {}
-            }
-        }
-        if calls.saturating_add(reserved_calls) > policy.max_calls
-            || tokens.saturating_add(reserved_tokens) > policy.max_tokens
-            || (policy.max_cost_micros != u64::MAX
-                && cost.saturating_add(reserved_cost_micros) > policy.max_cost_micros)
-            || unknown_calls.saturating_add(reserved_unknown_calls) > policy.max_unknown_usage_calls
-        {
-            bail!("objective budget exhausted before epoch reservation");
-        }
+        // ACP workers own provider call, token, spend, and usage-unknown
+        // limits. The objective ledger remains an audit projection, so Gear
+        // records the requested reservation but never rejects a child epoch
+        // because locally aggregated usage reached a stale configured value.
         let reservation = ObjectiveBudgetReservation {
             reservation_id: reservation_id.to_string(),
             objective_id: lease.lease.objective_id.clone(),
@@ -6921,14 +6896,10 @@ impl StateStore {
                 bail!("budget reservation requires non-empty {field}");
             }
         }
-        if budget.max_tokens_per_call == 0 {
-            bail!("budget max_tokens_per_call must be greater than zero");
-        }
         let goal_id = lease.lease.goal_id.as_str();
         let epoch_id = lease.lease.epoch_id.as_str();
         let mut ledger = self.read_goal_budget_ledger(goal_id)?;
-        let (calls, worker_calls, premium_calls, tokens, cost, unknown_calls) =
-            budget_ledger_totals(&ledger, epoch_id);
+        let (_, _, _, _, cost, _) = budget_ledger_totals(&ledger, epoch_id);
         if let Some(existing) = ledger
             .reservations
             .iter()
@@ -6943,25 +6914,11 @@ impl StateStore {
             }
             bail!("budget reservation id conflicts with an existing reservation");
         }
-        if calls >= budget.max_calls_per_epoch {
-            bail!("epoch call budget exhausted before reservation");
-        }
-        if worker_call && worker_calls >= budget.max_worker_calls {
-            bail!("worker call budget exhausted before reservation");
-        }
-        if premium && premium_calls >= budget.max_premium_worker_calls {
-            bail!("premium worker call budget exhausted before reservation");
-        }
-        if unknown_calls >= budget.max_usage_unknown_calls {
-            bail!("usage-unknown call budget exhausted before reservation");
-        }
-        if tokens.saturating_add(budget.max_tokens_per_call) > budget.max_tokens_per_epoch {
-            bail!("epoch token budget exhausted before reservation");
-        }
+        // ACP is the resource owner for every model-backed phase. Gear still
+        // records a reservation for lineage and audit receipts, but it never
+        // rejects a dispatch because local call/token/cost/usage counters are
+        // stale, missing, or smaller than the provider's allowance.
         let reserved_cost_micros = budget.max_cost_micros_per_epoch.saturating_sub(cost);
-        if budget.max_cost_micros_per_epoch != u64::MAX && reserved_cost_micros == 0 {
-            bail!("epoch cost budget exhausted before reservation");
-        }
         let reservation = BudgetReservation {
             reservation_id: reservation_id.to_string(),
             goal_id: goal_id.to_string(),
@@ -8553,7 +8510,7 @@ mod epoch_tests {
     }
 
     #[test]
-    fn budget_ledger_reserves_before_dispatch_and_settles_actual_usage() -> Result<()> {
+    fn budget_ledger_records_worker_usage_without_local_resource_gate() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
@@ -8614,11 +8571,18 @@ mod epoch_tests {
                 unavailable_reason: Some("backend omitted usage".to_string()),
             },
         )?;
-        assert!(
-            store
-                .reserve_budget_call(&lease, "epoch-1.worker.3", "worker", true, false, &budget,)
-                .is_err()
-        );
+        // The provider owns worker call/token/cost/usage limits. Even with a
+        // stale local ledger that has reached its finite test values, Gear
+        // must record the next ACP reservation instead of rejecting dispatch.
+        let third = store.reserve_budget_call(
+            &lease,
+            "epoch-1.worker.3",
+            "worker",
+            true,
+            false,
+            &budget,
+        )?;
+        assert_eq!(third.reserved_cost_micros, 0);
         let ledger_path = store.goal_budget_ledger_path("goal-1");
         let ledger_contents = fs::read_to_string(&ledger_path)?;
         fs::write(
@@ -8674,7 +8638,7 @@ mod epoch_tests {
     }
 
     #[test]
-    fn epoch_call_budget_does_not_consume_worker_call_budget() -> Result<()> {
+    fn epoch_reservations_do_not_apply_local_resource_limits() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
@@ -8708,18 +8672,14 @@ mod epoch_tests {
                 },
             )?;
         }
-        assert!(
-            store
-                .reserve_budget_call(
-                    &lease,
-                    "epoch-2.reviewer",
-                    "reviewer",
-                    false,
-                    false,
-                    &budget,
-                )
-                .is_err()
-        );
+        store.reserve_budget_call(
+            &lease,
+            "epoch-2.reviewer",
+            "reviewer",
+            false,
+            false,
+            &budget,
+        )?;
         lease.release()?;
         Ok(())
     }

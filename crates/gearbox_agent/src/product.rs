@@ -1130,7 +1130,7 @@ Status: `{}`
 
 ## Known Limits
 
-- ACP server integration is intentionally deferred until the local CLI runtime is stable.
+- External provider workers use the ACP stdio transport; startup fails closed when the required ACP server is unavailable.
 - Codex, Claude Code, CodeGraph, and context-mode workers are not hard dependencies in this MVP.
 "#,
         goal.id,
@@ -1810,5 +1810,83 @@ mod tests {
         );
         assert!(ledger.contains("status=Unavailable"));
         assert!(ledger.contains("no fallback route"));
+    }
+
+    #[test]
+    fn final_report_shows_terminal_decision_when_goal_is_complete() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let setup_artifact = |name: &str| {
+            let path = temp_dir.path().join(name);
+            std::fs::write(&path, "content").expect("artifact");
+            path
+        };
+        let goal = Goal {
+            id: "goal_complete_sync".to_string(),
+            title: "sync test".to_string(),
+            status: GoalStatus::Complete,
+            workspace: "/workspace".to_string(),
+            created_at: "2026-07-24T00:00:00Z".to_string(),
+            updated_at: "2026-07-24T00:00:00Z".to_string(),
+            request: "sync final report".to_string(),
+            product_type: "app".to_string(),
+            language_profile: "rust".to_string(),
+            success_criteria: vec!["works".to_string()],
+            budget: Budget::default(),
+            current_task_id: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            summary: "Goal completed successfully.".to_string(),
+        };
+        let task = Task {
+            id: "task_complete".to_string(),
+            goal_id: goal.id.clone(),
+            parent_task_id: None,
+            title: "Implement".to_string(),
+            kind: TaskKind::Document,
+            status: TaskStatus::Complete,
+            assigned_worker: None,
+            attempt: 1,
+            scope: Scope::new(vec![], vec![], usize::MAX),
+            inputs: TaskInputs::default(),
+            outputs: TaskOutputs::default(),
+        };
+        let worker_result = WorkerResult {
+            status: crate::workers::WorkerStatus::Succeeded,
+            command: Some("worker".to_string()),
+            exit_code: Some(0),
+            summary: "worker finished".to_string(),
+            packet_path: setup_artifact("packet.md"),
+            prompt_path: setup_artifact("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: None,
+            result_path: setup_artifact("result.json"),
+            outcome_path: setup_artifact("outcome.json"),
+        };
+        let report = super::final_report(
+            &goal,
+            &[task],
+            &worker_result,
+            &DiffSnapshot {
+                is_git_repo: true,
+                status: "M src/main.rs".to_string(),
+                changed_files: vec!["src/main.rs".to_string()],
+                diff_hash: None,
+            },
+            &ScopeCheck::default(),
+            &[ShellCommandResult {
+                command: "cargo test".to_string(),
+                exit_code: Some(0),
+                success: true,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                duration_ms: 5,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }],
+        );
+        assert!(report.contains("Status: `complete`"));
+        assert!(report.contains("No further action is required."));
+        assert!(report.contains("Goal completed successfully."));
     }
 }
